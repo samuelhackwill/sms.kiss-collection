@@ -46,7 +46,7 @@ EMPTY_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div class="panel">
     <h1>No Ready Film Yet</h1>
     <p>The review queue is being filled in the background.</p>
@@ -119,7 +119,7 @@ FILMS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
     <h1 style="margin:0;">Film Database</h1>
     {% for stat in tag_stats %}
@@ -325,6 +325,57 @@ FILMS_TEMPLATE = """
   bindFilmRows();
   window.setTimeout(refreshFilms, 3000);
 </script>
+</body>
+</html>
+"""
+
+
+ADMIN_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>IA Kissing Admin</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #0f141b; --border: #263244; --text: #edf3ff; --muted: #94a4bd; --link: #7cc7ff; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    .panel { max-width: 860px; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 16px; padding: 18px; box-shadow: 0 18px 60px rgba(0,0,0,0.32); }
+    .mono { font-family: monospace; font-size: 13px; }
+    .muted { color: var(--muted); }
+    form { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; margin-top: 18px; }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+    input[type="number"] { width: 110px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: #0d1117; color: var(--text); }
+    button { padding: 9px 14px; border-radius: 10px; border: 1px solid #3b495d; background: #2a3442; color: #d9e5f7; cursor: pointer; }
+    .status { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
+  </style>
+</head>
+<body>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <div class="panel">
+    <h1 style="margin-top:0;">Admin</h1>
+    <p class="muted">Launch the get more films batch from the web UI. This queues the same download-batch flow used by the Python tooling.</p>
+    {% if message %}
+      <p>{{ message }}</p>
+    {% endif %}
+    <form method="post" action="{{ url_for('admin_start_get_more_vids') }}">
+      <label>
+        Films to add
+        <input type="number" name="count" min="1" max="100" value="{{ requested_count }}">
+      </label>
+      <button type="submit">Run Get More Films</button>
+    </form>
+    <div class="status">
+      <h2 style="margin-top:0;">Queue Status</h2>
+      <p class="mono">active_pool={{ ready_count }}</p>
+      {% if queue_job %}
+        <p class="mono">job_id={{ queue_job["id"] }} status={{ queue_job["status"] }} phase={{ queue_job["phase"] }} progress={{ queue_job["progress_percent"] }}%</p>
+        <p>{{ queue_job["status_text"] }}</p>
+      {% else %}
+        <p class="mono">idle</p>
+      {% endif %}
+    </div>
+  </div>
 </body>
 </html>
 """
@@ -1122,6 +1173,30 @@ def create_app() -> Flask:
             abort(404)
         _queue_build_skim(settings, film_id, sample_every_seconds=4, output_fps=12)
         return redirect(url_for("review_data_index"))
+
+    @app.get("/admin")
+    def admin_index():
+        requested_count = max(1, min(100, request.args.get("count", default=1, type=int) or 1))
+        with get_connection(settings.db_path) as conn:
+            queue_job = _load_download_batch_job(conn)
+            ready_count = _count_active_pool_films(conn)
+        return render_template_string(
+            ADMIN_TEMPLATE,
+            message=request.args.get("message", type=str),
+            requested_count=requested_count,
+            queue_job=queue_job,
+            ready_count=ready_count,
+        )
+
+    @app.post("/admin/get-more-films")
+    def admin_start_get_more_vids():
+        count = max(1, min(100, request.form.get("count", default=1, type=int) or 1))
+        started, job_id = _start_get_more_vids(settings, count)
+        if started:
+            message = f"Started get more films job {job_id}."
+        else:
+            message = f"Get more films is already running as job {job_id}."
+        return redirect(url_for("admin_index", message=message, count=count))
 
     @app.get("/api/random-clips")
     def random_clips_api():

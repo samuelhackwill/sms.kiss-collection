@@ -37,11 +37,13 @@ def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     films_status_response = client.get("/films/status")
     detail_response = client.get("/films/1")
     clips_response = client.get("/clips")
+    admin_response = client.get("/admin")
 
     assert index_response.status_code == 200
     assert b"No Ready Film Yet" in index_response.data
     assert films_response.status_code == 200
     assert b"Kiss in Spring" in films_response.data
+    assert b"Review Data" in films_response.data
     assert films_status_response.status_code == 200
     assert b"films" in films_status_response.data
     assert detail_response.status_code == 200
@@ -49,6 +51,8 @@ def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     assert b"skim-viewport" in detail_response.data
     assert b"No Kissing Scenes. Show Me New Video" not in detail_response.data
     assert clips_response.status_code == 200
+    assert admin_response.status_code == 200
+    assert b"Run Get More Films" in admin_response.data
 
 
 def test_cleanup_nonpending_local_artifacts_keeps_db_rows(tmp_path: Path, monkeypatch) -> None:
@@ -335,6 +339,45 @@ def test_start_get_more_vids_starts_explicit_batch(tmp_path: Path, monkeypatch) 
         ).fetchone()
     assert job["job_type"] == "download_batch"
     assert job["status"] == "queued"
+
+
+def test_admin_post_starts_get_more_vids_job(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+    run_metadata_scoring(settings)
+
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._spawn_pipeline_command",
+        lambda settings, command: None,
+    )
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/admin/get-more-films", data={"count": "4"}, follow_redirects=False)
+
+    assert response.status_code == 302
+    assert "/admin?" in response.headers["Location"]
+    with get_connection(settings.db_path) as conn:
+        job = conn.execute(
+            "SELECT job_type, status, payload_json FROM analysis_jobs WHERE film_id IS NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert job["job_type"] == "download_batch"
+    assert job["status"] == "queued"
+    assert '"count": 4' in job["payload_json"]
 
 
 def test_update_mark_tag_updates_mark_and_clip(tmp_path: Path, monkeypatch) -> None:
