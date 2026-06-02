@@ -306,6 +306,65 @@ def test_random_clips_api_ordered_mode_uses_clip_id_order(tmp_path: Path, monkey
     assert [clip["id"] for clip in payload_wrap["clips"]] == [10]
 
 
+def test_review_data_allows_deleting_source_error_clip_file(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute("UPDATE films SET status = 'source_error' WHERE id = 1")
+        conn.execute(
+            """
+            INSERT INTO manual_marks (
+                id, film_id, skim_path, skim_sample_every_seconds, skim_output_fps,
+                preview_seconds, sample_index, source_seconds, selected_tag, note, created_at
+            ) VALUES (1, 1, '', 4, 12, 0, 1, 5, 'kiss', 'kiss', '2026-03-24T00:00:00Z')
+            """
+        )
+        clip_dir = settings.clips_dir / "kiss_in_spring_1932"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        clip_path = clip_dir / "manual-mark-001.mp4"
+        clip_path.write_text("clip")
+        conn.execute(
+            """
+            INSERT INTO manual_clips (
+                id, manual_mark_id, film_id, clip_path, clip_tag, metadata_json, start_seconds, end_seconds, created_at
+            ) VALUES
+                (1, 1, 1, ?, 'kiss', '{}', 5, 9, '2026-03-24T00:00:00Z')
+            """,
+            (str(clip_path),),
+        )
+
+    app = create_app()
+    client = app.test_client()
+
+    review_data_response = client.get("/review_data")
+    delete_response = client.post(
+        "/review_data/delete",
+        data={"kind": "clip", "relpath": "kiss_in_spring_1932/manual-mark-001.mp4"},
+        follow_redirects=False,
+    )
+
+    assert review_data_response.status_code == 200
+    assert b"Delete video file" in review_data_response.data
+    assert delete_response.status_code == 302
+    assert not clip_path.exists()
+    with get_connection(settings.db_path) as conn:
+        clip_count = conn.execute("SELECT COUNT(*) AS count FROM manual_clips WHERE id = 1").fetchone()["count"]
+    assert clip_count == 0
+
+
 def test_start_get_more_vids_starts_explicit_batch(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)

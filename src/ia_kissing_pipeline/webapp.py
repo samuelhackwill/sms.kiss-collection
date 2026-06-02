@@ -873,7 +873,7 @@ REVIEW_DATA_TEMPLATE = """
                       <button class="delete-button" type="submit" style="background:#132c49;border-color:#2b6aa7;color:#91ccff;">Requeue movie</button>
                     </form>
                   {% endif %}
-                  {% if item["status_kind"] == "stray" %}
+                  {% if item["can_delete"] %}
                     <form method="post" action="{{ url_for('delete_review_data_file') }}">
                       <input type="hidden" name="kind" value="{{ item['kind'] }}">
                       <input type="hidden" name="relpath" value="{{ item['relpath'] }}">
@@ -1161,7 +1161,30 @@ def create_app() -> Flask:
         path = _resolve_review_data_path(settings, kind, relpath)
         if path is None or not path.exists():
             abort(404)
-        path.unlink()
+        resolved_path = path.resolve()
+        with get_connection(settings.db_path) as conn:
+            if kind == "clip":
+                clip = conn.execute(
+                    """
+                    SELECT id, clip_path, cropped_clip_path
+                    FROM manual_clips
+                    WHERE clip_path = ? OR cropped_clip_path = ?
+                    """,
+                    (str(resolved_path), str(resolved_path)),
+                ).fetchone()
+                if clip:
+                    clip_item = dict(clip)
+                    for path_value in (clip_item.get("cropped_clip_path"), clip_item.get("clip_path")):
+                        if not path_value:
+                            continue
+                        clip_path = Path(path_value)
+                        if clip_path.exists():
+                            clip_path.unlink()
+                    conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip_item["id"],))
+                else:
+                    resolved_path.unlink()
+            else:
+                resolved_path.unlink()
         return redirect(url_for("review_data_index"))
 
     @app.post("/review_data/requeue")
@@ -1926,15 +1949,15 @@ def _build_film_status_map(conn, settings) -> dict[int, str]:
     return status_map
 
 
-def _review_data_status(status_map: dict[int, str], film_id: int | None) -> tuple[str, str]:
+def _review_data_status(status_map: dict[int, str], film_id: int | None) -> tuple[str, str, str | None]:
     if film_id is None:
-        return "stray", "stray"
+        return "stray", "stray", None
     pipeline_status = status_map.get(int(film_id))
     if pipeline_status in {"pending", "awaiting_download", "downloading", "checking_metadata", "checking_title"}:
-        return "pending", "pending review"
+        return "pending", "pending review", pipeline_status
     if pipeline_status:
-        return "linked", f"linked: {pipeline_status}"
-    return "stray", "stray"
+        return "linked", f"linked: {pipeline_status}", pipeline_status
+    return "stray", "stray", None
 
 
 def _load_review_data_sections(conn, settings) -> list[dict]:
@@ -1984,7 +2007,7 @@ def _load_review_data_sections(conn, settings) -> list[dict]:
                 archive_identifier = parts[0] if len(parts) > 1 else None
                 if archive_identifier:
                     film_id = film_by_archive.get(archive_identifier)
-            status_kind, status_text = _review_data_status(status_map, film_id)
+            status_kind, status_text, pipeline_status = _review_data_status(status_map, film_id)
             items.append(
                 {
                     "kind": kind,
@@ -1993,10 +2016,11 @@ def _load_review_data_sections(conn, settings) -> list[dict]:
                     "size_text": _format_size(path.stat().st_size),
                     "media_url": url_for("media_file", kind=kind, relpath=relpath) if playable and not ignored else None,
                     "playable": playable and not ignored,
-            "ignored": ignored,
-            "film_id": film_id,
-            "status_kind": status_kind,
-            "status_text": status_text,
+                    "ignored": ignored,
+                    "film_id": film_id,
+                    "status_kind": status_kind,
+                    "status_text": status_text,
+                    "can_delete": status_kind == "stray" or (kind == "clip" and pipeline_status == "source_error"),
                 }
             )
         return {
