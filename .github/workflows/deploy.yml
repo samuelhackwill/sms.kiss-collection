@@ -37,11 +37,23 @@ jobs:
           mkdir -p ~/.ssh
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
 
+      - name: Upload code to VPS
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' \
+            --exclude '.venv/' \
+            --exclude 'data/' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            ./ "${DEPLOY_USER}@${DEPLOY_HOST}:/home/bot/ia-kissing-pipeline/"
+
       - name: Deploy on VPS
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_BRANCH: ${{ github.ref_name }}
         run: |
           ssh "${DEPLOY_USER}@${DEPLOY_HOST}" \
-            "DEPLOY_BRANCH='${DEPLOY_BRANCH}' bash /home/bot/ia-kissing-pipeline/deploy/deploy.sh"
+            "bash /home/bot/ia-kissing-pipeline/deploy/deploy.sh"
