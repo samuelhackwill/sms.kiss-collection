@@ -92,6 +92,8 @@ Configuration is environment-variable based. Defaults are relative to the curren
 | `IA_KISSING_CODEX_MODEL` | `gpt-5.1-codex-mini` | Optional Codex model for text gating |
 | `IA_KISSING_CODEX_TIMEOUT_SECONDS` | `45` | Optional Codex text gate timeout |
 | `IA_KISSING_CODEX_WORKDIR` | `/tmp/codex-text-gate` | Optional Codex text gate workdir |
+| `IA_KISSING_WEB_HOST` | `127.0.0.1` | Flask bind host |
+| `IA_KISSING_WEB_PORT` | `8000` | Flask bind port |
 
 Start from the example file:
 
@@ -256,7 +258,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ia-kissing-web.service
 ```
 
-The repository also includes a GitHub Actions workflow for push-to-deploy. It runs the web tests, SSHes into the VPS, and executes:
+The repository also includes a GitHub Actions workflow for push-to-deploy. It runs the web tests, uploads the checked-out code to the VPS with `rsync`, then SSHes into the VPS and executes:
 
 ```bash
 /home/bot/ia-kissing-pipeline/deploy/deploy.sh
@@ -270,8 +272,7 @@ Required GitHub Actions secrets:
 
 The VPS must already have:
 
-- this repo checked out at `/home/bot/ia-kissing-pipeline`
-- a configured `origin` remote
+- an app directory at `/home/bot/ia-kissing-pipeline`
 - `uv`
 - FFmpeg
 - the systemd unit installed
@@ -291,7 +292,7 @@ sudo chmod 0440 /etc/sudoers.d/ia-kissing-web
 sudo visudo -cf /etc/sudoers.d/ia-kissing-web
 ```
 
-`deploy/deploy.sh` intentionally resets the working tree to the pushed branch before restarting. Keep runtime files in `data/`, not in Git.
+The workflow excludes `.git/`, `.venv/`, `.env*`, and `data/` from upload. Keep runtime files in `data/`, not in Git.
 
 ## Tests
 

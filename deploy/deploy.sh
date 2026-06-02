@@ -7,9 +7,6 @@ export PATH="/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 cd "$APP_DIR"
 
-git fetch --all --prune
-git reset --hard "origin/${DEPLOY_BRANCH:-main}"
-
 uv sync --extra dev
 uv run pytest tests/test_webapp.py
 

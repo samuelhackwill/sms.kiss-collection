@@ -14,6 +14,8 @@ Environment=FRAME_DIR=/home/bot/ia-kissing-pipeline/data/frames
 Environment=PREVIEW_DIR=/home/bot/ia-kissing-pipeline/data/previews
 Environment=CLIPS_DIR=/home/bot/ia-kissing-pipeline/data/clips
 Environment=LOG_DIR=/home/bot/ia-kissing-pipeline/data/logs
+Environment=IA_KISSING_WEB_HOST=127.0.0.1
+Environment=IA_KISSING_WEB_PORT=8000
 ExecStart=/home/bot/ia-kissing-pipeline/.venv/bin/python3 -m ia_kissing_pipeline.webapp
 Restart=always
 RestartSec=5
