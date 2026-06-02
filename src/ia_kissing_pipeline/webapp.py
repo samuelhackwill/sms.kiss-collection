@@ -1,0 +1,2799 @@
+from __future__ import annotations
+
+import json
+import os
+import signal
+import sqlite3
+import shutil
+import subprocess
+import sys
+import time
+import re
+from pathlib import Path
+
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
+
+from ia_kissing_pipeline.config import load_settings
+from ia_kissing_pipeline.db import get_connection, init_db
+from ia_kissing_pipeline.main import _resolve_source_video
+from ia_kissing_pipeline.ingest.ia_client import IAClient
+from ia_kissing_pipeline.ingest.ia_ingest import ingest_from_ia, make_checkpoint_key
+from ia_kissing_pipeline.main import run_metadata_scoring
+from ia_kissing_pipeline.utils.time import utc_now_iso
+
+
+READY_TARGET = 20
+QUEUE_INGEST_QUERY = "collection:feature_films"
+QUEUE_INGEST_LIMIT = 8
+QUEUE_INGEST_ROWS = 4
+QUEUE_STALE_SECONDS = 600
+QUEUE_NAME = "download_batch"
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+
+
+EMPTY_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>IA Kissing Review</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #0f141b; --border: #263244; --text: #edf3ff; --muted: #94a4bd; --link: #7cc7ff; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    .panel { max-width: 860px; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 16px; padding: 18px; box-shadow: 0 18px 60px rgba(0,0,0,0.32); }
+    .mono { font-family: monospace; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <div class="panel">
+    <h1>No Ready Film Yet</h1>
+    <p>The review queue is being filled in the background.</p>
+    <p class="mono">ready={{ ready_count }} target={{ target_ready }} queue_job={{ queue_status }}</p>
+  </div>
+</body>
+</html>
+"""
+
+
+FILMS_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>IA Kissing Review</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #111720; --border: #263244; --text: #edf3ff; --muted: #93a4bc; --link: #7cc7ff; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    table { border-collapse: collapse; width: 100%; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 18px; overflow: hidden; }
+    th, td { border-bottom: 1px solid var(--border); padding: 10px; text-align: left; vertical-align: top; }
+    th { background: #1b2430; color: #c8d5e6; }
+    .status { font-family: monospace; font-size: 13px; }
+    .status-badge { display: inline-block; padding: 4px 9px; border-radius: 999px; border: 1px solid #324054; background: #1b2430; color: #c8d5e6; }
+    .status-badge.downloading { background: #103923; border-color: #26714a; color: #87f0ae; font-weight: 700; }
+    .status-badge.pending { background: #132c49; border-color: #2b6aa7; color: #91ccff; }
+    .status-badge.awaiting_download { background: #3b2c11; border-color: #88611b; color: #ffcf75; }
+    .status-badge.checking_metadata, .status-badge.checking_title { background: #2d1f45; border-color: #67489d; color: #ccb0ff; }
+    .status-badge.source_error, .status-badge.excluded_metadata, .status-badge.excluded_manual, .status-badge.reviewed_no_kiss, .status-badge.reviewed_has_kiss { background: #252d37; border-color: #3e4d61; color: #94a4bd; }
+    .stale td { color: #66758a; background: #10161d; }
+    .icon-button { padding: 6px 10px; line-height: 1; background: #2a3442; color: #d9e5f7; border: 1px solid #3b495d; border-radius: 10px; }
+    .action-link { display: inline-block; padding: 6px 10px; line-height: 1; background: #2a3442; color: #d9e5f7; border: 1px solid #3b495d; border-radius: 10px; text-decoration: none; }
+    .action-link:hover { filter: brightness(1.08); }
+    .film-tag-button { transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
+    .film-tag-button:hover { transform: translateY(-1px); filter: brightness(1.08); box-shadow: 0 8px 20px rgba(0,0,0,0.24); }
+    .film-tag-button[data-tag="kiss"] { background: linear-gradient(180deg, #6e2040 0%, #4e1530 100%); border-color: #a54c73; color: #ffd0e2; }
+    .film-tag-button[data-tag="phone"] { background: linear-gradient(180deg, #16395f 0%, #102845 100%); border-color: #3f79b5; color: #c3e4ff; }
+    .film-tag-button[data-tag="cry"] { background: linear-gradient(180deg, #224f43 0%, #16382f 100%); border-color: #4ca186; color: #c8ffea; }
+    .film-tag-button[data-tag="dance"] { background: linear-gradient(180deg, #5d3f12 0%, #412b0c 100%); border-color: #b8872f; color: #ffe2a3; }
+    .film-tag-button.muted-tag { filter: grayscale(0.9) brightness(0.72); opacity: 0.72; }
+    .filter-button { text-decoration: none; }
+    .filter-button.active { outline: 2px solid #edf3ff; box-shadow: 0 0 0 3px rgba(255,255,255,0.14); }
+    .clear-filter { display: inline-block; padding: 6px 10px; line-height: 1; background: #2a3442; color: #d9e5f7; border: 1px solid #3b495d; border-radius: 10px; text-decoration: none; }
+    .mode-toggle { display: inline-flex; gap: 6px; align-items: center; margin-left: auto; }
+    .mode-toggle form { margin: 0; }
+    .mode-toggle button { padding: 6px 10px; line-height: 1; background: #2a3442; color: #d9e5f7; border: 1px solid #3b495d; border-radius: 10px; cursor: pointer; }
+    .mode-toggle button.active { background: #132c49; border-color: #2b6aa7; color: #91ccff; }
+    #tag-picker .film-tag-button[data-tag="kiss"] { background: linear-gradient(180deg, #6e2040 0%, #4e1530 100%); border-color: #a54c73; color: #ffd0e2; }
+    #tag-picker .film-tag-button[data-tag="phone"] { background: linear-gradient(180deg, #16395f 0%, #102845 100%); border-color: #3f79b5; color: #c3e4ff; }
+    #tag-picker .film-tag-button[data-tag="cry"] { background: linear-gradient(180deg, #224f43 0%, #16382f 100%); border-color: #4ca186; color: #c8ffea; }
+    #tag-picker .film-tag-button[data-tag="dance"] { background: linear-gradient(180deg, #5d3f12 0%, #412b0c 100%); border-color: #b8872f; color: #ffe2a3; }
+    .clips-row td { background: #0f141b; padding: 16px; }
+    .clips-drawer { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .clip-tile { background: #0b1016; border: 1px solid #263244; border-radius: 12px; overflow: hidden; }
+    .clips-drawer video { width: 100%; background: #000; border-radius: 12px 12px 0 0; display: block; }
+    .clip-actions { display: flex; gap: 8px; padding: 8px; justify-content: flex-end; }
+    .clip-actions button { padding: 7px 10px; line-height: 1; background: #2a3442; color: #d9e5f7; border: 1px solid #3b495d; border-radius: 10px; cursor: pointer; font-size: 13px; }
+    .clip-actions .ignore-button { background: #3b2c11; border-color: #88611b; color: #ffcf75; }
+    .clip-actions .delete-button { background: #3a2025; border-color: #8d4b58; color: #ffd3db; }
+    .clips-empty { color: var(--muted); font-size: 13px; }
+    tbody tr[data-film-id] { cursor: pointer; }
+    tbody tr[data-film-id]:hover td { background: #17202b; }
+    @media (max-width: 900px) {
+      body { margin: 14px; }
+      th, td { padding: 8px; }
+      .clips-drawer { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .icon-button, .film-tag-button { min-height: 40px; }
+    }
+  </style>
+</head>
+<body>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+    <h1 style="margin:0;">Film Database</h1>
+    {% for stat in tag_stats %}
+      <span class="status-badge pending film-tag-button" data-tag="{{ stat['tag'] }}">{{ stat["tag"] }} total: {{ stat["count"] }}</span>
+    {% endfor %}
+    {% if active_filter_tag %}
+      <span class="small" style="color: var(--muted);">filtered by {{ active_filter_tag }}</span>
+      <a class="clear-filter" href="{{ url_for('films_index') }}">Remove Filter</a>
+    {% endif %}
+    <div class="mode-toggle">
+      <span class="small" style="color: var(--muted);">Clip API</span>
+      <form method="post" action="{{ url_for('set_clip_order_mode') }}">
+        <input type="hidden" name="mode" value="random">
+        <button type="submit" class="{{ 'active' if clip_order_mode == 'random' else '' }}">Random</button>
+      </form>
+      <form method="post" action="{{ url_for('set_clip_order_mode') }}">
+        <input type="hidden" name="mode" value="ordered">
+        <button type="submit" class="{{ 'active' if clip_order_mode == 'ordered' else '' }}">Ordered</button>
+      </form>
+    </div>
+  </div>
+  <div style="margin: 0 0 18px 0; padding: 14px; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 16px;">
+    <div style="font-size: 13px; color: var(--muted); margin-bottom: 8px;">Review Tags</div>
+    <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+      {% for tag in ["kiss", "phone", "cry", "dance"] %}
+        <a class="status-badge pending film-tag-button filter-button {{ 'active' if active_filter_tag == tag else '' }}" href="{{ url_for('films_index', tag=tag) }}" data-filter-tag="{{ tag }}" data-tag="{{ tag }}">{{ tag }}</a>
+      {% endfor %}
+    </div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Title</th>
+        <th>Tags</th>
+        <th>Pipeline</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for film in films %}
+      <tr data-film-id="{{ film['id'] }}" class="{{ 'stale' if film['is_dimmed'] else '' }}">
+        <td>{{ film["id"] }}</td>
+        <td data-col="title">{{ film["title"] }}</td>
+        <td data-col="tags">{{ film["tags_html"]|safe }}</td>
+        <td class="status" data-col="pipeline"><span class="status-badge {{ film['pipeline_status'] }}">{{ film["pipeline_status"] }}</span></td>
+        <td data-col="action">
+          {% if film["show_open_link"] %}
+            <a class="action-link" href="{{ url_for('film_detail', film_id=film['id']) }}">Open</a>
+          {% endif %}
+          <form method="post" action="{{ url_for('force_exclude_route', film_id=film['id']) }}" style="display:inline-block; margin-left:8px;">
+            <button class="ghost icon-button" type="submit" title="Force exclude">&#128465;</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+<script>
+  const activeFilterTag = {{ active_filter_tag|tojson }};
+  const refreshFilms = async () => {
+    const statusUrl = activeFilterTag ? `{{ url_for('films_status') }}?tag=${encodeURIComponent(activeFilterTag)}` : "{{ url_for('films_status') }}";
+    const response = await fetch(statusUrl);
+    const payload = await response.json();
+    const tbody = document.querySelector("tbody");
+    if (!tbody) return;
+    const ordered = [...payload.films];
+    const seenIds = new Set(ordered.map((film) => String(film.id)));
+    ordered.forEach((film) => {
+      let row = tbody.querySelector(`tr[data-film-id="${film.id}"]`);
+      if (!row) {
+        row = document.createElement("tr");
+        row.dataset.filmId = film.id;
+        row.innerHTML = `
+          <td>${film.id}</td>
+          <td data-col="title"></td>
+          <td data-col="tags"></td>
+          <td class="status" data-col="pipeline"></td>
+          <td data-col="action"></td>
+        `;
+        tbody.appendChild(row);
+      }
+      row.className = film.is_dimmed ? "stale" : "";
+      row.querySelector('[data-col="title"]').textContent = film.title;
+      row.querySelector('[data-col="tags"]').innerHTML = film.tags_html;
+      row.querySelector('[data-col="pipeline"]').innerHTML = `<span class="status-badge ${film.pipeline_status}">${film.pipeline_status}</span>`;
+      row.querySelector('[data-col="action"]').innerHTML = `${film.show_open_link ? `<a class="action-link" href="/films/${film.id}">Open</a>` : ""}<form method="post" action="/films/${film.id}/force-exclude" style="display:inline-block; margin-left:8px;"><button class="ghost icon-button" type="submit" title="Force exclude">&#128465;</button></form>`;
+    });
+    tbody.querySelectorAll("tr[data-film-id]").forEach((row) => {
+      if (!seenIds.has(String(row.dataset.filmId))) {
+        const nextRow = row.nextElementSibling;
+        if (nextRow && nextRow.classList.contains("clips-row") && nextRow.dataset.filmId === row.dataset.filmId) {
+          nextRow.remove();
+        }
+        row.remove();
+      }
+    });
+    bindTagButtons();
+    bindFilmRows();
+    window.setTimeout(refreshFilms, 3000);
+  };
+  const closeExistingDrawers = (exceptFilmId = null) => {
+    document.querySelectorAll("tr.clips-row").forEach((row) => {
+      if (exceptFilmId && row.dataset.filmId === String(exceptFilmId)) return;
+      row.remove();
+    });
+  };
+  const bindTagButtons = () => {
+    document.querySelectorAll(".film-tag-button").forEach((button) => {
+      if (button.dataset.bound === "1") return;
+      button.dataset.bound = "1";
+      button.addEventListener("click", async () => {
+        if (!button.dataset.filmId) return;
+        const filmId = button.dataset.filmId;
+        const tag = button.dataset.tag;
+        const hostRow = button.closest("tr[data-film-id]");
+        const nextRow = hostRow?.nextElementSibling;
+        if (nextRow && nextRow.classList.contains("clips-row") && nextRow.dataset.filmId === filmId) {
+          nextRow.remove();
+          return;
+        }
+        closeExistingDrawers(filmId);
+        const response = await fetch(`/films/${filmId}/clips?tag=${encodeURIComponent(tag)}`);
+        const payload = await response.json();
+        const drawerRow = document.createElement("tr");
+        drawerRow.className = "clips-row";
+        drawerRow.dataset.filmId = filmId;
+        const drawerCell = document.createElement("td");
+        drawerCell.colSpan = 5;
+        if (!payload.clips.length) {
+          drawerCell.innerHTML = `<div class="clips-empty">No clips for tag "${tag}" yet.</div>`;
+        } else {
+          drawerCell.innerHTML = `<div class="clips-drawer">${payload.clips.map((clip) => `
+            <div class="clip-tile" data-clip-id="${clip.id}">
+              <video preload="metadata" controls src="/media/${clip.kind}/${clip.relpath}"></video>
+              <div class="clip-actions">
+                <button type="button" class="js-delete-db-clip delete-button" data-clip-id="${clip.id}" title="Delete clip">🗑 Delete</button>
+                <button type="button" class="js-ignore-db-clip ignore-button" data-clip-id="${clip.id}" title="Ignore clip">🚫 Ignore</button>
+              </div>
+            </div>
+          `).join("")}</div>`;
+        }
+        drawerRow.appendChild(drawerCell);
+        hostRow.insertAdjacentElement("afterend", drawerRow);
+        bindDrawerClipButtons();
+      });
+    });
+  };
+  const postForm = async (url, data) => {
+    const body = new URLSearchParams(data);
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+      body,
+    });
+    return response;
+  };
+  const bindDrawerClipButtons = () => {
+    document.querySelectorAll(".js-delete-db-clip").forEach((button) => {
+      if (button.dataset.bound === "1") return;
+      button.dataset.bound = "1";
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const clipId = button.dataset.clipId;
+        const tile = button.closest(".clip-tile");
+        const response = await postForm(`/clips/${clipId}/delete`, {});
+        if (response.ok && tile) {
+          tile.remove();
+        }
+      });
+    });
+    document.querySelectorAll(".js-ignore-db-clip").forEach((button) => {
+      if (button.dataset.bound === "1") return;
+      button.dataset.bound = "1";
+      button.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const clipId = button.dataset.clipId;
+        const tile = button.closest(".clip-tile");
+        const response = await postForm(`/clips/${clipId}/ignore`, {});
+        if (response.ok && tile) {
+          tile.remove();
+        }
+      });
+    });
+  };
+  const bindFilmRows = () => {
+    document.querySelectorAll('tbody tr[data-film-id]').forEach((row) => {
+      if (row.dataset.rowBound === "1") return;
+      row.dataset.rowBound = "1";
+      row.addEventListener("click", (event) => {
+        if (event.target.closest('button, a, form, video')) return;
+        const openLink = row.querySelector('a.action-link[href^="/films/"]');
+        if (openLink && !row.classList.contains("stale")) {
+          window.location = openLink.href;
+        }
+      });
+    });
+  };
+  bindTagButtons();
+  bindDrawerClipButtons();
+  bindFilmRows();
+  window.setTimeout(refreshFilms, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+FILM_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ film["title"] }}</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #111720; --border: #263244; --text: #edf3ff; --muted: #94a4bd; --link: #7cc7ff; --accent: #2f81f7; --accent-2: #123563; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; }
+    .panel { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); padding: 16px; margin-bottom: 20px; border-radius: 18px; box-shadow: 0 18px 60px rgba(0,0,0,0.28); }
+    .panel h2 { margin-top: 0; }
+    video { width: 100%; max-height: 74vh; background: black; display: block; }
+    button, input { font: inherit; }
+    button { padding: 8px 12px; background: linear-gradient(180deg, #2666b8 0%, var(--accent-2) 100%); color: white; border: 1px solid #3a78c4; border-radius: 12px; cursor: pointer; }
+    .ghost { background: #2a3442; border-color: #3b495d; }
+    .danger { background: #5e2534; border-color: #884055; }
+    .meta { font-family: monospace; font-size: 13px; }
+    .mark { border-top: 1px solid var(--border); padding: 10px 0; }
+    .note { width: 100%; min-height: 70px; background: #0f141b; color: var(--text); border: 1px solid #334152; border-radius: 12px; padding: 10px; }
+    input[type="number"] { background: #0f141b; color: var(--text); border: 1px solid #334152; border-radius: 10px; padding: 6px 8px; }
+    .small { color: var(--muted); font-size: 14px; }
+    .skim-shell { margin-top: 12px; }
+    .skim-viewport { position: relative; background: #05080d; border: 1px solid #314056; border-radius: 18px; overflow: hidden; }
+    .skim-overlay { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; justify-content: space-between; pointer-events: none; color: #f7e9d7; font: 12px/1.2 monospace; text-shadow: 0 1px 2px rgba(0,0,0,0.7); }
+    .skim-viewport video { cursor: ew-resize; touch-action: none; user-select: none; -webkit-user-select: none; }
+    .skim-help { margin-top: 8px; color: var(--muted); font-size: 13px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+    .debug-toggle { background: #2a3442; border-color: #3b495d; }
+    body.debug-off .debug-only { display: none; }
+    .film-tag-button { transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
+    .film-tag-button:hover { transform: translateY(-1px); filter: brightness(1.08); box-shadow: 0 8px 20px rgba(0,0,0,0.24); }
+    .tag-radio { position: absolute; opacity: 0; pointer-events: none; }
+    .tag-option { display: inline-flex; }
+    .tag-selector .film-tag-button[data-tag="kiss"] { background: linear-gradient(180deg, #6e2040 0%, #4e1530 100%); border-color: #a54c73; color: #ffd0e2; }
+    .tag-selector .film-tag-button[data-tag="phone"] { background: linear-gradient(180deg, #16395f 0%, #102845 100%); border-color: #3f79b5; color: #c3e4ff; }
+    .tag-selector .film-tag-button[data-tag="cry"] { background: linear-gradient(180deg, #224f43 0%, #16382f 100%); border-color: #4ca186; color: #c8ffea; }
+    .tag-selector .film-tag-button[data-tag="dance"] { background: linear-gradient(180deg, #5d3f12 0%, #412b0c 100%); border-color: #b8872f; color: #ffe2a3; }
+    .tag-selector .tag-radio:checked + .film-tag-button { opacity: 1; outline: 2px solid #87f0ae; }
+    .tag-selector .tag-radio:not(:checked) + .film-tag-button { opacity: 0.65; }
+  </style>
+</head>
+<body class="debug-off">
+  <div class="topbar">
+    <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+    <button type="button" id="debug-toggle" class="debug-toggle">Debug: Off</button>
+  </div>
+  <h1 class="debug-only">{{ film["title"] }}</h1>
+  <p class="meta debug-only">film_id={{ film["id"] }} pipeline={{ pipeline_status }}</p>
+  {% if skim_job and skim_job["status"] in ("queued", "running") %}
+    <div class="panel debug-only">
+      <strong>Skim preview is building.</strong>
+      <div class="small" id="skim-job-text">{{ skim_job["status_text"] }}</div>
+      <div style="height:12px;background:#e6d7c6;margin-top:8px;position:relative;">
+        <div id="skim-job-bar" style="height:12px;background:#7a241c;width:{{ skim_job['progress_percent'] }}%;"></div>
+      </div>
+    </div>
+  {% endif %}
+  {% if clip_job and clip_job["status"] in ("queued", "running") %}
+    <div class="panel debug-only">
+      <strong>Clip is building.</strong>
+      <div class="small" id="clip-job-text">{{ clip_job["status_text"] }}</div>
+      <div style="height:12px;background:#e6d7c6;margin-top:8px;position:relative;">
+        <div id="clip-job-bar" style="height:12px;background:#7a241c;width:{{ clip_job['progress_percent'] }}%;"></div>
+      </div>
+    </div>
+  {% endif %}
+  <div class="panel">
+    <h2 class="debug-only">Skim Review</h2>
+    <form method="post" action="{{ url_for('build_skim', film_id=film['id']) }}" class="debug-only">
+      <label>Sample every seconds <input type="number" step="1" min="1" name="sample_every_seconds" value="{{ skim.sample_every_seconds if skim else 4 }}"></label>
+      <label>Output fps <input type="number" step="1" min="1" name="output_fps" value="{{ skim.output_fps if skim else 12 }}"></label>
+      <button type="submit">Build / Refresh Skim Preview</button>
+    </form>
+    {% if skim %}
+      <p class="small debug-only">Move the mouse horizontally over the video to scrub. Click the video to add a mark. Use left/right arrow keys for frame stepping.</p>
+      <div class="skim-shell">
+        <div class="skim-viewport">
+          <video id="skim-video" preload="metadata" playsinline src="{{ url_for('media_file', kind='preview', relpath=skim.relpath) }}"></video>
+          <div class="skim-overlay">
+            <span id="skim-overlay-left" class="debug-only">skim 0.00s</span>
+            <span id="skim-overlay-right" class="debug-only">source 0s</span>
+          </div>
+        </div>
+      </div>
+      <form method="post" action="{{ url_for('add_mark', film_id=film['id']) }}" id="mark-form" style="margin-top: 12px;">
+        <input type="hidden" name="preview_seconds" id="preview-seconds" value="0">
+        <input type="hidden" name="sample_index" id="sample-index" value="1">
+        <input type="hidden" name="source_seconds" id="source-seconds" value="0">
+        <input type="hidden" name="skim_path" value="{{ skim.path }}">
+        <input type="hidden" name="skim_sample_every_seconds" value="{{ skim.sample_every_seconds }}">
+        <input type="hidden" name="skim_output_fps" value="{{ skim.output_fps }}">
+        <div class="row">
+          <p class="small debug-only" id="preview-readout">Current skim second: 0.00 | sample index: 1 | source second: 0</p>
+          <button type="submit">Mark Current Frame</button>
+        </div>
+      </form>
+    {% else %}
+      <p class="small">No skim preview built yet.</p>
+    {% endif %}
+  </div>
+  <div class="panel">
+    <h2>Marks & Clips</h2>
+    {% if marks %}
+      {% for mark in marks %}
+        <div class="mark">
+          <div class="meta">mark {{ mark["id"] }} | tag {{ mark["selected_tag"] or "untagged" }} <span class="debug-only">| sample {{ mark["sample_index"] }} | source {{ mark["source_seconds"] }}s</span></div>
+          <div>{{ mark["note"] or "" }}</div>
+          <form method="post" action="{{ url_for('update_mark_tag', mark_id=mark['id']) }}" class="tag-selector" style="margin-top:8px;">
+            <input type="hidden" name="return_film_id" value="{{ film['id'] }}">
+            <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+              {% for tag in ["kiss", "phone", "cry", "dance"] %}
+                <label class="tag-option">
+                  <input class="tag-radio js-autosubmit-tag" type="radio" name="selected_tag" value="{{ tag }}" {% if mark["selected_tag"] == tag or (not mark["selected_tag"] and tag == "kiss") %}checked{% endif %}>
+                  <span class="ghost film-tag-button" data-tag="{{ tag }}">{{ tag }}</span>
+                </label>
+              {% endfor %}
+            </div>
+          </form>
+          <form method="post" action="{{ url_for('build_clip', film_id=film['id'], mark_id=mark['id']) }}" style="margin-top:8px;">
+            <label>Pre <input type="number" step="1" min="1" name="pre_seconds" value="20"></label>
+            <label>Post <input type="number" step="1" min="1" name="post_seconds" value="20"></label>
+            <button type="submit">Build Rough Clip</button>
+          </form>
+          <form method="post" action="{{ url_for('delete_mark_route', mark_id=mark['id']) }}" style="margin-top:8px;">
+            <input type="hidden" name="return_film_id" value="{{ film['id'] }}">
+            <button class="ghost" type="submit">Delete Mark</button>
+          </form>
+          {% if mark["clip_relpath"] %}
+            <p><a href="{{ url_for('media_file', kind=mark['clip_kind'], relpath=mark['clip_relpath']) }}">Open clip</a></p>
+            <video id="clip-video-{{ mark['clip_id'] }}" controls preload="metadata" src="{{ url_for('media_file', kind=mark['clip_kind'], relpath=mark['clip_relpath']) }}"></video>
+            <form method="post" action="{{ url_for('update_clip_kiss_timing', clip_id=mark['clip_id']) }}" style="margin-top:8px;">
+              <input type="hidden" name="return_film_id" value="{{ film['id'] }}">
+              <input type="hidden" name="kiss_start_seconds" id="kiss-start-{{ mark['clip_id'] }}" value="{{ mark['kiss_start_seconds'] if mark['kiss_start_seconds'] is not none else '' }}">
+              <input type="hidden" name="kiss_end_seconds" id="kiss-end-{{ mark['clip_id'] }}" value="{{ mark['kiss_end_seconds'] if mark['kiss_end_seconds'] is not none else '' }}">
+              <div class="small" id="kiss-timing-view-{{ mark['clip_id'] }}">
+                Kiss start: {{ mark['kiss_start_seconds'] if mark['kiss_start_seconds'] is not none else '-' }} |
+                Kiss end: {{ mark['kiss_end_seconds'] if mark['kiss_end_seconds'] is not none else '-' }}
+              </div>
+              <div class="row">
+                <button class="ghost js-go-to-kiss" type="button" data-clip-id="{{ mark['clip_id'] }}">Go To Kiss</button>
+                <button class="ghost js-set-kiss-time" type="button" data-clip-id="{{ mark['clip_id'] }}" data-target="start">Set Kiss Start</button>
+                <button class="ghost js-set-kiss-time" type="button" data-clip-id="{{ mark['clip_id'] }}" data-target="end">Set Kiss End</button>
+                <button class="ghost" type="submit">Save Kiss Timing</button>
+              </div>
+            </form>
+            <form method="post" action="{{ url_for('delete_clip_route', clip_id=mark['clip_id']) }}" style="margin-top:8px;">
+              <input type="hidden" name="return_film_id" value="{{ film['id'] }}">
+              <button class="ghost" type="submit">Delete Clip</button>
+            </form>
+            <form method="post" action="{{ url_for('toggle_ignore_clip_route', clip_id=mark['clip_id']) }}" style="margin-top:8px;">
+              <input type="hidden" name="return_film_id" value="{{ film['id'] }}">
+              <button class="ghost" type="submit" title="{{ 'Unignore clip' if mark['clip_ignored'] else 'Ignore clip' }}">
+                {{ '🙈' if mark['clip_ignored'] else '🚫' }}
+              </button>
+            </form>
+          {% endif %}
+        </div>
+      {% endfor %}
+    {% else %}
+      <p class="small">No marks yet.</p>
+    {% endif %}
+  </div>
+  <div class="panel">
+    <div class="row">
+      <form method="post" action="{{ url_for('finalize_review', film_id=film['id']) }}">
+        <input type="hidden" name="action" value="no_kiss">
+        <input type="hidden" name="clip_timings_json" class="js-clip-timings-json" value="">
+        <button class="ghost" type="submit">Reviewed No Kiss</button>
+      </form>
+      <form method="post" action="{{ url_for('finalize_review', film_id=film['id']) }}">
+        <input type="hidden" name="action" value="has_kiss">
+        <input type="hidden" name="clip_timings_json" class="js-clip-timings-json" value="">
+        <button type="submit">Reviewed</button>
+      </form>
+    </div>
+  </div>
+<script>
+  const debugToggle = document.getElementById("debug-toggle");
+  const debugStorageKey = "ia-kissing-debug-hidden";
+  const applyDebugMode = (hidden) => {
+    document.body.classList.toggle("debug-off", hidden);
+    if (debugToggle) {
+      debugToggle.textContent = hidden ? "Debug: Off" : "Debug: On";
+    }
+  };
+  const storedValue = window.localStorage.getItem(debugStorageKey);
+  applyDebugMode(storedValue === null ? true : storedValue === "1");
+  if (debugToggle) {
+    debugToggle.addEventListener("click", () => {
+      const nextHidden = !document.body.classList.contains("debug-off");
+      window.localStorage.setItem(debugStorageKey, nextHidden ? "1" : "0");
+      applyDebugMode(nextHidden);
+    });
+  }
+  document.querySelectorAll(".js-autosubmit-tag").forEach((input) => {
+    input.addEventListener("change", () => {
+      const form = input.closest("form");
+      if (form) {
+        form.requestSubmit();
+      }
+    });
+  });
+  document.querySelectorAll(".js-set-kiss-time").forEach((button) => {
+    button.addEventListener("click", () => {
+      const clipId = button.dataset.clipId;
+      const target = button.dataset.target;
+      const video = document.getElementById(`clip-video-${clipId}`);
+      const input = document.getElementById(`kiss-${target}-${clipId}`);
+      const view = document.getElementById(`kiss-timing-view-${clipId}`);
+      if (!video || !input || !view) return;
+      input.value = (video.currentTime || 0).toFixed(3);
+      const start = document.getElementById(`kiss-start-${clipId}`)?.value || "-";
+      const end = document.getElementById(`kiss-end-${clipId}`)?.value || "-";
+      view.textContent = `Kiss start: ${start} | Kiss end: ${end}`;
+    });
+  });
+  document.querySelectorAll(".js-go-to-kiss").forEach((button) => {
+    button.addEventListener("click", () => {
+      const clipId = button.dataset.clipId;
+      const video = document.getElementById(`clip-video-${clipId}`);
+      const startInput = document.getElementById(`kiss-start-${clipId}`);
+      if (!video || !startInput) return;
+      const seconds = Number.parseFloat(startInput.value);
+      if (!Number.isFinite(seconds)) return;
+      video.currentTime = Math.max(0, seconds);
+      if (video.paused) {
+        video.play().catch(() => {});
+      }
+    });
+  });
+  document.querySelectorAll('form[action$="/finalize"]').forEach((form) => {
+    form.addEventListener("submit", () => {
+      const payload = [];
+      document.querySelectorAll('input[id^="kiss-start-"]').forEach((startInput) => {
+        const clipId = startInput.id.replace("kiss-start-", "");
+        const endInput = document.getElementById(`kiss-end-${clipId}`);
+        payload.push({
+          clip_id: clipId,
+          kiss_start_seconds: startInput.value || "",
+          kiss_end_seconds: endInput ? endInput.value || "" : "",
+        });
+      });
+      const target = form.querySelector(".js-clip-timings-json");
+      if (target) {
+        target.value = JSON.stringify(payload);
+      }
+    });
+  });
+</script>
+{% if skim %}
+<script>
+  const video = document.getElementById("skim-video");
+  const markForm = document.getElementById("mark-form");
+  const previewInput = document.getElementById("preview-seconds");
+  const sampleInput = document.getElementById("sample-index");
+  const sourceInput = document.getElementById("source-seconds");
+  const readout = document.getElementById("preview-readout");
+  const overlayLeft = document.getElementById("skim-overlay-left");
+  const overlayRight = document.getElementById("skim-overlay-right");
+  const sampleEvery = {{ skim.sample_every_seconds }};
+  const outputFps = {{ skim.output_fps }};
+  const frameDuration = 1 / outputFps;
+  let lastTapAt = 0;
+
+  const updateFields = () => {
+    const previewSeconds = video.currentTime || 0;
+    const sampleIndex = Math.max(1, Math.floor(previewSeconds * outputFps) + 1);
+    const sourceSeconds = (sampleIndex - 1) * sampleEvery;
+    previewInput.value = previewSeconds.toFixed(3);
+    sampleInput.value = sampleIndex;
+    sourceInput.value = sourceSeconds.toFixed(3);
+    readout.textContent = `Current skim second: ${previewSeconds.toFixed(2)} | sample index: ${sampleIndex} | source second: ${sourceSeconds.toFixed(0)}`;
+    overlayLeft.textContent = `skim ${previewSeconds.toFixed(2)}s`;
+    overlayRight.textContent = `source ${sourceSeconds.toFixed(0)}s | frame ${sampleIndex}`;
+  };
+
+  const scrubToVideoX = (clientX) => {
+    const rect = video.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const duration = video.duration || 0;
+    video.currentTime = duration * ratio;
+    updateFields();
+  };
+
+  video.addEventListener("mousemove", (event) => {
+    scrubToVideoX(event.clientX);
+  });
+  video.addEventListener("click", (event) => {
+    event.preventDefault();
+    scrubToVideoX(event.clientX);
+    markForm.requestSubmit();
+  });
+  video.addEventListener("touchmove", (event) => {
+    if (!event.touches.length) return;
+    event.preventDefault();
+    scrubToVideoX(event.touches[0].clientX);
+  }, { passive: false });
+  video.addEventListener("touchstart", (event) => {
+    if (!event.touches.length) return;
+    const now = Date.now();
+    const clientX = event.touches[0].clientX;
+    scrubToVideoX(clientX);
+    if (now - lastTapAt < 300) {
+      event.preventDefault();
+      markForm.requestSubmit();
+    }
+    lastTapAt = now;
+  }, { passive: false });
+  video.addEventListener("loadedmetadata", updateFields);
+  video.addEventListener("seeked", updateFields);
+  window.addEventListener("keydown", (event) => {
+    const active = document.activeElement;
+    if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) {
+      return;
+    }
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      video.currentTime = Math.max(0, (video.currentTime || 0) - frameDuration);
+      updateFields();
+    }
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      const duration = video.duration || 0;
+      video.currentTime = Math.min(duration, (video.currentTime || 0) + frameDuration);
+      updateFields();
+    }
+  });
+</script>
+{% endif %}
+{% if skim_job and skim_job["status"] in ("queued", "running") %}
+<script>
+  const pollSkim = async () => {
+    const response = await fetch("{{ url_for('skim_status', film_id=film['id']) }}");
+    const payload = await response.json();
+    const bar = document.getElementById("skim-job-bar");
+    const text = document.getElementById("skim-job-text");
+    if (bar) bar.style.width = `${payload.progress_percent}%`;
+    if (text) text.textContent = payload.status_text;
+    if (payload.status === "done") {
+      window.location = "{{ url_for('film_detail', film_id=film['id']) }}";
+      return;
+    }
+    if (payload.status === "error") {
+      if (text) text.textContent = payload.status_text;
+      return;
+    }
+    window.setTimeout(pollSkim, 1500);
+  };
+  window.setTimeout(pollSkim, 1500);
+</script>
+{% endif %}
+{% if clip_job and clip_job["status"] in ("queued", "running") %}
+<script>
+  const pollClip = async () => {
+    const response = await fetch("{{ url_for('clip_status', film_id=film['id']) }}");
+    const payload = await response.json();
+    const bar = document.getElementById("clip-job-bar");
+    const text = document.getElementById("clip-job-text");
+    if (bar) bar.style.width = `${payload.progress_percent}%`;
+    if (text) text.textContent = payload.status_text;
+    if (payload.status === "done") {
+      window.location = "{{ url_for('film_detail', film_id=film['id']) }}";
+      return;
+    }
+    if (payload.status === "error") {
+      if (text) text.textContent = payload.status_text;
+      return;
+    }
+    window.setTimeout(pollClip, 1500);
+  };
+  window.setTimeout(pollClip, 1500);
+</script>
+{% endif %}
+</body>
+</html>
+"""
+
+
+CLIPS_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Saved Clips</title>
+  <style>
+    body { margin: 16px; background: #111; color: #f3eee7; }
+    .grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+    .tile { background: #000; aspect-ratio: 16 / 9; overflow: hidden; }
+    .tile video { width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; background: #000; }
+    @media (max-width: 1400px) { .grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
+    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+    @media (max-width: 800px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 560px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  </style>
+</head>
+<body>
+  {% if clips %}
+    <div class="grid">
+      {% for clip in clips %}
+        <div class="tile">
+          <video preload="metadata" playsinline src="{{ url_for('media_file', kind=clip['kind'], relpath=clip['relpath']) }}"></video>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div>No clips yet.</div>
+  {% endif %}
+<script>
+  document.querySelectorAll(".tile video").forEach((video) => {
+    video.removeAttribute("controls");
+    video.addEventListener("click", () => {
+      if (video.paused) {
+        video.play();
+      } else {
+        video.pause();
+      }
+    });
+  });
+</script>
+</body>
+</html>
+"""
+
+
+REVIEW_DATA_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Review Data</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #111720; --border: #263244; --text: #edf3ff; --muted: #93a4bc; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: #7cc7ff; text-decoration: none; }
+    .section { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 18px; padding: 16px; margin-bottom: 18px; }
+    .section summary { cursor: pointer; list-style: none; }
+    .section summary::-webkit-details-marker { display: none; }
+    .section h2 { margin: 0 0 12px 0; display: inline-block; }
+    .section summary::after { content: "show"; float: right; color: var(--muted); font-size: 13px; margin-top: 6px; }
+    .section[open] summary::after { content: "hide"; }
+    .meta { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .card { background: #0b1016; border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
+    .card video { width: 100%; display: block; background: #000; aspect-ratio: 16 / 9; }
+    .card-body { padding: 10px; }
+    .path { font-size: 12px; color: var(--muted); word-break: break-all; margin-bottom: 8px; }
+    .row { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; border: 1px solid #324054; background: #1b2430; color: #c8d5e6; font-size: 12px; }
+    .badge.ignored { background: #252d37; border-color: #3e4d61; color: #94a4bd; }
+    .delete-button { padding: 6px 10px; line-height: 1; background: #3a2025; color: #ffd3db; border: 1px solid #8d4b58; border-radius: 10px; cursor: pointer; }
+    .empty { color: var(--muted); }
+    @media (max-width: 1200px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } body { margin: 14px; } }
+    @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <h1>Review Data</h1>
+  {% for section in sections %}
+    <details class="section" {% if section["open"] %}open{% endif %}>
+      <summary><h2>{{ section["title"] }}</h2></summary>
+      <div class="meta">{{ section["count"] }} video file{{ '' if section["count"] == 1 else 's' }}{% if section["root"] %} in {{ section["root"] }}{% endif %}</div>
+      {% if section["items"] %}
+        <div class="grid">
+          {% for item in section["items"] %}
+            <div class="card">
+              {% if item["playable"] %}
+                <video preload="metadata" controls src="{{ item['media_url'] }}"></video>
+              {% else %}
+                <div class="card-body">
+                  <div class="empty">Playback disabled</div>
+                </div>
+              {% endif %}
+              <div class="card-body">
+                <div class="row">
+                  <span class="badge">{{ item["size_text"] }}</span>
+                  <span class="badge {{ 'ignored' if item['status_kind'] != 'pending' else '' }}">{{ item["status_text"] }}</span>
+                  {% if item["ignored"] %}
+                    <span class="badge ignored">ignored clip</span>
+                  {% endif %}
+                </div>
+                <div class="path">{{ item["display_path"] }}</div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                  {% if item["film_id"] %}
+                    <form method="post" action="{{ url_for('requeue_review_data_movie') }}">
+                      <input type="hidden" name="film_id" value="{{ item['film_id'] }}">
+                      <button class="delete-button" type="submit" style="background:#132c49;border-color:#2b6aa7;color:#91ccff;">Requeue movie</button>
+                    </form>
+                  {% endif %}
+                  {% if item["status_kind"] == "stray" %}
+                    <form method="post" action="{{ url_for('delete_review_data_file') }}">
+                      <input type="hidden" name="kind" value="{{ item['kind'] }}">
+                      <input type="hidden" name="relpath" value="{{ item['relpath'] }}">
+                      <button class="delete-button" type="submit">Delete video file</button>
+                    </form>
+                  {% endif %}
+                </div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="empty">No video files in this section.</div>
+      {% endif %}
+    </details>
+  {% endfor %}
+</body>
+</html>
+"""
+
+
+def create_app() -> Flask:
+    app = Flask(__name__)
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    cors_allowed_origins = {"http://localhost:3000", "http://127.0.0.1:3000"}
+    cors_origin_patterns = [
+        re.compile(r"^http://10\.73\.73\.\d{1,3}:3000$"),
+    ]
+
+    @app.after_request
+    def add_cors_headers(response):
+        origin = request.headers.get("Origin")
+        origin_allowed = origin in cors_allowed_origins or (
+            isinstance(origin, str) and any(pattern.match(origin) for pattern in cors_origin_patterns)
+        )
+        if origin_allowed and (
+            request.path.startswith("/api/") or request.path.startswith("/media/")
+        ):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Range"
+            response.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Content-Type"
+        return response
+
+    @app.get("/")
+    def index():
+        with get_connection(settings.db_path) as conn:
+            next_film = _get_next_ready_film(conn)
+            if next_film:
+                return redirect(url_for("film_detail", film_id=next_film["id"]))
+            queue_job = _load_download_batch_job(conn)
+            ready_count = _count_active_pool_films(conn)
+        return render_template_string(
+            EMPTY_TEMPLATE,
+            ready_count=ready_count,
+            target_ready=READY_TARGET,
+            queue_status=queue_job["status_text"] if queue_job else "idle",
+        )
+
+    @app.get("/films")
+    def films_index():
+        active_filter_tag = request.args.get("tag", type=str)
+        films = _load_film_rows(settings, active_filter_tag)
+        return render_template_string(
+            FILMS_TEMPLATE,
+            films=films,
+            tag_stats=_load_global_tag_stats(settings),
+            active_filter_tag=active_filter_tag,
+            clip_order_mode=_get_clip_order_mode(settings),
+        )
+
+    @app.get("/films/status")
+    def films_status():
+        active_filter_tag = request.args.get("tag", type=str)
+        return jsonify({"films": _load_film_rows(settings, active_filter_tag)})
+
+    @app.post("/films/clip-order-mode")
+    def set_clip_order_mode():
+        mode = request.form.get("mode", "").strip()
+        if mode not in {"random", "ordered"}:
+            abort(400)
+        _set_clip_order_mode(settings, mode)
+        return redirect(url_for("films_index", tag=request.args.get("tag") or request.form.get("tag") or None))
+
+    @app.get("/films/<int:film_id>/clips")
+    def film_clips_payload(film_id: int):
+        tag = request.args.get("tag", type=str)
+        with get_connection(settings.db_path) as conn:
+            clips = _load_clips(conn, settings.clips_dir, film_id=film_id, tag=tag)
+        payload = [
+            {
+                "id": clip["id"],
+                "tag": clip.get("clip_tag"),
+                "relpath": clip["relpath"],
+                "kind": clip["kind"],
+            }
+            for clip in clips
+        ]
+        return jsonify({"clips": payload})
+
+    @app.get("/films/<int:film_id>")
+    def film_detail(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT * FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            _reconcile_stale_skim_job(conn, film_id)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+            marks = _load_marks(conn, settings.clips_dir, film_id)
+            skim_job = _load_latest_job(conn, film_id, "build_skim_preview")
+            clip_job = _load_latest_job(conn, film_id, "build_manual_clip")
+            review = _get_review_state(conn, film_id)
+            source_cached = _source_cached(settings, film["archive_identifier"])
+        return render_template_string(
+            FILM_TEMPLATE,
+            film=film,
+            skim=skim,
+            marks=marks,
+            skim_job=skim_job,
+            clip_job=clip_job,
+            pipeline_status=_display_pipeline_status(dict(film), skim_job, review, source_cached),
+        )
+
+    @app.post("/films/<int:film_id>/build-skim")
+    def build_skim(film_id: int):
+        sample_every_seconds = float(request.form.get("sample_every_seconds", 4))
+        output_fps = int(request.form.get("output_fps", 12))
+        _queue_build_skim(settings, film_id, sample_every_seconds=sample_every_seconds, output_fps=output_fps)
+        return redirect(url_for("film_detail", film_id=film_id))
+
+    @app.post("/films/<int:film_id>/marks")
+    def add_mark(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO manual_marks (
+                    film_id, skim_path, skim_sample_every_seconds, skim_output_fps,
+                    preview_seconds, sample_index, source_seconds, selected_tag, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    film_id,
+                    request.form.get("skim_path"),
+                    float(request.form.get("skim_sample_every_seconds", 4)),
+                    int(request.form.get("skim_output_fps", 12)),
+                    float(request.form.get("preview_seconds", 0)),
+                    int(request.form.get("sample_index", 1)),
+                    float(request.form.get("source_seconds", 0)),
+                    "kiss",
+                    "kiss",
+                    utc_now_iso(),
+                ),
+            )
+        return redirect(url_for("film_detail", film_id=film_id))
+
+    @app.post("/marks/<int:mark_id>/tag")
+    def update_mark_tag(mark_id: int):
+        selected_tag = request.form.get("selected_tag", "").strip()
+        if not selected_tag:
+            abort(400, "A tag must be selected")
+        return_film_id = request.form.get("return_film_id", type=int)
+        with get_connection(settings.db_path) as conn:
+            mark = conn.execute("SELECT * FROM manual_marks WHERE id = ?", (mark_id,)).fetchone()
+            if not mark:
+                abort(404)
+            conn.execute(
+                "UPDATE manual_marks SET selected_tag = ?, note = ? WHERE id = ?",
+                (selected_tag, selected_tag, mark_id),
+            )
+            conn.execute(
+                """
+                UPDATE manual_clips
+                SET clip_tag = ?,
+                    metadata_json = json_set(COALESCE(NULLIF(metadata_json, ''), '{}'), '$.tag', ?)
+                WHERE manual_mark_id = ?
+                """,
+                (selected_tag, selected_tag, mark_id),
+            )
+        if return_film_id:
+            return redirect(url_for("film_detail", film_id=return_film_id))
+        return redirect(url_for("films_index"))
+
+    @app.post("/films/<int:film_id>/marks/<int:mark_id>/build-clip")
+    def build_clip(film_id: int, mark_id: int):
+        pre_seconds = float(request.form.get("pre_seconds", 20))
+        post_seconds = float(request.form.get("post_seconds", 20))
+        with get_connection(settings.db_path) as conn:
+            mark = conn.execute("SELECT selected_tag FROM manual_marks WHERE id = ? AND film_id = ?", (mark_id, film_id)).fetchone()
+            if not mark or not mark["selected_tag"]:
+                abort(400, "A tagged mark is required before building a clip")
+            conn.execute(
+                """
+                INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+                VALUES (?, 'build_manual_clip', 'queued', ?, ?, ?, ?)
+                """,
+                (
+                    film_id,
+                    json.dumps({"mark_id": mark_id, "pre_seconds": pre_seconds, "post_seconds": post_seconds}, sort_keys=True),
+                    json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
+                    utc_now_iso(),
+                    utc_now_iso(),
+                ),
+            )
+            job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        _spawn_pipeline_command(
+            settings,
+            [
+                sys.executable,
+                "-m",
+                "ia_kissing_pipeline.webapp",
+                "build-manual-clip",
+                "--job-id",
+                str(job_id),
+                "--film-id",
+                str(film_id),
+                "--mark-id",
+                str(mark_id),
+                "--pre-seconds",
+                str(pre_seconds),
+                "--post-seconds",
+                str(post_seconds),
+            ],
+        )
+        return redirect(url_for("film_detail", film_id=film_id))
+
+    @app.post("/clips/<int:clip_id>/kiss-timing")
+    def update_clip_kiss_timing(clip_id: int):
+        return_film_id = request.form.get("return_film_id", type=int)
+        kiss_start_seconds = request.form.get("kiss_start_seconds", "").strip()
+        kiss_end_seconds = request.form.get("kiss_end_seconds", "").strip()
+        with get_connection(settings.db_path) as conn:
+            _persist_clip_kiss_timing(conn, clip_id, kiss_start_seconds, kiss_end_seconds)
+        if return_film_id:
+            return redirect(url_for("film_detail", film_id=return_film_id))
+        return redirect(url_for("clips_index"))
+
+    @app.post("/films/<int:film_id>/finalize")
+    def finalize_review(film_id: int):
+        action = request.form.get("action", "").strip()
+        notes = request.form.get("review_notes", "").strip() or None
+        review_status = "has_kiss" if action == "has_kiss" else "no_kiss"
+        clip_timings_json = request.form.get("clip_timings_json", "").strip()
+        if clip_timings_json:
+            payload = json.loads(clip_timings_json)
+            with get_connection(settings.db_path) as conn:
+                for item in payload:
+                    _persist_clip_kiss_timing(
+                        conn,
+                        int(item["clip_id"]),
+                        item.get("kiss_start_seconds", ""),
+                        item.get("kiss_end_seconds", ""),
+                    )
+        _apply_film_review_action(settings, film_id, review_status, notes)
+        return redirect(url_for("index"))
+
+    @app.post("/films/<int:film_id>/force-exclude")
+    def force_exclude_route(film_id: int):
+        _apply_film_review_action(settings, film_id, "force_excluded", "force excluded from /films")
+        return redirect(url_for("films_index"))
+
+    @app.get("/clips")
+    def clips_index():
+        with get_connection(settings.db_path) as conn:
+            clips = _load_clips(
+                conn,
+                settings.clips_dir,
+                film_id=request.args.get("film_id", type=int),
+                tag=request.args.get("tag", type=str),
+            )
+        return render_template_string(CLIPS_TEMPLATE, clips=clips)
+
+    @app.get("/review_data")
+    def review_data_index():
+        with get_connection(settings.db_path) as conn:
+            sections = _load_review_data_sections(conn, settings)
+        return render_template_string(REVIEW_DATA_TEMPLATE, sections=sections)
+
+    @app.post("/review_data/delete")
+    def delete_review_data_file():
+        kind = request.form.get("kind", "").strip()
+        relpath = request.form.get("relpath", "").strip()
+        path = _resolve_review_data_path(settings, kind, relpath)
+        if path is None or not path.exists():
+            abort(404)
+        path.unlink()
+        return redirect(url_for("review_data_index"))
+
+    @app.post("/review_data/requeue")
+    def requeue_review_data_movie():
+        film_id = request.form.get("film_id", type=int)
+        if not film_id:
+            abort(400)
+        if not _prepare_film_for_requeue(settings, film_id):
+            abort(404)
+        _queue_build_skim(settings, film_id, sample_every_seconds=4, output_fps=12)
+        return redirect(url_for("review_data_index"))
+
+    @app.get("/api/random-clips")
+    def random_clips_api():
+        tag = request.args.get("tag", type=str)
+        limit = max(1, min(50, request.args.get("limit", default=1, type=int) or 1))
+        with get_connection(settings.db_path) as conn:
+            clips = _load_random_clips(
+                conn,
+                settings.clips_dir,
+                limit=limit,
+                tag=tag,
+                mode=_get_clip_order_mode(settings),
+            )
+        payload = [
+            {
+                "id": clip["id"],
+                "film_id": clip["film_id"],
+                "title": clip["title"],
+                "tag": clip.get("clip_tag"),
+                "kind": clip["kind"],
+                "relpath": clip["relpath"],
+                "media_url": url_for("media_file", kind=clip["kind"], relpath=clip["relpath"]),
+                "start_seconds": clip["start_seconds"],
+                "end_seconds": clip["end_seconds"],
+                "kiss_start_seconds": clip.get("kiss_start_seconds"),
+                "kiss_end_seconds": clip.get("kiss_end_seconds"),
+            }
+            for clip in clips
+        ]
+        return jsonify({"clips": payload, "count": len(payload)})
+
+    @app.post("/clips/<int:clip_id>/crop")
+    def crop_clip_route(clip_id: int):
+        from ia_kissing_pipeline.video.extract_clips import crop_clip
+
+        crop_x = float(request.form.get("crop_x", 0))
+        crop_y = float(request.form.get("crop_y", 0))
+        crop_width = float(request.form.get("crop_width", 1))
+        crop_height = float(request.form.get("crop_height", 1))
+        with get_connection(settings.db_path) as conn:
+            clip = conn.execute("SELECT * FROM manual_clips WHERE id = ?", (clip_id,)).fetchone()
+            if not clip:
+                abort(404)
+            source_path = Path(clip["clip_path"])
+            cropped_path = source_path.with_name(f"{source_path.stem}-crop.mp4")
+        crop_clip(source_path, cropped_path, crop_x, crop_y, crop_width, crop_height)
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE manual_clips
+                SET cropped_clip_path = ?, crop_x = ?, crop_y = ?, crop_width = ?, crop_height = ?
+                WHERE id = ?
+                """,
+                (str(cropped_path), crop_x, crop_y, crop_width, crop_height, clip_id),
+        )
+        return redirect(url_for("clips_index"))
+
+    @app.post("/clips/<int:clip_id>/delete")
+    def delete_clip_route(clip_id: int):
+        return_film_id = request.form.get("return_film_id", type=int)
+        with get_connection(settings.db_path) as conn:
+            clip = conn.execute("SELECT * FROM manual_clips WHERE id = ?", (clip_id,)).fetchone()
+            if not clip:
+                abort(404)
+            for path_value in (clip["cropped_clip_path"], clip["clip_path"]):
+                if path_value:
+                    path = Path(path_value)
+                    if path.exists():
+                        path.unlink()
+            conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip_id,))
+        if return_film_id:
+            return redirect(url_for("film_detail", film_id=return_film_id))
+        return redirect(url_for("clips_index"))
+
+    @app.post("/clips/<int:clip_id>/ignore")
+    def toggle_ignore_clip_route(clip_id: int):
+        return_film_id = request.form.get("return_film_id", type=int)
+        with get_connection(settings.db_path) as conn:
+            clip = conn.execute("SELECT ignored FROM manual_clips WHERE id = ?", (clip_id,)).fetchone()
+            if not clip:
+                abort(404)
+            next_value = 0 if int(clip["ignored"] or 0) else 1
+            conn.execute("UPDATE manual_clips SET ignored = ? WHERE id = ?", (next_value, clip_id))
+        if return_film_id:
+            return redirect(url_for("film_detail", film_id=return_film_id))
+        return redirect(url_for("clips_index"))
+
+    @app.post("/marks/<int:mark_id>/delete")
+    def delete_mark_route(mark_id: int):
+        return_film_id = request.form.get("return_film_id", type=int)
+        with get_connection(settings.db_path) as conn:
+            clip = conn.execute("SELECT * FROM manual_clips WHERE manual_mark_id = ?", (mark_id,)).fetchone()
+            if clip:
+                for path_value in (clip["cropped_clip_path"], clip["clip_path"]):
+                    if path_value:
+                        path = Path(path_value)
+                        if path.exists():
+                            path.unlink()
+                conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip["id"],))
+            conn.execute("DELETE FROM manual_marks WHERE id = ?", (mark_id,))
+        if return_film_id:
+            return redirect(url_for("film_detail", film_id=return_film_id))
+        return redirect(url_for("films_index"))
+
+    @app.get("/films/<int:film_id>/skim-status")
+    def skim_status(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            job = _load_latest_job(conn, film_id, "build_skim_preview")
+        return jsonify(job or {"status": "idle", "progress_percent": 0, "status_text": "idle"})
+
+    @app.get("/films/<int:film_id>/clip-status")
+    def clip_status(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            job = _load_latest_job(conn, film_id, "build_manual_clip")
+        return jsonify(job or {"status": "idle", "progress_percent": 0, "status_text": "idle"})
+
+    @app.get("/media/<kind>/<path:relpath>")
+    def media_file(kind: str, relpath: str):
+        roots = {
+            "preview": settings.preview_dir,
+            "download": settings.download_dir,
+            "clip": settings.clips_dir,
+        }
+        root = roots.get(kind)
+        if root is None:
+            abort(404)
+        path = (root / relpath).resolve()
+        if not str(path).startswith(str(root.resolve())) or not path.exists():
+            abort(404)
+        if kind == "clip":
+            with get_connection(settings.db_path) as conn:
+                ignored = conn.execute(
+                    """
+                    SELECT 1
+                    FROM manual_clips
+                    WHERE ignored = 1
+                      AND (
+                        clip_path = ?
+                        OR cropped_clip_path = ?
+                      )
+                    LIMIT 1
+                    """,
+                    (str(path), str(path)),
+                ).fetchone()
+            if ignored:
+                abort(404)
+        return send_file(path)
+
+    @app.get("/source")
+    def source_archive():
+        path = Path("/home/bot/ia-kissing-pipeline-code.zip")
+        if not path.exists():
+            abort(404)
+        return send_file(
+            path,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name="ia-kissing-pipeline-code.zip",
+        )
+
+    return app
+
+
+def _decorate_film_row(film: dict, conn, settings) -> dict:
+    review = _get_review_state(conn, film["id"])
+    _reconcile_stale_skim_job(conn, film["id"])
+    skim = _load_latest_job(conn, film["id"], "build_skim_preview")
+    source_cached = _source_cached(settings, film["archive_identifier"])
+    film["pipeline_status"] = _display_pipeline_status(film, skim, review, source_cached)
+    film_tags = _load_film_tags(conn, film["id"], review)
+    clip_counts = _load_film_clip_counts(conn, film["id"])
+    active_clip_counts = _load_film_clip_counts(conn, film["id"], include_ignored=False)
+    film_tags = [tag for tag in film_tags if clip_counts.get(tag, 0) > 0]
+    film["tags"] = film_tags
+    film["tags_html"] = " ".join(
+        f'<button type="button" class="icon-button film-tag-button {"muted-tag" if active_clip_counts.get(tag, 0) == 0 else ""}" data-film-id="{film["id"]}" data-tag="{tag}" style="margin-right:6px;">{tag} ({clip_counts.get(tag, 0)})</button>'
+        for tag in film_tags
+    ) or '<span class="small">-</span>'
+    film["needs_review"] = film["pipeline_status"] in {
+        "checking_metadata",
+        "checking_title",
+        "awaiting_download",
+        "downloading",
+        "pending",
+    }
+    film["show_open_link"] = film["pipeline_status"] in {"pending", "reviewed_has_kiss"}
+    film["is_openable"] = film["pipeline_status"] == "pending"
+    film["is_dimmed"] = film["pipeline_status"] != "pending"
+    return film
+
+
+def _load_film_tags(conn, film_id: int, review: dict) -> list[str]:
+    tags = {
+        row["clip_tag"]
+        for row in conn.execute(
+            "SELECT DISTINCT clip_tag FROM manual_clips WHERE film_id = ? AND clip_tag IS NOT NULL AND clip_tag != ''",
+            (film_id,),
+        ).fetchall()
+    }
+    tags.update(
+        row["selected_tag"]
+        for row in conn.execute(
+            "SELECT DISTINCT selected_tag FROM manual_marks WHERE film_id = ? AND selected_tag IS NOT NULL AND selected_tag != ''",
+            (film_id,),
+        ).fetchall()
+    )
+    if review["review_status"] == "has_kiss":
+        tags.add("kiss")
+    return sorted(tags)
+
+
+def _load_film_clip_counts(conn, film_id: int, include_ignored: bool = True) -> dict[str, int]:
+    ignored_clause = "" if include_ignored else "AND ignored = 0"
+    return {
+        row["clip_tag"]: int(row["count"])
+        for row in conn.execute(
+            """
+            SELECT clip_tag, COUNT(*) AS count
+            FROM manual_clips
+            WHERE film_id = ? AND clip_tag IS NOT NULL AND clip_tag != ''
+              {ignored_clause}
+            GROUP BY clip_tag
+            """.format(ignored_clause=ignored_clause),
+            (film_id,),
+        ).fetchall()
+    }
+
+
+def _load_film_rows(settings, filter_tag: str | None = None) -> list[dict]:
+    with get_connection(settings.db_path) as conn:
+        films = [_decorate_film_row(dict(row), conn, settings) for row in conn.execute("SELECT * FROM films ORDER BY id ASC").fetchall()]
+    if filter_tag:
+        films = [film for film in films if filter_tag in film["tags"]]
+    priority = {
+        "pending": 0,
+        "awaiting_download": 1,
+        "checking_metadata": 2,
+        "checking_title": 3,
+        "downloading": 4,
+        "reviewed_has_kiss": 5,
+    }
+    films.sort(key=lambda film: (0 if film["needs_review"] else 1, priority.get(film["pipeline_status"], 9), film["id"]))
+    return films
+
+
+def _load_global_tag_stats(settings) -> list[dict]:
+    with get_connection(settings.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT clip_tag AS tag, COUNT(*) AS count
+            FROM manual_clips
+            WHERE clip_tag IS NOT NULL AND clip_tag != ''
+            GROUP BY clip_tag
+            ORDER BY clip_tag ASC
+            """
+        ).fetchall()
+    return [{"tag": row["tag"], "count": int(row["count"])} for row in rows]
+
+
+def _get_clip_order_mode(settings) -> str:
+    with get_connection(settings.db_path) as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = 'clip_order_mode'").fetchone()
+    value = row["value"] if row else "random"
+    return value if value in {"random", "ordered"} else "random"
+
+
+def _set_clip_order_mode(settings, mode: str) -> None:
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value)
+            VALUES ('clip_order_mode', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (mode,),
+        )
+
+
+def _display_pipeline_status(film: dict, skim_job: dict | None, review: dict, source_cached: bool) -> str:
+    review_status = review["review_status"]
+    if review_status != "pending" and not review["cleanup_completed"]:
+        return "deleting"
+    if review_status == "has_kiss":
+        return "reviewed_has_kiss"
+    if review_status == "no_kiss":
+        return "reviewed_no_kiss"
+    if review_status == "force_excluded":
+        return "excluded_manual"
+    if skim_job and skim_job["status"] in ("queued", "running"):
+        return "downloading"
+    if skim_job and skim_job["status"] == "error":
+        return "source_error"
+    status = film["status"]
+    if status.startswith("excluded_"):
+        return status
+    if status == "ingested":
+        return "checking_metadata"
+    if source_cached and _has_ready_skim(film["id"]):
+        return "pending"
+    if status in ("metadata_scored", "text_gate_passed", "rights_screened"):
+        return "awaiting_download"
+    return status
+
+
+def _get_next_ready_film(conn):
+    return conn.execute(
+        """
+        SELECT f.*
+        FROM films f
+        LEFT JOIN film_reviews fr ON fr.film_id = f.id
+        WHERE COALESCE(fr.review_status, 'pending') = 'pending'
+          AND f.status IN ('metadata_scored', 'text_gate_passed', 'rights_screened')
+          AND EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status = 'done'
+          )
+        ORDER BY f.id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def _count_ready_films(conn) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM films f
+        LEFT JOIN film_reviews fr ON fr.film_id = f.id
+        WHERE COALESCE(fr.review_status, 'pending') = 'pending'
+          AND f.status IN ('metadata_scored', 'text_gate_passed', 'rights_screened')
+          AND EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status = 'done'
+          )
+        """
+    ).fetchone()
+    return int(row["count"])
+
+
+def _count_active_pool_films(conn) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM films f
+        LEFT JOIN film_reviews fr ON fr.film_id = f.id
+        WHERE COALESCE(fr.review_status, 'pending') = 'pending'
+          AND f.status IN ('metadata_scored', 'text_gate_passed', 'rights_screened')
+        """
+    ).fetchone()
+    return int(row["count"])
+
+
+def _find_next_download_candidate(conn):
+    return conn.execute(
+        """
+        SELECT f.id
+        FROM films f
+        LEFT JOIN film_reviews fr ON fr.film_id = f.id
+        WHERE f.status IN ('metadata_scored', 'text_gate_passed', 'rights_screened')
+          AND COALESCE(fr.review_status, 'pending') = 'pending'
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status = 'done'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status IN ('queued', 'running')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status = 'error'
+          )
+        ORDER BY f.id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+
+
+def _count_download_candidates(conn) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM films f
+        LEFT JOIN film_reviews fr ON fr.film_id = f.id
+        WHERE f.status IN ('metadata_scored', 'text_gate_passed', 'rights_screened')
+          AND COALESCE(fr.review_status, 'pending') = 'pending'
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status = 'done'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status IN ('queued', 'running')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM analysis_jobs j
+            WHERE j.film_id = f.id
+              AND j.job_type = 'build_skim_preview'
+              AND j.status = 'error'
+          )
+        """
+    ).fetchone()
+    return int(row["count"])
+
+
+def _has_ready_skim(film_id: int) -> bool:
+    settings = load_settings()
+    with get_connection(settings.db_path) as conn:
+        return _load_latest_skim(conn, settings.preview_dir, film_id) is not None
+
+
+def _get_review_state(conn, film_id: int) -> dict:
+    row = conn.execute("SELECT review_status, cleanup_completed FROM film_reviews WHERE film_id = ?", (film_id,)).fetchone()
+    if not row:
+        return {"review_status": "pending", "cleanup_completed": 1}
+    return {"review_status": row["review_status"], "cleanup_completed": int(row["cleanup_completed"])}
+
+
+def _load_latest_skim(conn, preview_dir: Path, film_id: int) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT result_json
+        FROM analysis_jobs
+        WHERE film_id = ? AND job_type = 'build_skim_preview' AND status = 'done'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (film_id,),
+    ).fetchone()
+    if not row:
+        return None
+    payload = json.loads(row["result_json"])
+    path = Path(payload["preview_path"])
+    if not path.exists():
+        return None
+    return {
+        "path": str(path),
+        "relpath": str(path.relative_to(preview_dir)),
+        "sample_every_seconds": float(payload.get("sample_every_seconds", 4)),
+        "output_fps": int(payload.get("output_fps", 12)),
+    }
+
+
+def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:
+    if film_id is None:
+        row = conn.execute(
+            """
+            SELECT id, status, result_json, error_text
+            FROM analysis_jobs
+            WHERE film_id IS NULL AND job_type = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_type,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id, status, result_json, error_text
+            FROM analysis_jobs
+            WHERE film_id = ? AND job_type = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (film_id, job_type),
+        ).fetchone()
+    if not row:
+        return None
+    payload = json.loads(row["result_json"] or "{}")
+    progress = float(payload.get("progress", 0.0))
+    phase = payload.get("phase", row["status"])
+    status_text = {
+        "queued": "Queued",
+        "expanding_pool": "Adding films to the download pool",
+        "extracting_frames": "Extracting frames from source video",
+        "numbering_frames": "Numbering sampled frames",
+        "encoding_preview": "Encoding skim preview video",
+        "building_clip": "Building rough clip",
+        "cropping_clip": "Cropping clip",
+        "downloading_ready": "Downloading films",
+        "done": "Done",
+        "error": row["error_text"] or "Error",
+    }.get(phase, phase.replace("_", " "))
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "phase": phase,
+        "progress": progress,
+        "progress_percent": int(max(0, min(100, round(progress * 100)))),
+        "status_text": status_text,
+    }
+
+
+def _load_marks(conn, clips_dir: Path, film_id: int) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT manual_marks.*, manual_clips.id AS clip_id, manual_clips.clip_path, manual_clips.cropped_clip_path, manual_clips.metadata_json, manual_clips.ignored AS clip_ignored
+        FROM manual_marks
+        LEFT JOIN manual_clips ON manual_clips.manual_mark_id = manual_marks.id
+        WHERE manual_marks.film_id = ?
+        ORDER BY manual_marks.id DESC
+        """,
+        (film_id,),
+    ).fetchall()
+    marks = []
+    for row in rows:
+        item = dict(row)
+        clip_path = item.get("cropped_clip_path") or item.get("clip_path")
+        item["clip_relpath"], item["clip_kind"] = _resolve_media_relpath(clip_path, clips_dir)
+        metadata = json.loads(item.get("metadata_json") or "{}")
+        item["kiss_start_seconds"] = metadata.get("kiss_start_seconds")
+        item["kiss_end_seconds"] = metadata.get("kiss_end_seconds")
+        item["clip_ignored"] = bool(item.get("clip_ignored"))
+        marks.append(item)
+    return marks
+
+
+def _persist_clip_kiss_timing(conn, clip_id: int, kiss_start_seconds, kiss_end_seconds) -> None:
+    clip = conn.execute("SELECT metadata_json FROM manual_clips WHERE id = ?", (clip_id,)).fetchone()
+    if not clip:
+        raise ValueError(f"Clip {clip_id} not found")
+    metadata = json.loads(clip["metadata_json"] or "{}")
+    metadata["kiss_start_seconds"] = float(kiss_start_seconds) if str(kiss_start_seconds).strip() else None
+    metadata["kiss_end_seconds"] = float(kiss_end_seconds) if str(kiss_end_seconds).strip() else None
+    conn.execute(
+        "UPDATE manual_clips SET metadata_json = ? WHERE id = ?",
+        (json.dumps(metadata, sort_keys=True), clip_id),
+    )
+
+
+def _load_clips(conn, clips_dir: Path, film_id: int | None = None, tag: str | None = None) -> list[dict]:
+    clauses = ["manual_clips.ignored = 0"]
+    params: list[object] = []
+    if film_id is not None:
+        clauses.append("manual_clips.film_id = ?")
+        params.append(film_id)
+    if tag:
+        clauses.append("manual_clips.clip_tag = ?")
+        params.append(tag)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"""
+        SELECT manual_clips.*, films.title
+        FROM manual_clips
+        JOIN films ON films.id = manual_clips.film_id
+        {where_sql}
+        ORDER BY manual_clips.created_at DESC
+        """,
+        params,
+    ).fetchall()
+    return _hydrate_clip_rows(rows, clips_dir)
+
+
+def _load_random_clips(conn, clips_dir: Path, limit: int, tag: str | None = None, mode: str = "random") -> list[dict]:
+    clauses = ["manual_clips.ignored = 0"]
+    params: list[object] = []
+    if tag:
+        clauses.append("manual_clips.clip_tag = ?")
+        params.append(tag)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    if mode == "ordered":
+        cursor = _get_clip_order_cursor(conn, tag)
+        base_sql = f"""
+            SELECT manual_clips.*, films.title
+            FROM manual_clips
+            JOIN films ON films.id = manual_clips.film_id
+            {where_sql}
+        """
+        rows = conn.execute(
+            f"""
+            {base_sql}
+            AND manual_clips.id > ?
+            ORDER BY manual_clips.id ASC
+            LIMIT ?
+            """,
+            [*params, cursor, limit],
+        ).fetchall()
+        if len(rows) < limit:
+            rows += conn.execute(
+                f"""
+                {base_sql}
+                ORDER BY manual_clips.id ASC
+                LIMIT ?
+                """,
+                [*params, limit - len(rows)],
+            ).fetchall()
+        clips = _hydrate_clip_rows(rows, clips_dir)
+        if clips:
+            _set_clip_order_cursor(conn, tag, int(clips[-1]["id"]))
+        return clips
+    rows = conn.execute(
+        f"""
+        SELECT manual_clips.*, films.title
+        FROM manual_clips
+        JOIN films ON films.id = manual_clips.film_id
+        {where_sql}
+        ORDER BY RANDOM()
+        LIMIT ?
+        """,
+        [*params, limit],
+    ).fetchall()
+    return _hydrate_clip_rows(rows, clips_dir)
+
+
+def _hydrate_clip_rows(rows, clips_dir: Path) -> list[dict]:
+    clips = []
+    for row in rows:
+        item = dict(row)
+        clip_path = item.get("cropped_clip_path") or item.get("clip_path")
+        relpath, kind = _resolve_media_relpath(clip_path, clips_dir)
+        if not relpath:
+            continue
+        metadata = json.loads(item.get("metadata_json") or "{}")
+        item["kiss_start_seconds"] = metadata.get("kiss_start_seconds")
+        item["kiss_end_seconds"] = metadata.get("kiss_end_seconds")
+        item["relpath"] = relpath
+        item["kind"] = kind
+        clips.append(item)
+    return clips
+
+
+def _clip_order_cursor_key(tag: str | None) -> str:
+    return f"clip_order_cursor:{tag}" if tag else "clip_order_cursor:all"
+
+
+def _get_clip_order_cursor(conn, tag: str | None) -> int:
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = ?",
+        (_clip_order_cursor_key(tag),),
+    ).fetchone()
+    if not row:
+        return 0
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_clip_order_cursor(conn, tag: str | None, clip_id: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO app_settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (_clip_order_cursor_key(tag), str(clip_id)),
+    )
+
+
+def _resolve_media_relpath(path_value: str | None, clips_dir: Path) -> tuple[str | None, str]:
+    if not path_value:
+        return None, "clip"
+    path = Path(path_value)
+    if not path.exists():
+        return None, "clip"
+    try:
+        return str(path.relative_to(clips_dir)), "clip"
+    except ValueError:
+        preview_dir = load_settings().preview_dir
+        try:
+            return str(path.relative_to(preview_dir)), "preview"
+        except ValueError:
+            return None, "clip"
+
+
+def _load_download_batch_job(conn) -> dict | None:
+    return (
+        _load_latest_job(conn, None, "download_batch")
+        or _load_latest_job(conn, None, "get_more_vids")
+        or _load_latest_job(conn, None, "ensure_review_queue")
+    )
+
+
+def _source_cached(settings, archive_identifier: str) -> bool:
+    source_dir = settings.download_dir / archive_identifier
+    return source_dir.exists() and any(path.is_file() for path in source_dir.iterdir())
+
+
+def _format_size(size_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(size_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024.0
+    return f"{size_bytes}B"
+
+
+def _resolve_review_data_path(settings, kind: str, relpath: str) -> Path | None:
+    roots = {
+        "download": settings.download_dir,
+        "preview": settings.preview_dir,
+        "clip": settings.clips_dir,
+        "data": settings.db_path.parent,
+    }
+    root = roots.get(kind)
+    if root is None:
+        return None
+    path = (root / relpath).resolve()
+    if not str(path).startswith(str(root.resolve())):
+        return None
+    return path
+
+
+def _build_film_status_map(conn, settings) -> dict[int, str]:
+    status_map: dict[int, str] = {}
+    for row in conn.execute("SELECT * FROM films ORDER BY id ASC").fetchall():
+        film = dict(row)
+        review = _get_review_state(conn, film["id"])
+        skim = _load_latest_job(conn, film["id"], "build_skim_preview")
+        source_cached = _source_cached(settings, film["archive_identifier"])
+        status_map[int(film["id"])] = _display_pipeline_status(film, skim, review, source_cached)
+    return status_map
+
+
+def _review_data_status(status_map: dict[int, str], film_id: int | None) -> tuple[str, str]:
+    if film_id is None:
+        return "stray", "stray"
+    pipeline_status = status_map.get(int(film_id))
+    if pipeline_status in {"pending", "awaiting_download", "downloading", "checking_metadata", "checking_title"}:
+        return "pending", "pending review"
+    if pipeline_status:
+        return "linked", f"linked: {pipeline_status}"
+    return "stray", "stray"
+
+
+def _load_review_data_sections(conn, settings) -> list[dict]:
+    status_map = _build_film_status_map(conn, settings)
+    clip_rows = conn.execute(
+        """
+        SELECT id, film_id, clip_path, cropped_clip_path, ignored
+        FROM manual_clips
+        """
+    ).fetchall()
+    clip_path_index: dict[str, dict] = {}
+    for row in clip_rows:
+        item = dict(row)
+        for path_value in (item.get("clip_path"), item.get("cropped_clip_path")):
+            if path_value:
+                clip_path_index[str(Path(path_value).resolve())] = item
+    film_by_archive = {
+        row["archive_identifier"]: int(row["id"])
+        for row in conn.execute("SELECT id, archive_identifier FROM films").fetchall()
+    }
+
+    def scan_section(
+        title: str,
+        kind: str,
+        root: Path,
+        playable: bool = True,
+        include_root_files_only: bool = False,
+        open_by_default: bool = False,
+    ) -> dict:
+        items = []
+        files = []
+        if include_root_files_only:
+            files = [path for path in root.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES]
+        else:
+            files = [path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES]
+        for path in sorted(files):
+            relpath = str(path.relative_to(root))
+            ignored = False
+            film_id = None
+            if kind == "clip":
+                clip_row = clip_path_index.get(str(path.resolve()))
+                if clip_row:
+                    ignored = bool(clip_row.get("ignored"))
+                    film_id = clip_row.get("film_id")
+            else:
+                parts = Path(relpath).parts
+                archive_identifier = parts[0] if len(parts) > 1 else None
+                if archive_identifier:
+                    film_id = film_by_archive.get(archive_identifier)
+            status_kind, status_text = _review_data_status(status_map, film_id)
+            items.append(
+                {
+                    "kind": kind,
+                    "relpath": relpath,
+                    "display_path": relpath,
+                    "size_text": _format_size(path.stat().st_size),
+                    "media_url": url_for("media_file", kind=kind, relpath=relpath) if playable and not ignored else None,
+                    "playable": playable and not ignored,
+            "ignored": ignored,
+            "film_id": film_id,
+            "status_kind": status_kind,
+            "status_text": status_text,
+                }
+            )
+        return {
+            "title": title,
+            "root": str(root),
+            "count": len(items),
+            "items": items,
+            "open": open_by_default,
+        }
+
+    return [
+        scan_section("Downloaded Sources", "download", settings.download_dir, open_by_default=True),
+        scan_section("Skim Previews", "preview", settings.preview_dir),
+        scan_section("Saved Clips", "clip", settings.clips_dir),
+        scan_section("Loose Data Videos", "data", settings.db_path.parent, playable=False, include_root_files_only=True),
+    ]
+
+
+def _spawn_pipeline_command(settings, command: list[str]) -> None:
+    env = os.environ.copy()
+    env.setdefault("DB_PATH", str(settings.db_path))
+    env.setdefault("CACHE_DIR", str(settings.cache_dir))
+    env.setdefault("DOWNLOAD_DIR", str(settings.download_dir))
+    env.setdefault("FRAME_DIR", str(settings.frame_dir))
+    env.setdefault("PREVIEW_DIR", str(settings.preview_dir))
+    env.setdefault("CLIPS_DIR", str(settings.clips_dir))
+    env.setdefault("LOG_DIR", str(settings.log_dir))
+    project_root = Path(__file__).resolve().parents[2]
+    log_path = settings.log_dir / "webapp-jobs.log"
+    with log_path.open("a") as log_file:
+        subprocess.Popen(command, cwd=project_root, env=env, stdout=log_file, stderr=log_file, start_new_session=True)
+
+
+def _queue_build_skim(settings, film_id: int, sample_every_seconds: float = 4, output_fps: int = 12, max_height: int = 360) -> int:
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (?, 'build_skim_preview', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                film_id,
+                json.dumps({"sample_every_seconds": sample_every_seconds, "output_fps": output_fps}, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
+                utc_now_iso(),
+                utc_now_iso(),
+            ),
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    _spawn_pipeline_command(
+        settings,
+        [
+            sys.executable,
+            "-m",
+            "ia_kissing_pipeline.webapp",
+            "build-skim-job",
+            "--job-id",
+            str(job_id),
+            "--film-id",
+            str(film_id),
+            "--sample-every-seconds",
+            str(sample_every_seconds),
+            "--output-fps",
+            str(output_fps),
+            "--max-height",
+            str(max_height),
+        ],
+    )
+    return int(job_id)
+
+
+def _prepare_film_for_requeue(settings, film_id: int) -> bool:
+    now = utc_now_iso()
+    with get_connection(settings.db_path) as conn:
+        film = conn.execute("SELECT id FROM films WHERE id = ?", (film_id,)).fetchone()
+        if not film:
+            return False
+        _terminate_film_workers(film_id)
+        conn.execute(
+            """
+            UPDATE films
+            SET status = 'metadata_scored', updated_at = ?
+            WHERE id = ?
+            """,
+            (now, film_id),
+        )
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'error', error_text = 'superseded by manual requeue', updated_at = ?
+            WHERE film_id = ?
+              AND job_type = 'build_skim_preview'
+              AND status IN ('queued', 'running')
+            """,
+            (now, film_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO film_reviews (film_id, review_status, review_notes, reviewed_at, cleanup_completed, cleanup_at)
+            VALUES (?, 'pending', 'requeued from review_data', NULL, 0, NULL)
+            ON CONFLICT(film_id) DO UPDATE SET
+                review_status = 'pending',
+                review_notes = 'requeued from review_data',
+                reviewed_at = NULL,
+                cleanup_completed = 0,
+                cleanup_at = NULL
+            """,
+            (film_id,),
+        )
+    return True
+
+
+def _build_manual_clip_now(job_id: int, film_id: int, mark_id: int, pre_seconds: float, post_seconds: float) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    try:
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "running", "building_clip", 0.35)
+            conn.commit()
+            film = conn.execute("SELECT * FROM films WHERE id = ?", (film_id,)).fetchone()
+            mark = conn.execute("SELECT * FROM manual_marks WHERE id = ? AND film_id = ?", (mark_id, film_id)).fetchone()
+            if not film or not mark:
+                _update_job(conn, job_id, "error", "error", 1.0, "Film or mark not found")
+                raise SystemExit("Film or mark not found")
+            if not mark["selected_tag"]:
+                _update_job(conn, job_id, "error", "error", 1.0, "Tagged mark required before building clip")
+                raise SystemExit("Tagged mark required before building clip")
+            _, _, source_path = _resolve_source_video(conn, settings, film_id, prefer_largest=True)
+        from ia_kissing_pipeline.video.extract_clips import extract_clip
+
+        clip_path = settings.clips_dir / film["archive_identifier"] / f"manual-mark-{mark_id:03d}.mp4"
+        start_seconds = max(0.0, float(mark["source_seconds"]) - pre_seconds)
+        end_seconds = float(mark["source_seconds"]) + post_seconds
+        extract_clip(source_path, clip_path, start_seconds, end_seconds - start_seconds)
+        with get_connection(settings.db_path) as conn:
+            conn.execute("DELETE FROM manual_clips WHERE manual_mark_id = ?", (mark_id,))
+            conn.execute(
+                """
+                INSERT INTO manual_clips (manual_mark_id, film_id, clip_path, clip_tag, metadata_json, start_seconds, end_seconds, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    mark_id,
+                    film_id,
+                    str(clip_path),
+                    mark["selected_tag"],
+                    json.dumps(
+                        {
+                            "tag": mark["selected_tag"],
+                            "mark_preview_seconds": float(mark["preview_seconds"]),
+                            "mark_sample_index": int(mark["sample_index"]),
+                            "mark_source_seconds": float(mark["source_seconds"]),
+                            "mark_note": mark["note"],
+                            "kiss_start_seconds": float(pre_seconds) if mark["selected_tag"] == "kiss" else None,
+                        },
+                        sort_keys=True,
+                    ),
+                    start_seconds,
+                    end_seconds,
+                    utc_now_iso(),
+                ),
+            )
+            _update_job(conn, job_id, "done", "done", 1.0)
+    except BaseException as exc:
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "error", "error", 1.0, str(exc))
+        return 1
+    return 0
+
+
+def _build_skim_now(job_id: int, film_id: int, sample_every_seconds: float, output_fps: int, max_height: int) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    try:
+        with get_connection(settings.db_path) as conn:
+            film, _, source_path = _resolve_source_video(conn, settings, film_id, prefer_largest=False)
+            output_path = settings.preview_dir / film["archive_identifier"] / "skim-preview.mp4"
+
+            def progress_callback(phase: str, progress: float) -> None:
+                with get_connection(settings.db_path) as callback_conn:
+                    _update_job(callback_conn, job_id, "running", phase, progress)
+
+            from ia_kissing_pipeline.video.skim import build_skim_preview
+
+            _update_job(conn, job_id, "running", "queued", 0.1)
+            conn.commit()
+        build_skim_preview(
+            source_path,
+            output_path,
+            sample_every_seconds=sample_every_seconds,
+            output_fps=output_fps,
+            max_height=max_height,
+            progress_callback=progress_callback,
+        )
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(
+                        {
+                            "preview_path": str(output_path),
+                            "sample_every_seconds": sample_every_seconds,
+                            "output_fps": output_fps,
+                            "phase": "done",
+                            "progress": 1.0,
+                        },
+                        sort_keys=True,
+                    ),
+                    utc_now_iso(),
+                    job_id,
+                ),
+            )
+    except BaseException as exc:
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "error", "error", 1.0, str(exc))
+        return 1
+    return 0
+
+
+def _ensure_review_queue_now(job_id: int, target_ready: int) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    try:
+        if not _start_queue_runtime(settings, job_id, target_ready):
+            return 0
+        _terminate_duplicate_queue_workers(os.getpid())
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "running", "filling_queue", 0.05)
+        _cleanup_nonpending_local_artifacts(settings)
+        ready_count = 0
+        ingest_attempts = 0
+        while True:
+            _heartbeat_queue_runtime(settings, job_id, target_ready)
+            with get_connection(settings.db_path) as conn:
+                ready_count = _count_active_pool_films(conn)
+                candidate = _find_next_download_candidate(conn)
+            if candidate:
+                with get_connection(settings.db_path) as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+                        VALUES (?, 'build_skim_preview', 'queued', ?, ?, ?, ?)
+                        """,
+                        (
+                            candidate["id"],
+                            json.dumps({"sample_every_seconds": 4, "output_fps": 12}, sort_keys=True),
+                            json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
+                            utc_now_iso(),
+                            utc_now_iso(),
+                        ),
+                    )
+                    skim_job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                _build_skim_now(skim_job_id, candidate["id"], 4, 12, 360)
+                continue
+            if ready_count >= target_ready:
+                break
+            if ingest_attempts >= 4:
+                break
+            if not _ingest_and_score_more(settings):
+                break
+            _cleanup_nonpending_local_artifacts(settings)
+            ingest_attempts += 1
+            with get_connection(settings.db_path) as conn:
+                ready_count = _count_active_pool_films(conn)
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps({"phase": "done", "progress": 1.0, "ready_count": ready_count, "ingest_attempts": ingest_attempts}, sort_keys=True), utc_now_iso(), job_id),
+            )
+        _finish_queue_runtime(settings, job_id, target_ready, "idle", None)
+    except BaseException as exc:
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "error", "error", 1.0, str(exc))
+        _finish_queue_runtime(settings, job_id, target_ready, "error", str(exc))
+        return 1
+    return 0
+
+
+def _download_more_vids_now(job_id: int, requested_count: int) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    completed = 0
+    ingest_attempts = 0
+    try:
+        if not _start_queue_runtime(settings, job_id, requested_count):
+            return 0
+        _terminate_duplicate_queue_workers(os.getpid())
+        with get_connection(settings.db_path) as conn:
+            start_pool_count = _count_active_pool_films(conn)
+            _update_job(conn, job_id, "running", "expanding_pool", 0.05)
+        target_pool_count = start_pool_count + requested_count
+        while True:
+            _heartbeat_queue_runtime(settings, job_id, requested_count)
+            _cleanup_nonpending_local_artifacts(settings)
+            with get_connection(settings.db_path) as conn:
+                active_pool_count = _count_active_pool_films(conn)
+            if active_pool_count >= target_pool_count:
+                break
+            if ingest_attempts >= 8:
+                break
+            if not _ingest_and_score_more(settings):
+                break
+            ingest_attempts += 1
+            with get_connection(settings.db_path) as conn:
+                active_pool_count = _count_active_pool_films(conn)
+                progress = 0.05 if target_pool_count <= start_pool_count else min(
+                    0.35,
+                    0.05 + 0.30 * max(0, active_pool_count - start_pool_count) / max(1, target_pool_count - start_pool_count),
+                )
+                _update_job(conn, job_id, "running", "expanding_pool", progress)
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "running", "downloading_ready", 0.35)
+            total_candidates = _count_download_candidates(conn)
+        while True:
+            _heartbeat_queue_runtime(settings, job_id, requested_count)
+            _cleanup_nonpending_local_artifacts(settings)
+            with get_connection(settings.db_path) as conn:
+                candidate = _find_next_download_candidate(conn)
+            if not candidate:
+                break
+            with get_connection(settings.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+                    VALUES (?, 'build_skim_preview', 'queued', ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate["id"],
+                        json.dumps({"sample_every_seconds": 4, "output_fps": 12}, sort_keys=True),
+                        json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
+                        utc_now_iso(),
+                        utc_now_iso(),
+                    ),
+                )
+                skim_job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            if _build_skim_now(skim_job_id, candidate["id"], 4, 12, 360) == 0:
+                completed += 1
+                with get_connection(settings.db_path) as conn:
+                    _update_job(
+                        conn,
+                        job_id,
+                        "running",
+                        "downloading_ready",
+                        min(0.95, 0.35 + 0.60 * completed / max(1, total_candidates)),
+                    )
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(
+                        {
+                            "phase": "done",
+                            "progress": 1.0,
+                            "requested_add_count": requested_count,
+                            "start_pool_count": start_pool_count,
+                            "target_pool_count": target_pool_count,
+                            "completed_count": completed,
+                            "ingest_attempts": ingest_attempts,
+                        },
+                        sort_keys=True,
+                    ),
+                    utc_now_iso(),
+                    job_id,
+                ),
+            )
+        _finish_queue_runtime(settings, job_id, requested_count, "idle", None)
+    except BaseException as exc:
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "error", "error", 1.0, str(exc))
+        _finish_queue_runtime(settings, job_id, requested_count, "error", str(exc))
+        return 1
+    return 0
+
+
+def _start_get_more_vids(settings, count: int) -> tuple[bool, int | None]:
+    job_id = None
+    with get_connection(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _recover_queue_state(conn, settings)
+        if _queue_job_is_active(conn):
+            runtime = _load_queue_runtime(conn)
+            return False, int(runtime["owner_job_id"] or 0) if runtime else None
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (NULL, 'download_batch', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"count": count}, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
+                utc_now_iso(),
+                utc_now_iso(),
+            ),
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        _transition_queue_runtime(conn, "queued", job_id, None, count, None)
+    _spawn_pipeline_command(
+        settings,
+        [
+            sys.executable,
+            "-m",
+            "ia_kissing_pipeline.webapp",
+            "get-more-vids",
+            "--job-id",
+            str(job_id),
+            "--count",
+            str(count),
+        ],
+    )
+    return True, job_id
+
+
+def _maybe_start_queue_fill(settings, target_ready: int) -> None:
+    if os.getenv("IA_KISSING_DISABLE_QUEUE_FILL") == "1":
+        return
+    job_id = None
+    with get_connection(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _recover_queue_state(conn, settings)
+        if _queue_job_is_active(conn):
+            return
+        active_pool_count = _count_active_pool_films(conn)
+        if active_pool_count >= target_ready and not _find_next_download_candidate(conn):
+            return
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (NULL, 'ensure_review_queue', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"target_ready": target_ready}, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
+                utc_now_iso(),
+                utc_now_iso(),
+            ),
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        _transition_queue_runtime(conn, "queued", job_id, None, target_ready, None)
+    if job_id is None:
+        return
+    _spawn_pipeline_command(
+        settings,
+        [
+            sys.executable,
+            "-m",
+            "ia_kissing_pipeline.webapp",
+            "ensure-review-queue",
+            "--job-id",
+            str(job_id),
+            "--target-ready",
+            str(target_ready),
+        ],
+    )
+
+
+def _ingest_and_score_more(settings) -> bool:
+    client = IAClient(settings.cache_dir, settings.user_agent, throttle_seconds=0.2)
+    checkpoint_key = make_checkpoint_key(QUEUE_INGEST_QUERY)
+    with get_connection(settings.db_path) as conn:
+        result = ingest_from_ia(
+            conn,
+            client,
+            query=QUEUE_INGEST_QUERY,
+            limit=QUEUE_INGEST_LIMIT,
+            rows=QUEUE_INGEST_ROWS,
+            checkpoint_key=checkpoint_key,
+        )
+    run_metadata_scoring(settings)
+    # Temporarily disabled in the top-up path. We keep the code and CLI surface,
+    # but do not use title screening or rights screening for overnight ingestion.
+    return result.films_upserted > 0
+
+
+def _queue_job_is_active(conn) -> bool:
+    row = _load_queue_runtime(conn)
+    if not row:
+        return False
+    return row["state"] in ("queued", "running")
+
+
+def _reconcile_stale_skim_job(conn, film_id: int) -> None:
+    row = conn.execute(
+        """
+        SELECT id, status
+        FROM analysis_jobs
+        WHERE film_id = ? AND job_type = 'build_skim_preview'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (film_id,),
+    ).fetchone()
+    if not row or row["status"] not in ("queued", "running"):
+        return
+    if _skim_worker_active(film_id):
+        return
+    conn.execute(
+        """
+        UPDATE analysis_jobs
+        SET status = 'error', error_text = COALESCE(error_text, 'stale skim job'), result_json = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (json.dumps({"phase": "error", "progress": 1.0}, sort_keys=True), utc_now_iso(), row["id"]),
+    )
+
+
+def _skim_worker_active(film_id: int) -> bool:
+    result = subprocess.run(
+        ["ps", "-eo", "cmd"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    pattern = re.compile(rf"build-skim-job .*--film-id {film_id}(?:\s|$)")
+    return any(pattern.search(line) for line in result.stdout.splitlines())
+
+
+def _recover_queue_state(conn, settings) -> None:
+    runtime = _load_queue_runtime(conn)
+    if runtime and runtime["state"] in ("queued", "running"):
+        owner_pid = int(runtime["owner_pid"] or 0)
+        owner_job_id = int(runtime["owner_job_id"] or 0)
+        heartbeat_at = runtime["heartbeat_at"]
+        heartbeat_age = _heartbeat_age_seconds(heartbeat_at)
+        if runtime["state"] == "queued" and owner_job_id:
+            job_row = conn.execute(
+                "SELECT status FROM analysis_jobs WHERE id = ? AND job_type IN ('ensure_review_queue', 'get_more_vids', 'download_batch')",
+                (owner_job_id,),
+            ).fetchone()
+            if not job_row or job_row["status"] not in ("queued", "running"):
+                _abandon_queue_runtime(conn, owner_job_id, "queued queue job missing")
+        elif runtime["state"] == "running":
+            if not _pid_is_alive(owner_pid) or heartbeat_age > QUEUE_STALE_SECONDS:
+                if owner_pid and _pid_is_alive(owner_pid):
+                    try:
+                        os.kill(owner_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                _abandon_queue_runtime(conn, owner_job_id, "queue worker stale")
+    rows = conn.execute(
+        """
+        SELECT id
+        FROM analysis_jobs
+        WHERE film_id IS NULL AND job_type IN ('ensure_review_queue', 'get_more_vids', 'download_batch') AND status IN ('queued', 'running')
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    runtime_job_id = int(runtime["owner_job_id"] or 0) if runtime else 0
+    for row in rows:
+        if row["id"] == runtime_job_id:
+            continue
+        conn.execute(
+            "UPDATE analysis_jobs SET status = 'error', error_text = 'superseded queue job', updated_at = ? WHERE id = ?",
+            (utc_now_iso(), row["id"]),
+        )
+
+
+def _load_queue_runtime(conn):
+    return conn.execute(
+        "SELECT * FROM queue_runtime WHERE queue_name = ?",
+        (QUEUE_NAME,),
+    ).fetchone()
+
+
+def _transition_queue_runtime(conn, state: str, owner_job_id: int | None, owner_pid: int | None, target_ready: int, last_error: str | None) -> None:
+    conn.execute(
+        """
+        UPDATE queue_runtime
+        SET state = ?, owner_job_id = ?, owner_pid = ?, heartbeat_at = ?, target_ready = ?, last_error = ?, updated_at = ?
+        WHERE queue_name = ?
+        """,
+        (state, owner_job_id, owner_pid, utc_now_iso(), target_ready, last_error, utc_now_iso(), QUEUE_NAME),
+    )
+
+
+def _abandon_queue_runtime(conn, job_id: int, reason: str) -> None:
+    if job_id:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'error', error_text = ?, updated_at = ?
+            WHERE id = ? AND status IN ('queued', 'running')
+            """,
+            (reason, utc_now_iso(), job_id),
+        )
+    _transition_queue_runtime(conn, "idle", None, None, 0, reason)
+
+
+def _start_queue_runtime(settings, job_id: int, target_ready: int) -> bool:
+    with get_connection(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _recover_queue_state(conn, settings)
+        runtime = _load_queue_runtime(conn)
+        if not runtime:
+            raise RuntimeError("queue_runtime row missing")
+        if int(runtime["owner_job_id"] or 0) != job_id or runtime["state"] != "queued":
+            return False
+        _transition_queue_runtime(conn, "running", job_id, os.getpid(), target_ready, None)
+    return True
+
+
+def _heartbeat_queue_runtime(settings, job_id: int, target_ready: int) -> None:
+    with get_connection(settings.db_path) as conn:
+        runtime = _load_queue_runtime(conn)
+        if not runtime or int(runtime["owner_job_id"] or 0) != job_id:
+            raise RuntimeError("queue runtime ownership lost")
+        _transition_queue_runtime(conn, "running", job_id, os.getpid(), target_ready, None)
+
+
+def _finish_queue_runtime(settings, job_id: int, target_ready: int, terminal_state: str, last_error: str | None) -> None:
+    with get_connection(settings.db_path) as conn:
+        runtime = _load_queue_runtime(conn)
+        if not runtime or int(runtime["owner_job_id"] or 0) != job_id:
+            return
+        _transition_queue_runtime(conn, terminal_state, job_id, os.getpid(), target_ready, last_error)
+        _transition_queue_runtime(conn, "idle", None, None, 0, last_error)
+
+
+def _heartbeat_age_seconds(heartbeat_at: str | None) -> int:
+    if not heartbeat_at:
+        return QUEUE_STALE_SECONDS + 1
+    try:
+        normalized = heartbeat_at.replace("Z", "+00:00")
+        heartbeat_epoch = time.mktime(time.strptime(normalized[:19], "%Y-%m-%dT%H:%M:%S"))
+        return max(0, int(time.time() - heartbeat_epoch))
+    except (ValueError, TypeError):
+        return QUEUE_STALE_SECONDS + 1
+
+
+def _terminate_duplicate_queue_workers(exclude_pid: int) -> None:
+    result = subprocess.run(["ps", "-eo", "pid=,cmd="], text=True, capture_output=True, check=True)
+    pattern = re.compile(r"\b(ensure-review-queue|get-more-vids)\b")
+    for line in result.stdout.splitlines():
+        if not pattern.search(line):
+            continue
+        parts = line.strip().split(maxsplit=1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == exclude_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _cleanup_nonpending_local_artifacts(settings) -> None:
+    with get_connection(settings.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT f.archive_identifier
+            FROM films f
+            LEFT JOIN film_reviews fr ON fr.film_id = f.id
+            WHERE COALESCE(fr.review_status, 'pending') != 'pending'
+               OR f.status NOT IN ('metadata_scored', 'text_gate_passed', 'rights_screened')
+            """
+        ).fetchall()
+        for row in rows:
+            _cleanup_film_local_artifacts(settings, row["archive_identifier"])
+
+
+def _preserve_manual_clips(conn, settings, film) -> None:
+    rows = conn.execute("SELECT * FROM manual_clips WHERE film_id = ? ORDER BY id ASC", (film["id"],)).fetchall()
+    archive_dir = settings.clips_dir / film["archive_identifier"]
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for row in rows:
+        clip_path = Path(row["clip_path"])
+        if clip_path.exists() and not str(clip_path).startswith(str(settings.clips_dir)):
+            target_path = archive_dir / clip_path.name
+            shutil.copy2(clip_path, target_path)
+            conn.execute("UPDATE manual_clips SET clip_path = ? WHERE id = ?", (str(target_path), row["id"]))
+        cropped_path = row["cropped_clip_path"]
+        if cropped_path:
+            cropped = Path(cropped_path)
+            if cropped.exists() and not str(cropped).startswith(str(settings.clips_dir)):
+                target_crop = archive_dir / cropped.name
+                shutil.copy2(cropped, target_crop)
+                conn.execute("UPDATE manual_clips SET cropped_clip_path = ? WHERE id = ?", (str(target_crop), row["id"]))
+
+
+def _cleanup_film_local_artifacts(settings, archive_identifier: str) -> None:
+    for root in (settings.download_dir, settings.frame_dir, settings.preview_dir):
+        target = root / archive_identifier
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def _delete_clip_files_for_film(conn, film_id: int) -> None:
+    rows = conn.execute("SELECT clip_path, cropped_clip_path FROM manual_clips WHERE film_id = ?", (film_id,)).fetchall()
+    for row in rows:
+        for path_value in (row["cropped_clip_path"], row["clip_path"]):
+            if path_value:
+                path = Path(path_value)
+                if path.exists():
+                    path.unlink()
+
+
+def _apply_film_review_action(settings, film_id: int, review_status: str, notes: str | None) -> None:
+    last_error = None
+    film = None
+    for attempt in range(5):
+        try:
+            with get_connection(settings.db_path) as conn:
+                film = conn.execute("SELECT * FROM films WHERE id = ?", (film_id,)).fetchone()
+                if not film:
+                    raise ValueError(f"Film {film_id} not found")
+                if review_status == "has_kiss":
+                    _preserve_manual_clips(conn, settings, film)
+                if review_status == "force_excluded":
+                    _terminate_film_workers(film_id)
+                    _delete_clip_files_for_film(conn, film_id)
+                    conn.execute(
+                        """
+                        UPDATE analysis_jobs
+                        SET status = 'error', error_text = 'force excluded by reviewer', updated_at = ?
+                        WHERE film_id = ? AND job_type IN ('build_skim_preview', 'build_manual_clip') AND status IN ('queued', 'running')
+                        """,
+                        (utc_now_iso(), film_id),
+                    )
+                    conn.execute("DELETE FROM manual_clips WHERE film_id = ?", (film_id,))
+                    conn.execute("DELETE FROM manual_marks WHERE film_id = ?", (film_id,))
+                conn.execute(
+                    """
+                    INSERT INTO film_reviews (film_id, review_status, review_notes, reviewed_at, cleanup_completed, cleanup_at)
+                    VALUES (?, ?, ?, ?, 0, NULL)
+                    ON CONFLICT(film_id) DO UPDATE SET
+                        review_status = excluded.review_status,
+                        review_notes = excluded.review_notes,
+                        reviewed_at = excluded.reviewed_at,
+                        cleanup_completed = 0,
+                        cleanup_at = NULL
+                    """,
+                    (film_id, review_status, notes, utc_now_iso()),
+                )
+            break
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower() or attempt == 4:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+    if film is None and last_error is not None:
+        raise last_error
+    _cleanup_film_local_artifacts(settings, film["archive_identifier"])
+    for attempt in range(5):
+        try:
+            with get_connection(settings.db_path) as conn:
+                conn.execute(
+                    "UPDATE film_reviews SET cleanup_completed = 1, cleanup_at = ? WHERE film_id = ?",
+                    (utc_now_iso(), film_id),
+                )
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 4:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+
+
+def _terminate_film_workers(film_id: int) -> None:
+    result = subprocess.run(["ps", "-eo", "pid=,cmd="], text=True, capture_output=True, check=True)
+    pattern = re.compile(rf"\b(build-skim-job|build-manual-clip)\b.*--film-id {film_id}(?:\s|$)")
+    for line in result.stdout.splitlines():
+        match = pattern.search(line)
+        if not match:
+            continue
+        parts = line.strip().split(maxsplit=1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+def _update_job(conn, job_id: int, status: str, phase: str, progress: float, error_text: str | None = None) -> None:
+    payload = {"phase": phase, "progress": progress}
+    last_error = None
+    for attempt in range(5):
+        try:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = ?, result_json = ?, error_text = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, json.dumps(payload, sort_keys=True), error_text, utc_now_iso(), job_id),
+            )
+            return
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower() or attempt == 4:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+    if last_error is not None:
+        raise last_error
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "build-manual-clip":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("build-manual-clip")
+        parser.add_argument("--job-id", type=int, required=True)
+        parser.add_argument("--film-id", type=int, required=True)
+        parser.add_argument("--mark-id", type=int, required=True)
+        parser.add_argument("--pre-seconds", type=float, required=True)
+        parser.add_argument("--post-seconds", type=float, required=True)
+        args = parser.parse_args()
+        return _build_manual_clip_now(args.job_id, args.film_id, args.mark_id, args.pre_seconds, args.post_seconds)
+    if len(sys.argv) > 1 and sys.argv[1] == "build-skim-job":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("build-skim-job")
+        parser.add_argument("--job-id", type=int, required=True)
+        parser.add_argument("--film-id", type=int, required=True)
+        parser.add_argument("--sample-every-seconds", type=float, required=True)
+        parser.add_argument("--output-fps", type=int, required=True)
+        parser.add_argument("--max-height", type=int, required=True)
+        args = parser.parse_args()
+        return _build_skim_now(args.job_id, args.film_id, args.sample_every_seconds, args.output_fps, args.max_height)
+    if len(sys.argv) > 1 and sys.argv[1] == "ensure-review-queue":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("ensure-review-queue")
+        parser.add_argument("--job-id", type=int, required=True)
+        parser.add_argument("--target-ready", type=int, required=True)
+        args = parser.parse_args()
+        return _ensure_review_queue_now(args.job_id, args.target_ready)
+    if len(sys.argv) > 1 and sys.argv[1] == "get-more-vids":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("get-more-vids")
+        parser.add_argument("--job-id", type=int, required=True)
+        parser.add_argument("--count", type=int, required=True)
+        args = parser.parse_args()
+        return _download_more_vids_now(args.job_id, args.count)
+    app = create_app()
+    app.run(host="0.0.0.0", port=8000, debug=False)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

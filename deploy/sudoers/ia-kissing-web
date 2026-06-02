@@ -1,0 +1,1 @@
+bot ALL=NOPASSWD: /usr/bin/systemctl restart ia-kissing-web.service

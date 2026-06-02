@@ -1,0 +1,53 @@
+{
+  "items": [
+    {
+      "archive_identifier": "kiss_in_spring_1932",
+      "title": "Kiss in Spring",
+      "year": 1932,
+      "description": "A romance melodrama about lovers, marriage, and courtship in a feature narrative.",
+      "subjects": ["romance", "marriage", "lovers"],
+      "creator": "Example Studio",
+      "collection": "feature_films",
+      "language": "en",
+      "runtime_seconds": 5400,
+      "item_url": "https://archive.org/details/kiss_in_spring_1932",
+      "license_text": "Public Domain Mark 1.0",
+      "license_url": "https://creativecommons.org/publicdomain/mark/1.0/",
+      "files": [
+        {
+          "filename": "kiss_in_spring_1932.mp4",
+          "format": "MPEG4",
+          "size_bytes": 104857600,
+          "download_url": "https://archive.org/download/kiss_in_spring_1932/kiss_in_spring_1932.mp4",
+          "is_video": true,
+          "is_preferred_source": true
+        }
+      ]
+    },
+    {
+      "archive_identifier": "ants_of_industry_1948",
+      "title": "Ants of Industry",
+      "year": 1948,
+      "description": "An educational documentary about insects and machinery.",
+      "subjects": ["documentary", "insects", "educational"],
+      "creator": "Example Classroom",
+      "collection": "ephemera",
+      "language": "en",
+      "runtime_seconds": 1200,
+      "item_url": "https://archive.org/details/ants_of_industry_1948",
+      "license_text": "Copyright restricted. All rights reserved.",
+      "license_url": "https://example.com/restricted",
+      "files": [
+        {
+          "filename": "ants_of_industry_1948.ogv",
+          "format": "OGV",
+          "size_bytes": 52428800,
+          "download_url": "https://archive.org/download/ants_of_industry_1948/ants_of_industry_1948.ogv",
+          "is_video": true,
+          "is_preferred_source": true
+        }
+      ]
+    }
+  ]
+}
+

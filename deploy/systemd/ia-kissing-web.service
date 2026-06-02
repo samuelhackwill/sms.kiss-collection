@@ -1,0 +1,22 @@
+[Unit]
+Description=IA Kissing Pipeline Web App
+After=network.target
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/home/bot/ia-kissing-pipeline
+Environment=DB_PATH=/home/bot/ia-kissing-pipeline/data/pipeline.db
+Environment=CACHE_DIR=/home/bot/ia-kissing-pipeline/data/cache
+Environment=DOWNLOAD_DIR=/home/bot/ia-kissing-pipeline/data/downloads
+Environment=FRAME_DIR=/home/bot/ia-kissing-pipeline/data/frames
+Environment=PREVIEW_DIR=/home/bot/ia-kissing-pipeline/data/previews
+Environment=CLIPS_DIR=/home/bot/ia-kissing-pipeline/data/clips
+Environment=LOG_DIR=/home/bot/ia-kissing-pipeline/data/logs
+ExecStart=/home/bot/ia-kissing-pipeline/.venv/bin/python3 -m ia_kissing_pipeline.webapp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

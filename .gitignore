@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Build/package output
+dist/
+build/
+*.egg-info/
+
+# Runtime data and generated media
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.jpg
+*.jpeg
+*.png
+*.log
+
+# OpenClaw/Codex local state and generated review artifacts
+openclaw/**/.openclaw/
+openclaw/**/tmp/
+openclaw/**/sessions/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
