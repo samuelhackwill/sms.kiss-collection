@@ -10,6 +10,8 @@ cd "$APP_DIR"
 uv sync --extra dev
 uv run pytest tests/test_webapp.py
 
+# lll
+
 sudo systemctl restart "$SERVICE_NAME"
 
 for attempt in 1 2 3 4 5; do
