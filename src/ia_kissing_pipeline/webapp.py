@@ -2020,7 +2020,7 @@ def _load_review_data_sections(conn, settings) -> list[dict]:
                     "film_id": film_id,
                     "status_kind": status_kind,
                     "status_text": status_text,
-                    "can_delete": status_kind == "stray" or (kind == "clip" and pipeline_status == "source_error"),
+                    "can_delete": status_kind == "stray" or pipeline_status == "source_error",
                 }
             )
         return {
