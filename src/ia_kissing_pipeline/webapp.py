@@ -2869,7 +2869,10 @@ def _apply_film_review_action(settings, film_id: int, review_status: str, notes:
 
 
 def _terminate_film_workers(film_id: int) -> None:
-    result = subprocess.run(["ps", "-eo", "pid=,cmd="], text=True, capture_output=True, check=True)
+    try:
+        result = subprocess.run(["ps", "-eo", "pid=,command="], text=True, capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return
     pattern = re.compile(rf"\b(build-skim-job|build-manual-clip)\b.*--film-id {film_id}(?:\s|$)")
     for line in result.stdout.splitlines():
         match = pattern.search(line)
