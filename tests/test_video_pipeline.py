@@ -140,3 +140,56 @@ def test_video_prepare_and_shot_flow(tmp_path: Path) -> None:
     assert analysis_path.exists()
     assert keyframe_dir.exists()
     assert list(keyframe_dir.glob("shot_*.jpg"))
+
+
+def test_build_skim_preview_creates_overview_frames(tmp_path: Path) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    fixture_video = tmp_path / "fixture.mp4"
+    make_fixture_video(fixture_video)
+    db_path = tmp_path / "pipeline.db"
+    init_db(db_path)
+
+    with connect(db_path) as conn:
+        upsert_film_item(
+            conn,
+            {
+                "archive_identifier": "fixture-film",
+                "title": "Fixture Film",
+                "item_url": "https://archive.org/details/fixture-film",
+                "subjects": ["romance"],
+                "files": [
+                    {
+                        "filename": fixture_video.name,
+                        "download_url": str(fixture_video),
+                        "format": "h.264",
+                        "is_video": True,
+                        "is_preferred_source": True,
+                    }
+                ],
+            },
+        )
+
+    env = os.environ.copy()
+    env["DB_PATH"] = str(db_path)
+    env["PYTHONPATH"] = str(project_root / "src")
+    env["DOWNLOAD_DIR"] = str(tmp_path / "downloads")
+    env["FRAME_DIR"] = str(tmp_path / "frames")
+    env["CACHE_DIR"] = str(tmp_path / "cache")
+    env["PREVIEW_DIR"] = str(tmp_path / "previews")
+    env["LOG_DIR"] = str(tmp_path / "logs")
+
+    subprocess.run(
+        [sys.executable, "-m", "ia_kissing_pipeline.main", "build-skim-preview", "--film-id", "1"],
+        cwd=project_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    preview_path = Path(env["PREVIEW_DIR"]) / "fixture-film" / "skim-preview.mp4"
+    overview_dir = Path(env["PREVIEW_DIR"]) / "fixture-film" / "skim-overview"
+
+    assert preview_path.exists()
+    assert overview_dir.exists()
+    assert list(overview_dir.glob("frame_*.jpg"))

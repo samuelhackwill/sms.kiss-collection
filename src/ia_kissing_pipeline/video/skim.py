@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -39,6 +40,7 @@ def build_skim_preview(
         if progress_callback:
             progress_callback("numbering_frames", 0.6)
         _number_frames(frames_dir)
+        _persist_skim_overview_frames(frames_dir, output_path.parent / "skim-overview")
         if progress_callback:
             progress_callback("encoding_preview", 0.85)
         subprocess.run(
@@ -97,6 +99,18 @@ def build_skim_overview_frames(
         check=True,
     )
     return sorted(output_dir.glob("frame_*.jpg"))
+
+
+def _persist_skim_overview_frames(frames_dir: Path, output_dir: Path) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in output_dir.glob("frame_*.jpg"):
+        path.unlink()
+    copied = []
+    for frame_path in sorted(frames_dir.glob("frame_*.jpg")):
+        destination = output_dir / frame_path.name
+        shutil.copy2(frame_path, destination)
+        copied.append(destination)
+    return copied
 
 
 def _number_frames(frames_dir: Path) -> None:
