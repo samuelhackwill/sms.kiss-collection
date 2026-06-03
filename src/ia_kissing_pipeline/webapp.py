@@ -12,7 +12,6 @@ import sys
 import time
 import re
 from pathlib import Path
-from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
@@ -2058,32 +2057,28 @@ def _ensure_kiss_detector_outputs(settings, archive_identifier: str, skim: dict)
 
 
 def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
-    image_b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
-    payload = {
-        "api_key": settings.roboflow_api_key,
-        "inputs": {
-            "image": {"type": "base64", "value": image_b64},
-            "classes": settings.roboflow_kiss_detector_classes,
-        },
-    }
-    request_url = (
-        f"{settings.roboflow_api_url.rstrip('/')}/infer/workflows/"
-        f"{settings.roboflow_workspace_name}/{settings.roboflow_workflow_id}"
-    )
-    request_obj = urllib_request.Request(
-        request_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    try:
+        from inference_sdk import InferenceHTTPClient
+    except ImportError as exc:
+        raise RuntimeError(
+            "Roboflow inference SDK is not installed for this Python version. "
+            "Install the `inference` package on a supported runtime (currently Python < 3.13)."
+        ) from exc
+
+    client = InferenceHTTPClient(
+        api_url=settings.roboflow_api_url,
+        api_key=settings.roboflow_api_key,
     )
     try:
-        with urllib_request.urlopen(request_obj, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib_error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Roboflow request failed with HTTP {exc.code}: {error_body}") from exc
-    except urllib_error.URLError as exc:
-        raise RuntimeError(f"Roboflow request failed: {exc.reason}") from exc
+        result = client.run_workflow(
+            workspace_name=settings.roboflow_workspace_name,
+            workflow_id=settings.roboflow_workflow_id,
+            images={"image": str(frame_path)},
+            parameters={"classes": settings.roboflow_kiss_detector_classes},
+            use_cache=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Roboflow workflow request failed: {exc}") from exc
 
     image_payload = _find_first_workflow_image(result)
     if image_payload is None:
