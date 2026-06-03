@@ -394,7 +394,7 @@ FILM_TEMPLATE = """
     .topbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 14px; }
     .panel { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); padding: 16px; margin-bottom: 20px; border-radius: 18px; box-shadow: 0 18px 60px rgba(0,0,0,0.28); }
     .panel h2 { margin-top: 0; }
-    video, .skim-frame-display { width: 100%; max-height: 74vh; background: black; display: block; }
+    video { width: 100%; max-height: 74vh; background: black; display: block; }
     button, input { font: inherit; }
     button { padding: 8px 12px; background: linear-gradient(180deg, #2666b8 0%, var(--accent-2) 100%); color: white; border: 1px solid #3a78c4; border-radius: 12px; cursor: pointer; }
     .ghost { background: #2a3442; border-color: #3b495d; }
@@ -407,7 +407,7 @@ FILM_TEMPLATE = """
     .skim-shell { margin-top: 12px; }
     .skim-viewport { position: relative; background: #05080d; border: 1px solid #314056; border-radius: 18px; overflow: hidden; }
     .skim-overlay { position: absolute; top: 10px; left: 10px; right: 10px; display: flex; justify-content: space-between; pointer-events: none; color: #f7e9d7; font: 12px/1.2 monospace; text-shadow: 0 1px 2px rgba(0,0,0,0.7); }
-    .skim-frame-display { cursor: ew-resize; touch-action: none; user-select: none; -webkit-user-select: none; aspect-ratio: 16 / 9; object-fit: contain; }
+    .skim-viewport video { cursor: ew-resize; touch-action: none; user-select: none; -webkit-user-select: none; }
     .skim-help { margin-top: 8px; color: var(--muted); font-size: 13px; }
     .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
     .metadata-row { display: grid; grid-template-columns: minmax(180px, 280px) minmax(0, 1fr); gap: 16px; align-items: start; }
@@ -500,10 +500,10 @@ FILM_TEMPLATE = """
       <button type="submit">Build / Refresh Skim Preview</button>
     </form>
     {% if skim %}
-      <p class="small debug-only">Move the mouse horizontally over the skim frame to scrub. Click to add a mark. Use left/right arrow keys for frame stepping.</p>
+      <p class="small debug-only">Move the mouse horizontally over the video to scrub. Click the video to add a mark. Use left/right arrow keys for frame stepping.</p>
       <div class="skim-shell">
-        <div class="skim-viewport" id="skim-viewport">
-          <img id="skim-frame-image" class="skim-frame-display" alt="Skim frame preview">
+        <div class="skim-viewport">
+          <video id="skim-video" preload="metadata" playsinline src="{{ url_for('media_file', kind='preview', relpath=skim.relpath) }}"></video>
           <div class="skim-overlay">
             <span id="skim-overlay-left" class="debug-only">skim 0.00s</span>
             <span id="skim-overlay-right" class="debug-only">source 0s</span>
@@ -693,8 +693,7 @@ FILM_TEMPLATE = """
 </script>
 {% if skim %}
 <script>
-  const skimViewport = document.getElementById("skim-viewport");
-  const skimFrameImage = document.getElementById("skim-frame-image");
+  const video = document.getElementById("skim-video");
   const markForm = document.getElementById("mark-form");
   const skimOverviewDetails = document.getElementById("skim-overview-details");
   const skimOverviewGrid = document.getElementById("skim-overview-grid");
@@ -708,25 +707,18 @@ FILM_TEMPLATE = """
   const sampleEvery = {{ skim.sample_every_seconds }};
   const outputFps = {{ skim.output_fps }};
   const frameDuration = 1 / outputFps;
+  const seekEpsilon = Math.max(0.001, frameDuration / 2);
   let lastTapAt = 0;
   let skimOverviewBuilt = false;
   let skimOverviewBuilding = false;
-  let skimFramesPayload = null;
-  let skimFramesPromise = null;
-  let currentFrameIndex = 0;
+  let scrubFrameRequested = false;
+  let pendingSeekTime = null;
+  let seekInFlight = false;
 
-  const renderFrame = (frameIndex) => {
-    if (!skimFramesPayload || !skimFramesPayload.length) {
-      return;
-    }
-    currentFrameIndex = Math.max(0, Math.min(skimFramesPayload.length - 1, frameIndex));
-    const frame = skimFramesPayload[currentFrameIndex];
-    if (skimFrameImage) {
-      skimFrameImage.src = frame.media_url;
-    }
-    const sampleIndex = currentFrameIndex + 1;
-    const previewSeconds = currentFrameIndex / outputFps;
-    const sourceSeconds = Number(frame.source_seconds);
+  const updateFields = () => {
+    const previewSeconds = video.currentTime || 0;
+    const sampleIndex = Math.max(1, Math.floor(previewSeconds * outputFps) + 1);
+    const sourceSeconds = (sampleIndex - 1) * sampleEvery;
     previewInput.value = previewSeconds.toFixed(3);
     sampleInput.value = sampleIndex;
     sourceInput.value = sourceSeconds.toFixed(3);
@@ -735,70 +727,98 @@ FILM_TEMPLATE = """
     overlayRight.textContent = `source ${sourceSeconds.toFixed(0)}s | frame ${sampleIndex}`;
   };
 
-  const loadSkimFrames = async () => {
-    if (skimFramesPayload) {
-      return skimFramesPayload;
-    }
-    if (!skimFramesPromise) {
-      skimFramesPromise = fetch("{{ url_for('skim_overview_payload', film_id=film['id']) }}")
-        .then((response) => {
-          if (!response.ok) {
-            throw new Error(`overview request failed: ${response.status}`);
-          }
-          return response.json();
-        })
-        .then((payload) => {
-          skimFramesPayload = payload.frames || [];
-          if (skimFramesPayload.length) {
-            renderFrame(0);
-          }
-          return skimFramesPayload;
-        });
-    }
-    return skimFramesPromise;
-  };
-
-  const scrubToViewportX = async (clientX) => {
-    const frames = await loadSkimFrames();
-    if (!frames.length || !skimViewport) {
+  const scrubToVideoX = (clientX) => {
+    const rect = video.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const duration = video.duration || 0;
+    if (!Number.isFinite(duration) || duration <= 0) {
       return;
     }
-    const rect = skimViewport.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const frameIndex = Math.max(0, Math.min(frames.length - 1, Math.round(ratio * (frames.length - 1))));
-    renderFrame(frameIndex);
+    pendingSeekTime = duration * ratio;
+    updateFieldsForPendingSeek();
+    flushPendingSeek();
   };
 
-  if (skimViewport) {
-    skimViewport.addEventListener("mousemove", (event) => {
-      scrubToViewportX(event.clientX);
-    });
-    skimViewport.addEventListener("click", async (event) => {
-      event.preventDefault();
-      await scrubToViewportX(event.clientX);
-      markForm.requestSubmit();
-    });
-    skimViewport.addEventListener("touchmove", (event) => {
-      if (!event.touches.length) return;
-      event.preventDefault();
-      scrubToViewportX(event.touches[0].clientX);
-    }, { passive: false });
-    skimViewport.addEventListener("touchstart", async (event) => {
-      if (!event.touches.length) return;
-      const now = Date.now();
-      const clientX = event.touches[0].clientX;
-      await scrubToViewportX(clientX);
-      if (now - lastTapAt < 300) {
-        event.preventDefault();
-        markForm.requestSubmit();
-      }
-      lastTapAt = now;
-    }, { passive: false });
-  }
+  const updateFieldsForPendingSeek = () => {
+    if (pendingSeekTime === null) {
+      updateFields();
+      return;
+    }
+    const previewSeconds = pendingSeekTime;
+    const sampleIndex = Math.max(1, Math.floor(previewSeconds * outputFps) + 1);
+    const sourceSeconds = (sampleIndex - 1) * sampleEvery;
+    previewInput.value = previewSeconds.toFixed(3);
+    sampleInput.value = sampleIndex;
+    sourceInput.value = sourceSeconds.toFixed(3);
+    readout.textContent = `Current skim second: ${previewSeconds.toFixed(2)} | sample index: ${sampleIndex} | source second: ${sourceSeconds.toFixed(0)}`;
+    overlayLeft.textContent = `skim ${previewSeconds.toFixed(2)}s`;
+    overlayRight.textContent = `source ${sourceSeconds.toFixed(0)}s | frame ${sampleIndex}`;
+  };
 
-  loadSkimFrames().catch(() => {
-    if (readout) {
-      readout.textContent = "Could not load skim frames.";
+  const flushPendingSeek = () => {
+    if (scrubFrameRequested) {
+      return;
+    }
+    scrubFrameRequested = true;
+    window.requestAnimationFrame(() => {
+      scrubFrameRequested = false;
+      if (seekInFlight || pendingSeekTime === null) {
+        return;
+      }
+      const nextSeekTime = pendingSeekTime;
+      pendingSeekTime = null;
+      if (Math.abs((video.currentTime || 0) - nextSeekTime) <= seekEpsilon) {
+        updateFields();
+        if (pendingSeekTime !== null) {
+          flushPendingSeek();
+        }
+        return;
+      }
+      seekInFlight = true;
+      video.currentTime = nextSeekTime;
+    });
+  };
+
+  video.addEventListener("mousemove", (event) => {
+    scrubToVideoX(event.clientX);
+  });
+  video.addEventListener("click", (event) => {
+    event.preventDefault();
+    scrubToVideoX(event.clientX);
+    markForm.requestSubmit();
+  });
+  video.addEventListener("touchmove", (event) => {
+    if (!event.touches.length) return;
+    event.preventDefault();
+    scrubToVideoX(event.touches[0].clientX);
+  }, { passive: false });
+  video.addEventListener("touchstart", (event) => {
+    if (!event.touches.length) return;
+    const now = Date.now();
+    const clientX = event.touches[0].clientX;
+    scrubToVideoX(clientX);
+    if (now - lastTapAt < 300) {
+      event.preventDefault();
+      markForm.requestSubmit();
+    }
+    lastTapAt = now;
+  }, { passive: false });
+  video.addEventListener("loadedmetadata", updateFields);
+  video.addEventListener("seeked", () => {
+    seekInFlight = false;
+    updateFields();
+    if (pendingSeekTime !== null && Math.abs((video.currentTime || 0) - pendingSeekTime) > 0.001) {
+      flushPendingSeek();
+    }
+  });
+  video.addEventListener("timeupdate", () => {
+    if (!seekInFlight) {
+      return;
+    }
+    seekInFlight = false;
+    updateFields();
+    if (pendingSeekTime !== null && Math.abs((video.currentTime || 0) - pendingSeekTime) > seekEpsilon) {
+      flushPendingSeek();
     }
   });
 
@@ -808,8 +828,12 @@ FILM_TEMPLATE = """
     skimOverviewStatus.textContent = "Generating frame grid...";
     skimOverviewGrid.innerHTML = "";
     try {
-      const frames = await loadSkimFrames();
-      frames.forEach((frame) => {
+      const response = await fetch("{{ url_for('skim_overview_payload', film_id=film['id']) }}");
+      if (!response.ok) {
+        throw new Error(`overview request failed: ${response.status}`);
+      }
+      const payload = await response.json();
+      payload.frames.forEach((frame) => {
         const card = document.createElement("div");
         card.className = "skim-frame-card";
 
@@ -837,7 +861,7 @@ FILM_TEMPLATE = """
       });
 
       skimOverviewBuilt = true;
-      skimOverviewStatus.textContent = `${frames.length} skim frames`;
+      skimOverviewStatus.textContent = `${payload.frames.length} skim frames`;
     } catch (_error) {
       skimOverviewStatus.textContent = "Could not generate skim overview.";
     } finally {
@@ -860,11 +884,14 @@ FILM_TEMPLATE = """
     }
     if (event.key === "ArrowLeft") {
       event.preventDefault();
-      renderFrame(currentFrameIndex - 1);
+      video.currentTime = Math.max(0, (video.currentTime || 0) - frameDuration);
+      updateFields();
     }
     if (event.key === "ArrowRight") {
       event.preventDefault();
-      renderFrame(currentFrameIndex + 1);
+      const duration = video.duration || 0;
+      video.currentTime = Math.min(duration, (video.currentTime || 0) + frameDuration);
+      updateFields();
     }
   });
 </script>
