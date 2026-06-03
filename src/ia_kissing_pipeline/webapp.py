@@ -707,6 +707,7 @@ FILM_TEMPLATE = """
   const sampleEvery = {{ skim.sample_every_seconds }};
   const outputFps = {{ skim.output_fps }};
   const frameDuration = 1 / outputFps;
+  const seekEpsilon = Math.max(0.001, frameDuration / 2);
   let lastTapAt = 0;
   let skimOverviewBuilt = false;
   let skimOverviewBuilding = false;
@@ -766,6 +767,13 @@ FILM_TEMPLATE = """
       }
       const nextSeekTime = pendingSeekTime;
       pendingSeekTime = null;
+      if (Math.abs((video.currentTime || 0) - nextSeekTime) <= seekEpsilon) {
+        updateFields();
+        if (pendingSeekTime !== null) {
+          flushPendingSeek();
+        }
+        return;
+      }
       seekInFlight = true;
       video.currentTime = nextSeekTime;
     });
@@ -800,6 +808,16 @@ FILM_TEMPLATE = """
     seekInFlight = false;
     updateFields();
     if (pendingSeekTime !== null && Math.abs((video.currentTime || 0) - pendingSeekTime) > 0.001) {
+      flushPendingSeek();
+    }
+  });
+  video.addEventListener("timeupdate", () => {
+    if (!seekInFlight) {
+      return;
+    }
+    seekInFlight = false;
+    updateFields();
+    if (pendingSeekTime !== null && Math.abs((video.currentTime || 0) - pendingSeekTime) > seekEpsilon) {
       flushPendingSeek();
     }
   });
