@@ -7,7 +7,13 @@ from ia_kissing_pipeline.config import load_settings
 from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.ingest.fixture_ingest import ingest_fixture
 from ia_kissing_pipeline.main import run_metadata_scoring
-from ia_kissing_pipeline.webapp import _build_manual_clip_now, _cleanup_nonpending_local_artifacts, _start_get_more_vids, create_app
+from ia_kissing_pipeline.webapp import (
+    _build_manual_clip_now,
+    _cleanup_nonpending_local_artifacts,
+    _run_kiss_detector_now,
+    _start_get_more_vids,
+    create_app,
+)
 
 
 def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
@@ -245,38 +251,50 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
             ),
         )
 
-    app = create_app()
-    client = app.test_client()
-    response = client.get("/films/1/kiss-detector")
-
-    assert response.status_code == 200
-    payload = response.get_json()
-    assert payload["frames"] == []
-    assert payload["completed"] == 0
-    assert payload["total"] == 2
-    assert payload["done"] is False
     output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
-    assert output_dir.exists()
-    assert len(list(output_dir.glob("frame_*.png"))) == 0
-    assert build_calls["detector"] == 1
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'kiss_detector', 'queued', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            ('{"phase":"queued","progress":0.05}',),
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
 
-    second_response = client.get("/films/1/kiss-detector")
-    assert second_response.status_code == 200
-    second_payload = second_response.get_json()
-    assert second_payload["completed"] == 1
-    assert second_payload["total"] == 2
-    assert second_payload["done"] is True
-    assert len(second_payload["frames"]) == 1
-    assert second_payload["frames"][0]["media_url"].startswith("/media/preview/")
+    assert _run_kiss_detector_now(job_id, 1) == 0
+    assert output_dir.exists()
     assert len(list(output_dir.glob("frame_*.png"))) == 1
+    assert len(list(output_dir.glob("frame_*.skip"))) == 1
     assert build_calls["detector"] == 2
 
-    third_response = client.get("/films/1/kiss-detector")
-    assert third_response.status_code == 200
-    third_payload = third_response.get_json()
-    assert third_payload["completed"] == 1
-    assert third_payload["total"] == 2
-    assert third_payload["done"] is True
+    app = create_app()
+    client = app.test_client()
+    detail_response = client.get("/films/1")
+    assert b"Analyze Frames" in detail_response.data
+    assert b"Remove Frames" in detail_response.data
+    assert b"Download All Frames" in detail_response.data
+    response = client.get("/films/1/kiss-detector")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["completed"] == 1
+    assert payload["total"] == 2
+    assert payload["done"] is True
+    assert payload["status"] == "done"
+    assert len(payload["frames"]) == 1
+    assert payload["frames"][0]["index"] == 2
+    assert payload["frames"][0]["media_url"].startswith("/media/preview/")
+
+    download_response = client.get("/films/1/kiss-detector/download-all")
+    assert download_response.status_code == 200
+    assert download_response.mimetype == "application/zip"
+
+    remove_response = client.post("/films/1/kiss-detector/remove")
+    assert remove_response.status_code == 200
+    remove_payload = remove_response.get_json()
+    assert remove_payload["completed"] == 0
+    assert len(list(output_dir.glob("frame_*.png"))) == 0
+    assert len(list(output_dir.glob("frame_*.skip"))) == 0
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
@@ -349,6 +367,59 @@ def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeyp
     assert clips == 0
     assert not download_file.exists()
     assert not clip_path.exists()
+
+
+def test_kiss_detector_analyze_route_queues_background_job(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    spawned = {}
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._spawn_pipeline_command",
+        lambda settings, command: spawned.setdefault("command", command),
+    )
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_dir = settings.preview_dir / "kiss_in_spring_1932"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_path = preview_dir / "skim-preview.mp4"
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/films/1/kiss-detector/analyze")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "queued"
+    assert "kiss-detector-job" in " ".join(spawned["command"])
+    with get_connection(settings.db_path) as conn:
+        job = conn.execute(
+            "SELECT job_type, status FROM analysis_jobs WHERE film_id = 1 AND job_type = 'kiss_detector' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert job["job_type"] == "kiss_detector"
+    assert job["status"] == "queued"
 
 
 def test_random_clips_api_returns_json_payload(tmp_path: Path, monkeypatch) -> None:

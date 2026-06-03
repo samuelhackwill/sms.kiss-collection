@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import re
+import zipfile
 from pathlib import Path
 from urllib import request as urllib_request
 
@@ -436,6 +437,10 @@ FILM_TEMPLATE = """
     .skim-frame-actions a:hover { color: var(--link); text-decoration: underline; }
     .skim-overview-status { margin-top: 14px; color: var(--muted); font-size: 13px; }
     .kiss-detector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; }
+    .action-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+    .button-link { display: inline-flex; align-items: center; padding: 8px 12px; background: linear-gradient(180deg, #2666b8 0%, var(--accent-2) 100%); color: white; border: 1px solid #3a78c4; border-radius: 12px; cursor: pointer; text-decoration: none; }
+    .button-link.ghost-link { background: #2a3442; border-color: #3b495d; }
+    .button-link[aria-disabled="true"] { opacity: 0.55; pointer-events: none; }
     .debug-box { margin-top: 12px; padding: 12px; border-radius: 12px; border: 1px solid #314056; background: #0b1016; color: #d7e5f7; font: 12px/1.45 monospace; white-space: pre-wrap; word-break: break-word; }
     .debug-toggle { background: #2a3442; border-color: #3b495d; }
     body.debug-off .debug-only { display: none; }
@@ -555,6 +560,11 @@ FILM_TEMPLATE = """
         <div class="fold-body">
           {% if skim %}
             <p class="small">Runs the Roboflow workflow on every skim overview frame and shows the returned visual output.</p>
+            <div class="action-row">
+              <button type="button" id="kiss-detector-analyze">Analyze Frames</button>
+              <button type="button" id="kiss-detector-remove" class="ghost">Remove Frames</button>
+              <a id="kiss-detector-download-all" class="button-link ghost-link" href="{{ url_for('kiss_detector_download_all', film_id=film['id']) }}" aria-disabled="true">Download All Frames</a>
+            </div>
             <div id="kiss-detector-status" class="skim-overview-status">Collapsed.</div>
             <div id="kiss-detector-grid" class="kiss-detector-grid"></div>
             <div id="kiss-detector-debug" class="debug-box" style="display:none;"></div>
@@ -725,6 +735,9 @@ FILM_TEMPLATE = """
   const kissDetectorGrid = document.getElementById("kiss-detector-grid");
   const kissDetectorStatus = document.getElementById("kiss-detector-status");
   const kissDetectorDebug = document.getElementById("kiss-detector-debug");
+  const kissDetectorAnalyzeButton = document.getElementById("kiss-detector-analyze");
+  const kissDetectorRemoveButton = document.getElementById("kiss-detector-remove");
+  const kissDetectorDownloadAll = document.getElementById("kiss-detector-download-all");
   const previewInput = document.getElementById("preview-seconds");
   const sampleInput = document.getElementById("sample-index");
   const sourceInput = document.getElementById("source-seconds");
@@ -738,9 +751,9 @@ FILM_TEMPLATE = """
   let lastTapAt = 0;
   let skimOverviewBuilt = false;
   let skimOverviewBuilding = false;
-  let kissDetectorBuilt = false;
-  let kissDetectorBuilding = false;
   const renderedKissDetectorFrames = new Set();
+  let kissDetectorPollingTimer = null;
+  let kissDetectorRequestInFlight = false;
   let scrubFrameRequested = false;
   let pendingSeekTime = null;
   let seekInFlight = false;
@@ -907,73 +920,147 @@ FILM_TEMPLATE = """
     });
   }
 
-  const buildKissDetector = async () => {
-    if (kissDetectorBuilt || kissDetectorBuilding || !kissDetectorGrid || !kissDetectorStatus) return;
-    kissDetectorBuilding = true;
-    renderedKissDetectorFrames.clear();
-    kissDetectorStatus.textContent = "Running workflow on skim frames...";
-    kissDetectorGrid.innerHTML = "";
-    if (kissDetectorDebug) {
-      kissDetectorDebug.style.display = "none";
-      kissDetectorDebug.textContent = "";
+  const stopKissDetectorPolling = () => {
+    if (kissDetectorPollingTimer !== null) {
+      window.clearTimeout(kissDetectorPollingTimer);
+      kissDetectorPollingTimer = null;
     }
-    try {
-      let done = false;
-      while (!done) {
-        const response = await fetch("{{ url_for('kiss_detector_payload', film_id=film['id']) }}");
-        const payload = await response.json();
-        if (!response.ok) {
-          if (kissDetectorDebug && payload.debug) {
-            kissDetectorDebug.style.display = "block";
-            kissDetectorDebug.textContent = payload.debug;
-          }
-          throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
-        }
-        payload.frames.forEach((frame) => {
-          if (renderedKissDetectorFrames.has(frame.index)) {
-            return;
-          }
-          renderedKissDetectorFrames.add(frame.index);
-          const card = document.createElement("div");
-          card.className = "skim-frame-card";
+  };
 
-          const image = document.createElement("img");
-          image.src = frame.media_url;
-          image.alt = `Kiss detector frame ${frame.index}`;
+  const updateKissDetectorDownloadState = (hasFrames) => {
+    if (!kissDetectorDownloadAll) return;
+    kissDetectorDownloadAll.setAttribute("aria-disabled", hasFrames ? "false" : "true");
+  };
 
-          const meta = document.createElement("div");
-          meta.className = "skim-frame-meta";
-          meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
-
-          const actions = document.createElement("div");
-          actions.className = "skim-frame-actions";
-
-          const downloadLink = document.createElement("a");
-          downloadLink.href = frame.media_url;
-          downloadLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.png`;
-          downloadLink.textContent = "download";
-
-          card.appendChild(image);
-          card.appendChild(meta);
-          actions.appendChild(downloadLink);
-          card.appendChild(actions);
-          kissDetectorGrid.appendChild(card);
-        });
-        kissDetectorStatus.textContent = `${payload.completed}/${payload.total} workflow outputs`;
-        done = Boolean(payload.done);
+  const renderKissDetectorFrames = (frames, reset = false) => {
+    if (!kissDetectorGrid) return;
+    if (reset) {
+      renderedKissDetectorFrames.clear();
+      kissDetectorGrid.innerHTML = "";
+    }
+    frames.forEach((frame) => {
+      if (renderedKissDetectorFrames.has(frame.index)) {
+        return;
       }
-      kissDetectorBuilt = true;
+      renderedKissDetectorFrames.add(frame.index);
+      const card = document.createElement("div");
+      card.className = "skim-frame-card";
+
+      const image = document.createElement("img");
+      image.src = frame.media_url;
+      image.alt = `Kiss detector frame ${frame.index}`;
+
+      const meta = document.createElement("div");
+      meta.className = "skim-frame-meta";
+      meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
+
+      const actions = document.createElement("div");
+      actions.className = "skim-frame-actions";
+
+      const downloadLink = document.createElement("a");
+      downloadLink.href = frame.media_url;
+      downloadLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.png`;
+      downloadLink.textContent = "download";
+
+      card.appendChild(image);
+      card.appendChild(meta);
+      actions.appendChild(downloadLink);
+      card.appendChild(actions);
+      kissDetectorGrid.appendChild(card);
+    });
+    updateKissDetectorDownloadState(renderedKissDetectorFrames.size > 0);
+  };
+
+  const applyKissDetectorStatus = (payload) => {
+    renderKissDetectorFrames(payload.frames || []);
+    if (kissDetectorDebug) {
+      if (payload.debug) {
+        kissDetectorDebug.style.display = "block";
+        kissDetectorDebug.textContent = payload.debug;
+      } else {
+        kissDetectorDebug.style.display = "none";
+        kissDetectorDebug.textContent = "";
+      }
+    }
+    const counts = Number.isFinite(payload.total) && payload.total > 0
+      ? `${payload.completed}/${payload.total} saved`
+      : `${payload.completed || 0} saved`;
+    const statusText = payload.error || payload.status_text || "Idle";
+    kissDetectorStatus.textContent = `${counts} | ${statusText}`;
+    const active = payload.status === "queued" || payload.status === "running";
+    if (kissDetectorAnalyzeButton) {
+      kissDetectorAnalyzeButton.disabled = active;
+      kissDetectorAnalyzeButton.textContent = active ? "Analyzing..." : "Analyze Frames";
+    }
+    if (kissDetectorRemoveButton) {
+      kissDetectorRemoveButton.disabled = false;
+    }
+    if (active && kissDetectorDetails?.open) {
+      stopKissDetectorPolling();
+      kissDetectorPollingTimer = window.setTimeout(loadKissDetectorStatus, 1500);
+    } else {
+      stopKissDetectorPolling();
+    }
+  };
+
+  const loadKissDetectorStatus = async () => {
+    if (kissDetectorRequestInFlight || !kissDetectorStatus) return;
+    kissDetectorRequestInFlight = true;
+    try {
+      const response = await fetch("{{ url_for('kiss_detector_payload', film_id=film['id']) }}");
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
+      }
+      applyKissDetectorStatus(payload);
     } catch (error) {
-      kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not run kiss detector.";
+      kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not load kiss detector status.";
     } finally {
-      kissDetectorBuilding = false;
+      kissDetectorRequestInFlight = false;
     }
   };
 
   if (kissDetectorDetails) {
     kissDetectorDetails.addEventListener("toggle", () => {
       if (kissDetectorDetails.open) {
-        buildKissDetector();
+        loadKissDetectorStatus();
+      } else {
+        stopKissDetectorPolling();
+      }
+    });
+  }
+
+  if (kissDetectorAnalyzeButton) {
+    kissDetectorAnalyzeButton.addEventListener("click", async () => {
+      kissDetectorAnalyzeButton.disabled = true;
+      kissDetectorStatus.textContent = "Queueing kiss detector job...";
+      try {
+        const response = await fetch("{{ url_for('kiss_detector_analyze', film_id=film['id']) }}", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
+        }
+        applyKissDetectorStatus(payload);
+      } catch (error) {
+        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not start kiss detector.";
+        kissDetectorAnalyzeButton.disabled = false;
+      }
+    });
+  }
+
+  if (kissDetectorRemoveButton) {
+    kissDetectorRemoveButton.addEventListener("click", async () => {
+      stopKissDetectorPolling();
+      try {
+        const response = await fetch("{{ url_for('kiss_detector_remove', film_id=film['id']) }}", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || `kiss detector remove failed: ${response.status}`);
+        }
+        renderKissDetectorFrames([], true);
+        applyKissDetectorStatus(payload);
+      } catch (error) {
+        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not remove kiss detector frames.";
       }
     });
   }
@@ -1308,6 +1395,7 @@ def create_app() -> Flask:
             marks = _load_marks(conn, settings.clips_dir, film_id)
             skim_job = _load_latest_job(conn, film_id, "build_skim_preview")
             clip_job = _load_latest_job(conn, film_id, "build_manual_clip")
+            kiss_detector_job = _load_latest_job(conn, film_id, "kiss_detector")
             review = _get_review_state(conn, film_id)
             source_cached = _source_cached(settings, film["archive_identifier"])
         return render_template_string(
@@ -1318,6 +1406,7 @@ def create_app() -> Flask:
             marks=marks,
             skim_job=skim_job,
             clip_job=clip_job,
+            kiss_detector_job=kiss_detector_job,
             pipeline_status=_display_pipeline_status(dict(film), skim_job, review, source_cached),
         )
 
@@ -1676,20 +1765,63 @@ def create_app() -> Flask:
             if not film:
                 abort(404)
             skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+            kiss_detector_job = _load_latest_job(conn, film_id, "kiss_detector")
         if skim is None:
             abort(404)
+        return jsonify(_build_kiss_detector_payload(settings, film["archive_identifier"], skim, kiss_detector_job))
+
+    @app.post("/films/<int:film_id>/kiss-detector/analyze")
+    def kiss_detector_analyze(film_id: int):
         try:
-            payload = _process_kiss_detector_batch(settings, film["archive_identifier"], skim)
+            job_id = _queue_kiss_detector(settings, film_id)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        except RuntimeError as exc:
-            message = str(exc)
-            summary, separator, debug = message.partition("\n\n")
-            response_payload = {"error": summary}
-            if separator:
-                response_payload["debug"] = debug
-            return jsonify(response_payload), 502
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+            job = _load_latest_job(conn, film_id, "kiss_detector")
+        if not film or skim is None or job is None:
+            abort(404)
+        payload = _build_kiss_detector_payload(settings, film["archive_identifier"], skim, job)
+        payload["job_id"] = job_id
         return jsonify(payload)
+
+    @app.post("/films/<int:film_id>/kiss-detector/remove")
+    def kiss_detector_remove(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+        if skim is None:
+            abort(404)
+        _remove_kiss_detector_outputs(settings, film_id, film["archive_identifier"])
+        with get_connection(settings.db_path) as conn:
+            job = _load_latest_job(conn, film_id, "kiss_detector")
+        return jsonify(_build_kiss_detector_payload(settings, film["archive_identifier"], skim, job))
+
+    @app.get("/films/<int:film_id>/kiss-detector/download-all")
+    def kiss_detector_download_all(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier, title FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+        output_dir = settings.preview_dir / film["archive_identifier"] / "kiss-detector"
+        frame_paths = sorted(output_dir.glob("frame_*.png"))
+        if not frame_paths:
+            abort(404)
+        archive_buffer = io.BytesIO()
+        with zipfile.ZipFile(archive_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive_file:
+            for frame_path in frame_paths:
+                archive_file.write(frame_path, arcname=frame_path.name)
+        archive_buffer.seek(0)
+        safe_stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", film["title"]).strip("-") or film["archive_identifier"]
+        return send_file(
+            archive_buffer,
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=f"{safe_stem}-kiss-detector.zip",
+        )
 
     @app.get("/media/<kind>/<path:relpath>")
     def media_file(kind: str, relpath: str):
@@ -2033,10 +2165,7 @@ def _load_latest_skim(conn, preview_dir: Path, film_id: int) -> dict | None:
 
 
 def _ensure_skim_overview(settings, archive_identifier: str, skim: dict) -> list[dict[str, str | int]]:
-    from ia_kissing_pipeline.video.skim import build_skim_overview_frames
-
-    overview_dir = settings.preview_dir / archive_identifier / "skim-overview"
-    frame_paths = build_skim_overview_frames(Path(skim["path"]), overview_dir)
+    frame_paths = _ensure_skim_overview_paths(settings, archive_identifier, skim)
     frames = []
     sample_every_seconds = float(skim.get("sample_every_seconds", 4))
     for index, path in enumerate(frame_paths, start=1):
@@ -2051,16 +2180,20 @@ def _ensure_skim_overview(settings, archive_identifier: str, skim: dict) -> list
     return frames
 
 
+def _ensure_skim_overview_paths(settings, archive_identifier: str, skim: dict) -> list[Path]:
+    from ia_kissing_pipeline.video.skim import build_skim_overview_frames
+
+    overview_dir = settings.preview_dir / archive_identifier / "skim-overview"
+    return build_skim_overview_frames(Path(skim["path"]), overview_dir)
+
+
 def _process_kiss_detector_batch(settings, archive_identifier: str, skim: dict) -> dict[str, object]:
     if not settings.roboflow_api_key:
         raise ValueError("Missing ROBOFLOW_API_KEY in your environment.")
     if not settings.roboflow_workspace_name or not settings.roboflow_workflow_id:
         raise ValueError("Missing ROBOFLOW_WORKSPACE_NAME or ROBOFLOW_WORKFLOW_ID in your environment.")
 
-    overview_dir = settings.preview_dir / archive_identifier / "skim-overview"
-    if not list(overview_dir.glob("frame_*.jpg")):
-        _ensure_skim_overview(settings, archive_identifier, skim)
-    frame_paths = sorted(overview_dir.glob("frame_*.jpg"))
+    frame_paths = _ensure_skim_overview_paths(settings, archive_identifier, skim)
     output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
     output_dir.mkdir(parents=True, exist_ok=True)
     next_missing = None
@@ -2089,16 +2222,52 @@ def _process_kiss_detector_batch(settings, archive_identifier: str, skim: dict) 
     }
 
 
+def _build_kiss_detector_payload(settings, archive_identifier: str, skim: dict, job: dict | None = None) -> dict[str, object]:
+    output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
+    overview_dir = settings.preview_dir / archive_identifier / "skim-overview"
+    frame_paths = sorted(overview_dir.glob("frame_*.jpg"))
+    frames = _list_kiss_detector_outputs(settings, archive_identifier, skim, output_dir)
+    skipped = len(list(output_dir.glob("frame_*.skip")))
+    completed = len(frames)
+    total = len(frame_paths)
+    payload = {
+        "frames": frames,
+        "completed": completed,
+        "skipped": skipped,
+        "total": total,
+        "done": total > 0 and completed + skipped >= total,
+        "status": "idle",
+        "status_text": "Idle",
+        "progress_percent": 0,
+    }
+    if job:
+        payload["status"] = job["status"]
+        payload["status_text"] = job["status_text"]
+        payload["progress_percent"] = job["progress_percent"]
+        if job["status"] == "error" and job.get("error_text"):
+            message = job["error_text"]
+            summary, separator, debug = message.partition("\n\n")
+            payload["error"] = summary
+            if separator:
+                payload["debug"] = debug
+    elif total == 0:
+        payload["status_text"] = "No saved detector frames yet."
+    elif completed or skipped:
+        payload["status_text"] = "Saved detector outputs on disk."
+    return payload
+
+
 def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, output_dir: Path | None = None) -> list[dict[str, str | int]]:
     output_dir = output_dir or (settings.preview_dir / archive_identifier / "kiss-detector")
     sample_every_seconds = float(skim.get("sample_every_seconds", 4))
     frames = []
-    for index, output_path in enumerate(sorted(output_dir.glob("frame_*.png")), start=1):
+    for output_path in sorted(output_dir.glob("frame_*.png")):
+        frame_number = int(output_path.stem.split("_")[-1])
         relpath = str(output_path.relative_to(settings.preview_dir))
         frames.append(
             {
-                "index": index,
-                "source_seconds": int(round((index - 1) * sample_every_seconds)),
+                "index": frame_number,
+                "source_seconds": int(round((frame_number - 1) * sample_every_seconds)),
                 "media_url": url_for("media_file", kind="preview", relpath=relpath),
             }
         )
@@ -2231,6 +2400,7 @@ def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:
         "extracting_frames": "Extracting frames from source video",
         "numbering_frames": "Numbering sampled frames",
         "encoding_preview": "Encoding skim preview video",
+        "detecting_frames": "Analyzing skim frames",
         "building_clip": "Building rough clip",
         "cropping_clip": "Cropping clip",
         "downloading_ready": "Downloading films",
@@ -2244,6 +2414,7 @@ def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:
         "progress": progress,
         "progress_percent": int(max(0, min(100, round(progress * 100)))),
         "status_text": status_text,
+        "error_text": row["error_text"],
     }
 
 
@@ -2574,6 +2745,67 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
         subprocess.Popen(command, cwd=project_root, env=env, stdout=log_file, stderr=log_file, start_new_session=True)
 
 
+def _queue_kiss_detector(settings, film_id: int) -> int:
+    with get_connection(settings.db_path) as conn:
+        film = conn.execute("SELECT id FROM films WHERE id = ?", (film_id,)).fetchone()
+        if not film:
+            raise ValueError(f"Film {film_id} not found")
+        skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+        if skim is None:
+            raise ValueError("Build a skim preview before running the kiss detector.")
+        active_job = _load_latest_job(conn, film_id, "kiss_detector")
+        if active_job and active_job["status"] in ("queued", "running"):
+            return int(active_job["id"])
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (?, 'kiss_detector', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                film_id,
+                json.dumps({}, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
+                utc_now_iso(),
+                utc_now_iso(),
+            ),
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    _spawn_pipeline_command(
+        settings,
+        [
+            sys.executable,
+            "-m",
+            "ia_kissing_pipeline.webapp",
+            "kiss-detector-job",
+            "--job-id",
+            str(job_id),
+            "--film-id",
+            str(film_id),
+        ],
+    )
+    return int(job_id)
+
+
+def _remove_kiss_detector_outputs(settings, film_id: int, archive_identifier: str) -> None:
+    output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
+    _terminate_film_workers(film_id)
+    now = utc_now_iso()
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'error', error_text = 'kiss detector outputs removed by user', updated_at = ?
+            WHERE film_id = ? AND job_type = 'kiss_detector' AND status IN ('queued', 'running')
+            """,
+            (now, film_id),
+        )
+    if not output_dir.exists():
+        return
+    for path in output_dir.glob("frame_*.*"):
+        if path.suffix.lower() in {".png", ".skip"}:
+            path.unlink()
+
+
 def _queue_build_skim(settings, film_id: int, sample_every_seconds: float = 4, output_fps: int = 12, max_height: int = 360) -> int:
     with get_connection(settings.db_path) as conn:
         conn.execute(
@@ -2753,6 +2985,59 @@ def _build_skim_now(job_id: int, film_id: int, sample_every_seconds: float, outp
                         },
                         sort_keys=True,
                     ),
+                    utc_now_iso(),
+                    job_id,
+                ),
+            )
+    except BaseException as exc:
+        with get_connection(settings.db_path) as conn:
+            _update_job(conn, job_id, "error", "error", 1.0, str(exc))
+        return 1
+    return 0
+
+
+def _run_kiss_detector_now(job_id: int, film_id: int) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    try:
+        if not settings.roboflow_api_key:
+            raise ValueError("Missing ROBOFLOW_API_KEY in your environment.")
+        if not settings.roboflow_workspace_name or not settings.roboflow_workflow_id:
+            raise ValueError("Missing ROBOFLOW_WORKSPACE_NAME or ROBOFLOW_WORKFLOW_ID in your environment.")
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT * FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                raise ValueError(f"Film {film_id} not found")
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+            if skim is None:
+                raise ValueError("Build a skim preview before running the kiss detector.")
+            _update_job(conn, job_id, "running", "queued", 0.05)
+            conn.commit()
+        frame_paths = _ensure_skim_overview_paths(settings, film["archive_identifier"], skim)
+        output_dir = settings.preview_dir / film["archive_identifier"] / "kiss-detector"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        total = len(frame_paths)
+        for index, frame_path in enumerate(frame_paths, start=1):
+            output_path = output_dir / f"frame_{index:06d}.png"
+            skipped_path = output_dir / f"frame_{index:06d}.skip"
+            if not output_path.exists() and not skipped_path.exists():
+                rendered_bytes = _run_roboflow_kiss_detector(settings, frame_path)
+                if rendered_bytes is not None:
+                    _save_rendered_workflow_image(rendered_bytes, output_path)
+                else:
+                    skipped_path.write_text("no_predictions")
+            progress = 0.05 + 0.9 * index / max(1, total)
+            with get_connection(settings.db_path) as conn:
+                _update_job(conn, job_id, "running", "detecting_frames", progress)
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, error_text = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps({"phase": "done", "progress": 1.0}, sort_keys=True),
                     utc_now_iso(),
                     job_id,
                 ),
@@ -3281,7 +3566,7 @@ def _apply_film_review_action(settings, film_id: int, review_status: str, notes:
                         """
                         UPDATE analysis_jobs
                         SET status = 'error', error_text = 'force excluded by reviewer', updated_at = ?
-                        WHERE film_id = ? AND job_type IN ('build_skim_preview', 'build_manual_clip') AND status IN ('queued', 'running')
+                        WHERE film_id = ? AND job_type IN ('build_skim_preview', 'build_manual_clip', 'kiss_detector') AND status IN ('queued', 'running')
                         """,
                         (utc_now_iso(), film_id),
                     )
@@ -3328,7 +3613,7 @@ def _terminate_film_workers(film_id: int) -> None:
         result = subprocess.run(["ps", "-eo", "pid=,command="], text=True, capture_output=True, check=True)
     except (FileNotFoundError, subprocess.CalledProcessError):
         return
-    pattern = re.compile(rf"\b(build-skim-job|build-manual-clip)\b.*--film-id {film_id}(?:\s|$)")
+    pattern = re.compile(rf"\b(build-skim-job|build-manual-clip|kiss-detector-job)\b.*--film-id {film_id}(?:\s|$)")
     for line in result.stdout.splitlines():
         match = pattern.search(line)
         if not match:
@@ -3394,6 +3679,15 @@ def main() -> int:
         parser.add_argument("--max-height", type=int, required=True)
         args = parser.parse_args()
         return _build_skim_now(args.job_id, args.film_id, args.sample_every_seconds, args.output_fps, args.max_height)
+    if len(sys.argv) > 1 and sys.argv[1] == "kiss-detector-job":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("kiss-detector-job")
+        parser.add_argument("--job-id", type=int, required=True)
+        parser.add_argument("--film-id", type=int, required=True)
+        args = parser.parse_args()
+        return _run_kiss_detector_now(args.job_id, args.film_id)
     if len(sys.argv) > 1 and sys.argv[1] == "ensure-review-queue":
         import argparse
 
