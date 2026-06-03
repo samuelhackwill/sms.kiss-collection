@@ -2090,7 +2090,7 @@ def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
     except ImportError as exc:
         raise RuntimeError(
             "Roboflow inference SDK is not installed for this Python version. "
-            "Install the `inference` package on a supported runtime (currently Python < 3.13)."
+            "Install the `inference` package in the active Python 3.13 environment."
         ) from exc
 
     client = InferenceHTTPClient(

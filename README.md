@@ -6,7 +6,7 @@ The project started as a "find kissing scenes" pipeline, but the current web app
 
 ## Stack
 
-- Python 3.12+
+- Python 3.13+
 - Flask web app
 - SQLite database
 - FFmpeg / ffprobe for video download inspection, frame extraction, skim previews, clips, and crops
@@ -69,7 +69,7 @@ Install Python dependencies with `uv`:
 uv sync --extra dev
 ```
 
-If you do not use `uv`, create a Python 3.12+ virtualenv and install the package in editable mode.
+If you do not use `uv`, create a Python 3.13+ virtualenv and install the package in editable mode.
 
 ## Configuration
 
