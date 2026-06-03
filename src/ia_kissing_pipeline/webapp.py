@@ -755,63 +755,36 @@ FILM_TEMPLATE = """
   video.addEventListener("loadedmetadata", updateFields);
   video.addEventListener("seeked", updateFields);
 
-  const waitForEvent = (target, eventName) => new Promise((resolve) => {
-    target.addEventListener(eventName, resolve, { once: true });
-  });
-
   const buildSkimOverview = async () => {
     if (skimOverviewBuilt || skimOverviewBuilding || !skimOverviewGrid || !skimOverviewStatus) return;
     skimOverviewBuilding = true;
     skimOverviewStatus.textContent = "Generating frame grid...";
     skimOverviewGrid.innerHTML = "";
     try {
-      const extractor = document.createElement("video");
-      extractor.preload = "auto";
-      extractor.muted = true;
-      extractor.playsInline = true;
-      extractor.src = video.currentSrc || video.src;
-      await waitForEvent(extractor, "loadedmetadata");
-
-      const width = extractor.videoWidth || video.videoWidth || 320;
-      const height = extractor.videoHeight || video.videoHeight || 180;
-      const duration = extractor.duration || video.duration || 0;
-      const frameCount = Math.max(1, Math.round(duration * outputFps));
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d");
-      if (!context) {
-        skimOverviewStatus.textContent = "Could not create frame previews.";
-        skimOverviewBuilding = false;
-        return;
+      const response = await fetch("{{ url_for('skim_overview_payload', film_id=film['id']) }}");
+      if (!response.ok) {
+        throw new Error(`overview request failed: ${response.status}`);
       }
-
-      for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
-        const seekTime = Math.max(0, Math.min(duration > 0 ? duration - 0.001 : 0, (frameIndex + 0.5) / outputFps));
-        extractor.currentTime = seekTime;
-        await waitForEvent(extractor, "seeked");
-        context.drawImage(extractor, 0, 0, width, height);
-
+      const payload = await response.json();
+      payload.frames.forEach((frame) => {
         const card = document.createElement("div");
         card.className = "skim-frame-card";
 
         const image = document.createElement("img");
-        image.src = canvas.toDataURL("image/jpeg", 0.82);
-        image.alt = `Skim frame ${frameIndex + 1}`;
+        image.src = frame.media_url;
+        image.alt = `Skim frame ${frame.index}`;
 
         const meta = document.createElement("div");
         meta.className = "skim-frame-meta";
-        const sourceSeconds = frameIndex * sampleEvery;
-        meta.textContent = `frame ${frameIndex + 1} | source ${sourceSeconds.toFixed(0)}s`;
+        meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
 
         card.appendChild(image);
         card.appendChild(meta);
         skimOverviewGrid.appendChild(card);
-        skimOverviewStatus.textContent = `Generating frame grid... ${frameIndex + 1}/${frameCount}`;
-      }
+      });
 
       skimOverviewBuilt = true;
-      skimOverviewStatus.textContent = `${frameCount} skim frames`;
+      skimOverviewStatus.textContent = `${payload.frames.length} skim frames`;
     } catch (_error) {
       skimOverviewStatus.textContent = "Could not generate skim overview.";
     } finally {
@@ -1506,6 +1479,18 @@ def create_app() -> Flask:
             job = _load_latest_job(conn, film_id, "build_manual_clip")
         return jsonify(job or {"status": "idle", "progress_percent": 0, "status_text": "idle"})
 
+    @app.get("/films/<int:film_id>/skim-overview")
+    def skim_overview_payload(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+        if skim is None:
+            abort(404)
+        frames = _ensure_skim_overview(settings, film["archive_identifier"], skim)
+        return jsonify({"frames": frames})
+
     @app.get("/media/<kind>/<path:relpath>")
     def media_file(kind: str, relpath: str):
         roots = {
@@ -1845,6 +1830,25 @@ def _load_latest_skim(conn, preview_dir: Path, film_id: int) -> dict | None:
         "sample_every_seconds": float(payload.get("sample_every_seconds", 4)),
         "output_fps": int(payload.get("output_fps", 12)),
     }
+
+
+def _ensure_skim_overview(settings, archive_identifier: str, skim: dict) -> list[dict[str, str | int]]:
+    from ia_kissing_pipeline.video.skim import build_skim_overview_frames
+
+    overview_dir = settings.preview_dir / archive_identifier / "skim-overview"
+    frame_paths = build_skim_overview_frames(Path(skim["path"]), overview_dir)
+    frames = []
+    sample_every_seconds = float(skim.get("sample_every_seconds", 4))
+    for index, path in enumerate(frame_paths, start=1):
+        relpath = str(path.relative_to(settings.preview_dir))
+        frames.append(
+            {
+                "index": index,
+                "source_seconds": int(round((index - 1) * sample_every_seconds)),
+                "media_url": url_for("media_file", kind="preview", relpath=relpath),
+            }
+        )
+    return frames
 
 
 def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:

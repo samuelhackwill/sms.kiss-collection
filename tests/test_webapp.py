@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from ia_kissing_pipeline.config import load_settings
@@ -7,6 +8,32 @@ from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.ingest.fixture_ingest import ingest_fixture
 from ia_kissing_pipeline.main import run_metadata_scoring
 from ia_kissing_pipeline.webapp import _build_manual_clip_now, _cleanup_nonpending_local_artifacts, _start_get_more_vids, create_app
+
+
+def _make_test_video(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=160x90:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:s=160x90:d=1",
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[outv]",
+            "-map",
+            "[outv]",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
 
 
 def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
@@ -108,6 +135,51 @@ def test_cleanup_nonpending_local_artifacts_keeps_db_rows(tmp_path: Path, monkey
     assert remaining == [(1, "metadata_scored"), (2, "excluded_metadata"), (3, "metadata_scored")]
     assert (settings.download_dir / "kiss_in_spring_1932" / "placeholder.txt").exists()
     assert not (settings.download_dir / "ants_of_industry_1948" / "placeholder.txt").exists()
+
+
+def test_skim_overview_endpoint_builds_and_reuses_images(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+        _make_test_video(preview_path)
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    app = create_app()
+    client = app.test_client()
+    response = client.get("/films/1/skim-overview")
+    second_response = client.get("/films/1/skim-overview")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["frames"]
+    assert payload["frames"][0]["media_url"].startswith("/media/preview/")
+    overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
+    assert overview_dir.exists()
+    assert list(overview_dir.glob("frame_*.jpg"))
+    assert second_response.status_code == 200
+    assert second_response.get_json()["frames"] == payload["frames"]
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:

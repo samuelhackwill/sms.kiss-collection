@@ -69,6 +69,36 @@ def build_skim_preview(
     return output_path
 
 
+def build_skim_overview_frames(
+    skim_preview_path: Path,
+    output_dir: Path,
+    *,
+    force: bool = False,
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(output_dir.glob("frame_*.jpg"))
+    if existing and not force:
+        return existing
+    for path in existing:
+        path.unlink()
+    frame_pattern = output_dir / "frame_%06d.jpg"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(skim_preview_path),
+            "-vsync",
+            "0",
+            str(frame_pattern),
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return sorted(output_dir.glob("frame_*.jpg"))
+
+
 def _number_frames(frames_dir: Path) -> None:
     font = ImageFont.load_default()
     for index, frame_path in enumerate(sorted(frames_dir.glob("frame_*.jpg")), start=1):
