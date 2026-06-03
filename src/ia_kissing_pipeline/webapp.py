@@ -710,6 +710,9 @@ FILM_TEMPLATE = """
   let lastTapAt = 0;
   let skimOverviewBuilt = false;
   let skimOverviewBuilding = false;
+  let scrubFrameRequested = false;
+  let pendingSeekTime = null;
+  let seekInFlight = false;
 
   const updateFields = () => {
     const previewSeconds = video.currentTime || 0;
@@ -727,8 +730,45 @@ FILM_TEMPLATE = """
     const rect = video.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     const duration = video.duration || 0;
-    video.currentTime = duration * ratio;
-    updateFields();
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return;
+    }
+    pendingSeekTime = duration * ratio;
+    updateFieldsForPendingSeek();
+    flushPendingSeek();
+  };
+
+  const updateFieldsForPendingSeek = () => {
+    if (pendingSeekTime === null) {
+      updateFields();
+      return;
+    }
+    const previewSeconds = pendingSeekTime;
+    const sampleIndex = Math.max(1, Math.floor(previewSeconds * outputFps) + 1);
+    const sourceSeconds = (sampleIndex - 1) * sampleEvery;
+    previewInput.value = previewSeconds.toFixed(3);
+    sampleInput.value = sampleIndex;
+    sourceInput.value = sourceSeconds.toFixed(3);
+    readout.textContent = `Current skim second: ${previewSeconds.toFixed(2)} | sample index: ${sampleIndex} | source second: ${sourceSeconds.toFixed(0)}`;
+    overlayLeft.textContent = `skim ${previewSeconds.toFixed(2)}s`;
+    overlayRight.textContent = `source ${sourceSeconds.toFixed(0)}s | frame ${sampleIndex}`;
+  };
+
+  const flushPendingSeek = () => {
+    if (scrubFrameRequested) {
+      return;
+    }
+    scrubFrameRequested = true;
+    window.requestAnimationFrame(() => {
+      scrubFrameRequested = false;
+      if (seekInFlight || pendingSeekTime === null) {
+        return;
+      }
+      const nextSeekTime = pendingSeekTime;
+      pendingSeekTime = null;
+      seekInFlight = true;
+      video.currentTime = nextSeekTime;
+    });
   };
 
   video.addEventListener("mousemove", (event) => {
@@ -756,7 +796,13 @@ FILM_TEMPLATE = """
     lastTapAt = now;
   }, { passive: false });
   video.addEventListener("loadedmetadata", updateFields);
-  video.addEventListener("seeked", updateFields);
+  video.addEventListener("seeked", () => {
+    seekInFlight = false;
+    updateFields();
+    if (pendingSeekTime !== null && Math.abs((video.currentTime || 0) - pendingSeekTime) > 0.001) {
+      flushPendingSeek();
+    }
+  });
 
   const buildSkimOverview = async () => {
     if (skimOverviewBuilt || skimOverviewBuilding || !skimOverviewGrid || !skimOverviewStatus) return;
