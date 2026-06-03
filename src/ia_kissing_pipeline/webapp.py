@@ -737,6 +737,7 @@ FILM_TEMPLATE = """
   let skimOverviewBuilding = false;
   let kissDetectorBuilt = false;
   let kissDetectorBuilding = false;
+  const renderedKissDetectorFrames = new Set();
   let scrubFrameRequested = false;
   let pendingSeekTime = null;
   let seekInFlight = false;
@@ -906,42 +907,51 @@ FILM_TEMPLATE = """
   const buildKissDetector = async () => {
     if (kissDetectorBuilt || kissDetectorBuilding || !kissDetectorGrid || !kissDetectorStatus) return;
     kissDetectorBuilding = true;
+    renderedKissDetectorFrames.clear();
     kissDetectorStatus.textContent = "Running workflow on skim frames...";
     kissDetectorGrid.innerHTML = "";
     try {
-      const response = await fetch("{{ url_for('kiss_detector_payload', film_id=film['id']) }}");
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
+      let done = false;
+      while (!done) {
+        const response = await fetch("{{ url_for('kiss_detector_payload', film_id=film['id']) }}");
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
+        }
+        payload.frames.forEach((frame) => {
+          if (renderedKissDetectorFrames.has(frame.index)) {
+            return;
+          }
+          renderedKissDetectorFrames.add(frame.index);
+          const card = document.createElement("div");
+          card.className = "skim-frame-card";
+
+          const image = document.createElement("img");
+          image.src = frame.media_url;
+          image.alt = `Kiss detector frame ${frame.index}`;
+
+          const meta = document.createElement("div");
+          meta.className = "skim-frame-meta";
+          meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
+
+          const actions = document.createElement("div");
+          actions.className = "skim-frame-actions";
+
+          const downloadLink = document.createElement("a");
+          downloadLink.href = frame.media_url;
+          downloadLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.png`;
+          downloadLink.textContent = "download";
+
+          card.appendChild(image);
+          card.appendChild(meta);
+          actions.appendChild(downloadLink);
+          card.appendChild(actions);
+          kissDetectorGrid.appendChild(card);
+        });
+        kissDetectorStatus.textContent = `${payload.completed}/${payload.total} workflow outputs`;
+        done = Boolean(payload.done);
       }
-      payload.frames.forEach((frame) => {
-        const card = document.createElement("div");
-        card.className = "skim-frame-card";
-
-        const image = document.createElement("img");
-        image.src = frame.media_url;
-        image.alt = `Kiss detector frame ${frame.index}`;
-
-        const meta = document.createElement("div");
-        meta.className = "skim-frame-meta";
-        meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
-
-        const actions = document.createElement("div");
-        actions.className = "skim-frame-actions";
-
-        const downloadLink = document.createElement("a");
-        downloadLink.href = frame.media_url;
-        downloadLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.png`;
-        downloadLink.textContent = "download";
-
-        card.appendChild(image);
-        card.appendChild(meta);
-        actions.appendChild(downloadLink);
-        card.appendChild(actions);
-        kissDetectorGrid.appendChild(card);
-      });
       kissDetectorBuilt = true;
-      kissDetectorStatus.textContent = `${payload.frames.length} workflow outputs`;
     } catch (error) {
       kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not run kiss detector.";
     } finally {
@@ -1658,12 +1668,12 @@ def create_app() -> Flask:
         if skim is None:
             abort(404)
         try:
-            frames = _ensure_kiss_detector_outputs(settings, film["archive_identifier"], skim)
+            payload = _process_kiss_detector_batch(settings, film["archive_identifier"], skim)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 502
-        return jsonify({"frames": frames})
+        return jsonify(payload)
 
     @app.get("/media/<kind>/<path:relpath>")
     def media_file(kind: str, relpath: str):
@@ -2025,7 +2035,7 @@ def _ensure_skim_overview(settings, archive_identifier: str, skim: dict) -> list
     return frames
 
 
-def _ensure_kiss_detector_outputs(settings, archive_identifier: str, skim: dict) -> list[dict[str, str | int]]:
+def _process_kiss_detector_batch(settings, archive_identifier: str, skim: dict) -> dict[str, object]:
     if not settings.roboflow_api_key:
         raise ValueError("Missing ROBOFLOW_API_KEY in your environment.")
     if not settings.roboflow_workspace_name or not settings.roboflow_workflow_id:
@@ -2037,14 +2047,32 @@ def _ensure_kiss_detector_outputs(settings, archive_identifier: str, skim: dict)
     frame_paths = sorted(overview_dir.glob("frame_*.jpg"))
     output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    frames = []
-    sample_every_seconds = float(skim.get("sample_every_seconds", 4))
+    next_missing = None
     for index, frame_path in enumerate(frame_paths, start=1):
         output_path = output_dir / f"frame_{index:06d}.png"
         if not output_path.exists():
-            rendered_bytes = _run_roboflow_kiss_detector(settings, frame_path)
-            _save_rendered_workflow_image(rendered_bytes, output_path)
+            next_missing = (index, frame_path, output_path)
+            break
+    if next_missing is not None:
+        _, frame_path, output_path = next_missing
+        rendered_bytes = _run_roboflow_kiss_detector(settings, frame_path)
+        _save_rendered_workflow_image(rendered_bytes, output_path)
+    frames = _list_kiss_detector_outputs(settings, archive_identifier, skim, output_dir)
+    total = len(frame_paths)
+    completed = len(frames)
+    return {
+        "frames": frames,
+        "completed": completed,
+        "total": total,
+        "done": completed >= total,
+    }
+
+
+def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, output_dir: Path | None = None) -> list[dict[str, str | int]]:
+    output_dir = output_dir or (settings.preview_dir / archive_identifier / "kiss-detector")
+    sample_every_seconds = float(skim.get("sample_every_seconds", 4))
+    frames = []
+    for index, output_path in enumerate(sorted(output_dir.glob("frame_*.png")), start=1):
         relpath = str(output_path.relative_to(settings.preview_dir))
         frames.append(
             {

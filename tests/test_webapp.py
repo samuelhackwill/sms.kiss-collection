@@ -246,18 +246,32 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     app = create_app()
     client = app.test_client()
     response = client.get("/films/1/kiss-detector")
-    second_response = client.get("/films/1/kiss-detector")
 
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["frames"]
     assert payload["frames"][0]["media_url"].startswith("/media/preview/")
+    assert payload["completed"] == 1
+    assert payload["total"] == 2
+    assert payload["done"] is False
     output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
     assert output_dir.exists()
-    assert list(output_dir.glob("frame_*.png"))
-    assert build_calls["detector"] == 2
+    assert len(list(output_dir.glob("frame_*.png"))) == 1
+    assert build_calls["detector"] == 1
+
+    second_response = client.get("/films/1/kiss-detector")
     assert second_response.status_code == 200
-    assert second_response.get_json()["frames"] == payload["frames"]
+    second_payload = second_response.get_json()
+    assert second_payload["completed"] == 2
+    assert second_payload["total"] == 2
+    assert second_payload["done"] is True
+    assert len(second_payload["frames"]) == 2
+    assert len(list(output_dir.glob("frame_*.png"))) == 2
+    assert build_calls["detector"] == 2
+
+    third_response = client.get("/films/1/kiss-detector")
+    assert third_response.status_code == 200
+    assert third_response.get_json() == second_payload
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
