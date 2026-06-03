@@ -213,6 +213,8 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
 
     def fake_run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
         build_calls["detector"] += 1
+        if frame_path.name.endswith("000001.jpg"):
+            return None
         image = Image.new("RGB", (32, 18), color=(255, 0, 0))
         import io
 
@@ -249,29 +251,32 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
 
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload["frames"]
-    assert payload["frames"][0]["media_url"].startswith("/media/preview/")
-    assert payload["completed"] == 1
+    assert payload["frames"] == []
+    assert payload["completed"] == 0
     assert payload["total"] == 2
     assert payload["done"] is False
     output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
     assert output_dir.exists()
-    assert len(list(output_dir.glob("frame_*.png"))) == 1
+    assert len(list(output_dir.glob("frame_*.png"))) == 0
     assert build_calls["detector"] == 1
 
     second_response = client.get("/films/1/kiss-detector")
     assert second_response.status_code == 200
     second_payload = second_response.get_json()
-    assert second_payload["completed"] == 2
+    assert second_payload["completed"] == 1
     assert second_payload["total"] == 2
     assert second_payload["done"] is True
-    assert len(second_payload["frames"]) == 2
-    assert len(list(output_dir.glob("frame_*.png"))) == 2
+    assert len(second_payload["frames"]) == 1
+    assert second_payload["frames"][0]["media_url"].startswith("/media/preview/")
+    assert len(list(output_dir.glob("frame_*.png"))) == 1
     assert build_calls["detector"] == 2
 
     third_response = client.get("/films/1/kiss-detector")
     assert third_response.status_code == 200
-    assert third_response.get_json() == second_payload
+    third_payload = third_response.get_json()
+    assert third_payload["completed"] == 1
+    assert third_payload["total"] == 2
+    assert third_payload["done"] is True
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:

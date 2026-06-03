@@ -2066,21 +2066,26 @@ def _process_kiss_detector_batch(settings, archive_identifier: str, skim: dict) 
     next_missing = None
     for index, frame_path in enumerate(frame_paths, start=1):
         output_path = output_dir / f"frame_{index:06d}.png"
-        if not output_path.exists():
-            next_missing = (index, frame_path, output_path)
+        skipped_path = output_dir / f"frame_{index:06d}.skip"
+        if not output_path.exists() and not skipped_path.exists():
+            next_missing = (index, frame_path, output_path, skipped_path)
             break
     if next_missing is not None:
-        _, frame_path, output_path = next_missing
+        _, frame_path, output_path, skipped_path = next_missing
         rendered_bytes = _run_roboflow_kiss_detector(settings, frame_path)
-        _save_rendered_workflow_image(rendered_bytes, output_path)
+        if rendered_bytes is not None:
+            _save_rendered_workflow_image(rendered_bytes, output_path)
+        else:
+            skipped_path.write_text("no_predictions")
     frames = _list_kiss_detector_outputs(settings, archive_identifier, skim, output_dir)
     total = len(frame_paths)
+    skipped = len(list(output_dir.glob("frame_*.skip")))
     completed = len(frames)
     return {
         "frames": frames,
         "completed": completed,
         "total": total,
-        "done": completed >= total,
+        "done": completed + skipped >= total,
     }
 
 
@@ -2100,7 +2105,7 @@ def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, o
     return frames
 
 
-def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
+def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes | None:
     try:
         from inference_sdk import InferenceHTTPClient
     except ImportError as exc:
@@ -2124,6 +2129,9 @@ def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
     except Exception as exc:
         raise RuntimeError(f"Roboflow workflow request failed: {exc}") from exc
 
+    if not _workflow_has_predictions(result):
+        return None
+
     image_payload = _find_first_workflow_image(result)
     if image_payload is None:
         debug_payload = json.dumps(result, indent=2, sort_keys=True, default=str)
@@ -2136,6 +2144,9 @@ def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
 
 def _find_first_workflow_image(node):
     if isinstance(node, dict):
+        annotated_image = node.get("annotated_image")
+        if isinstance(annotated_image, str) and annotated_image.strip():
+            return {"type": "base64", "value": annotated_image}
         node_type = node.get("type")
         node_value = node.get("value")
         if node_type in {"base64", "url"} and isinstance(node_value, str):
@@ -2150,6 +2161,21 @@ def _find_first_workflow_image(node):
             if found is not None:
                 return found
     return None
+
+
+def _workflow_has_predictions(node) -> bool:
+    if isinstance(node, dict):
+        predictions = node.get("predictions")
+        if isinstance(predictions, list) and len(predictions) > 0:
+            return True
+        for value in node.values():
+            if _workflow_has_predictions(value):
+                return True
+    elif isinstance(node, list):
+        for item in node:
+            if _workflow_has_predictions(item):
+                return True
+    return False
 
 
 def _decode_workflow_image_payload(payload: dict) -> bytes:
