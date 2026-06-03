@@ -412,8 +412,11 @@ FILM_TEMPLATE = """
     .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
     .metadata-row { display: grid; grid-template-columns: minmax(180px, 280px) minmax(0, 1fr); gap: 16px; align-items: start; }
     .metadata-title { font-size: clamp(24px, 4vw, 38px); line-height: 1.05; font-weight: 700; }
-    .metadata-box { max-height: 240px; overflow: auto; background: #0b1016; border: 1px solid #314056; border-radius: 14px; padding: 12px 14px; }
-    .metadata-box pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.45 monospace; color: #d7e5f7; }
+    .metadata-box { max-height: 240px; overflow: auto; background: #0b1016; border: 1px solid #314056; border-radius: 14px; padding: 4px 0; }
+    .metadata-item { display: grid; grid-template-columns: minmax(130px, 180px) minmax(0, 1fr); gap: 14px; padding: 10px 14px; border-top: 1px solid rgba(49, 64, 86, 0.65); }
+    .metadata-item:first-child { border-top: 0; }
+    .metadata-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .metadata-value { font: 13px/1.45 monospace; color: #d7e5f7; white-space: pre-wrap; word-break: break-word; }
     .debug-toggle { background: #2a3442; border-color: #3b495d; }
     body.debug-off .debug-only { display: none; }
     .film-tag-button { transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
@@ -465,7 +468,12 @@ FILM_TEMPLATE = """
       <div>
         <div class="small" style="margin-bottom:8px;">Available Metadata</div>
         <div class="metadata-box">
-          <pre>{{ film_metadata_json }}</pre>
+          {% for item in film_metadata %}
+            <div class="metadata-item">
+              <div class="metadata-label">{{ item["label"] }}</div>
+              <div class="metadata-value">{{ item["value"] }}</div>
+            </div>
+          {% endfor %}
         </div>
       </div>
     </div>
@@ -916,13 +924,39 @@ REVIEW_DATA_TEMPLATE = """
 """
 
 
-def _build_film_metadata_payload(film: sqlite3.Row) -> str:
-    payload = {}
+def _format_film_metadata_value(value) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        if stripped.startswith("[") or stripped.startswith("{"):
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                return value
+            if isinstance(decoded, list):
+                return ", ".join(str(item) for item in decoded if str(item).strip())
+            if isinstance(decoded, dict):
+                return "; ".join(f"{key}: {decoded[key]}" for key in sorted(decoded))
+        return value
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if str(item).strip())
+    if isinstance(value, dict):
+        return "; ".join(f"{key}: {value[key]}" for key in sorted(value))
+    return str(value)
+
+
+def _build_film_metadata_payload(film: sqlite3.Row) -> list[dict[str, str]]:
+    items = []
     for key, value in dict(film).items():
-        if key == "title" or value in (None, "", "[]", "{}"):
+        if key == "title" or value is None:
             continue
-        payload[key] = value
-    return json.dumps(payload, indent=2, sort_keys=True)
+        formatted = _format_film_metadata_value(value)
+        if not formatted:
+            continue
+        label = key.replace("_", " ")
+        items.append({"label": label, "value": formatted})
+    return items
 
 
 def create_app() -> Flask:
@@ -1023,7 +1057,7 @@ def create_app() -> Flask:
         return render_template_string(
             FILM_TEMPLATE,
             film=film,
-            film_metadata_json=_build_film_metadata_payload(film),
+            film_metadata=_build_film_metadata_payload(film),
             skim=skim,
             marks=marks,
             skim_job=skim_job,
