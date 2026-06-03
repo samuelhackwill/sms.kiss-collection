@@ -417,6 +417,17 @@ FILM_TEMPLATE = """
     .metadata-item:first-child { border-top: 0; }
     .metadata-label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
     .metadata-value { font: 13px/1.45 monospace; color: #d7e5f7; white-space: pre-wrap; word-break: break-word; }
+    .fold-section { border: 1px solid #314056; border-radius: 16px; background: #0b1016; overflow: hidden; }
+    .fold-section summary { list-style: none; cursor: pointer; padding: 14px 16px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .fold-section summary::-webkit-details-marker { display: none; }
+    .fold-section summary::after { content: "+"; color: var(--muted); font-size: 22px; line-height: 1; }
+    .fold-section[open] summary::after { content: "−"; }
+    .fold-body { padding: 0 16px 16px; border-top: 1px solid rgba(49, 64, 86, 0.65); }
+    .skim-overview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; margin-top: 14px; }
+    .skim-frame-card { background: #0f141b; border: 1px solid #263244; border-radius: 12px; overflow: hidden; }
+    .skim-frame-card img { width: 100%; display: block; background: #000; aspect-ratio: 16 / 9; object-fit: cover; }
+    .skim-frame-meta { padding: 8px 10px; font: 12px/1.35 monospace; color: #c8d5e6; }
+    .skim-overview-status { margin-top: 14px; color: var(--muted); font-size: 13px; }
     .debug-toggle { background: #2a3442; border-color: #3b495d; }
     body.debug-off .debug-only { display: none; }
     .film-tag-button { transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
@@ -511,6 +522,22 @@ FILM_TEMPLATE = """
     {% else %}
       <p class="small">No skim preview built yet.</p>
     {% endif %}
+  </div>
+  <div class="panel">
+    <div class="fold-section">
+      <details id="skim-overview-details">
+        <summary>Skim Overview</summary>
+        <div class="fold-body">
+          {% if skim %}
+            <p class="small">All skim frames from first to last. Open this section to generate the grid.</p>
+            <div id="skim-overview-status" class="skim-overview-status">Collapsed.</div>
+            <div id="skim-overview-grid" class="skim-overview-grid"></div>
+          {% else %}
+            <p class="small">No skim preview built yet.</p>
+          {% endif %}
+        </div>
+      </details>
+    </div>
   </div>
   <div class="panel">
     <h2>Marks & Clips</h2>
@@ -665,6 +692,9 @@ FILM_TEMPLATE = """
 <script>
   const video = document.getElementById("skim-video");
   const markForm = document.getElementById("mark-form");
+  const skimOverviewDetails = document.getElementById("skim-overview-details");
+  const skimOverviewGrid = document.getElementById("skim-overview-grid");
+  const skimOverviewStatus = document.getElementById("skim-overview-status");
   const previewInput = document.getElementById("preview-seconds");
   const sampleInput = document.getElementById("sample-index");
   const sourceInput = document.getElementById("source-seconds");
@@ -675,6 +705,8 @@ FILM_TEMPLATE = """
   const outputFps = {{ skim.output_fps }};
   const frameDuration = 1 / outputFps;
   let lastTapAt = 0;
+  let skimOverviewBuilt = false;
+  let skimOverviewBuilding = false;
 
   const updateFields = () => {
     const previewSeconds = video.currentTime || 0;
@@ -722,6 +754,79 @@ FILM_TEMPLATE = """
   }, { passive: false });
   video.addEventListener("loadedmetadata", updateFields);
   video.addEventListener("seeked", updateFields);
+
+  const waitForEvent = (target, eventName) => new Promise((resolve) => {
+    target.addEventListener(eventName, resolve, { once: true });
+  });
+
+  const buildSkimOverview = async () => {
+    if (skimOverviewBuilt || skimOverviewBuilding || !skimOverviewGrid || !skimOverviewStatus) return;
+    skimOverviewBuilding = true;
+    skimOverviewStatus.textContent = "Generating frame grid...";
+    skimOverviewGrid.innerHTML = "";
+    try {
+      const extractor = document.createElement("video");
+      extractor.preload = "auto";
+      extractor.muted = true;
+      extractor.playsInline = true;
+      extractor.src = video.currentSrc || video.src;
+      await waitForEvent(extractor, "loadedmetadata");
+
+      const width = extractor.videoWidth || video.videoWidth || 320;
+      const height = extractor.videoHeight || video.videoHeight || 180;
+      const duration = extractor.duration || video.duration || 0;
+      const frameCount = Math.max(1, Math.round(duration * outputFps));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) {
+        skimOverviewStatus.textContent = "Could not create frame previews.";
+        skimOverviewBuilding = false;
+        return;
+      }
+
+      for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
+        const seekTime = Math.max(0, Math.min(duration > 0 ? duration - 0.001 : 0, (frameIndex + 0.5) / outputFps));
+        extractor.currentTime = seekTime;
+        await waitForEvent(extractor, "seeked");
+        context.drawImage(extractor, 0, 0, width, height);
+
+        const card = document.createElement("div");
+        card.className = "skim-frame-card";
+
+        const image = document.createElement("img");
+        image.src = canvas.toDataURL("image/jpeg", 0.82);
+        image.alt = `Skim frame ${frameIndex + 1}`;
+
+        const meta = document.createElement("div");
+        meta.className = "skim-frame-meta";
+        const sourceSeconds = frameIndex * sampleEvery;
+        meta.textContent = `frame ${frameIndex + 1} | source ${sourceSeconds.toFixed(0)}s`;
+
+        card.appendChild(image);
+        card.appendChild(meta);
+        skimOverviewGrid.appendChild(card);
+        skimOverviewStatus.textContent = `Generating frame grid... ${frameIndex + 1}/${frameCount}`;
+      }
+
+      skimOverviewBuilt = true;
+      skimOverviewStatus.textContent = `${frameCount} skim frames`;
+    } catch (_error) {
+      skimOverviewStatus.textContent = "Could not generate skim overview.";
+    } finally {
+      skimOverviewBuilding = false;
+    }
+  };
+
+  if (skimOverviewDetails) {
+    skimOverviewDetails.addEventListener("toggle", () => {
+      if (skimOverviewDetails.open) {
+        buildSkimOverview();
+      }
+    });
+  }
+
   window.addEventListener("keydown", (event) => {
     const active = document.activeElement;
     if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) {

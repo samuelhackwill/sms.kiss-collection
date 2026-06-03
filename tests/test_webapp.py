@@ -50,6 +50,8 @@ def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     assert b"Available Metadata" in detail_response.data
     assert b"archive identifier" in detail_response.data
     assert b"Build / Refresh Skim Preview" in detail_response.data
+    assert b"Skim Overview" in detail_response.data
+    assert b"skim-overview-grid" in detail_response.data
     assert b"skim-viewport" in detail_response.data
     assert b"No Kissing Scenes. Show Me New Video" not in detail_response.data
     assert clips_response.status_code == 200
