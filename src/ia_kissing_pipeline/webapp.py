@@ -410,6 +410,10 @@ FILM_TEMPLATE = """
     .skim-viewport video { cursor: ew-resize; touch-action: none; user-select: none; -webkit-user-select: none; }
     .skim-help { margin-top: 8px; color: var(--muted); font-size: 13px; }
     .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+    .metadata-row { display: grid; grid-template-columns: minmax(180px, 280px) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .metadata-title { font-size: clamp(24px, 4vw, 38px); line-height: 1.05; font-weight: 700; }
+    .metadata-box { max-height: 240px; overflow: auto; background: #0b1016; border: 1px solid #314056; border-radius: 14px; padding: 12px 14px; }
+    .metadata-box pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 13px/1.45 monospace; color: #d7e5f7; }
     .debug-toggle { background: #2a3442; border-color: #3b495d; }
     body.debug-off .debug-only { display: none; }
     .film-tag-button { transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
@@ -422,6 +426,9 @@ FILM_TEMPLATE = """
     .tag-selector .film-tag-button[data-tag="dance"] { background: linear-gradient(180deg, #5d3f12 0%, #412b0c 100%); border-color: #b8872f; color: #ffe2a3; }
     .tag-selector .tag-radio:checked + .film-tag-button { opacity: 1; outline: 2px solid #87f0ae; }
     .tag-selector .tag-radio:not(:checked) + .film-tag-button { opacity: 0.65; }
+    @media (max-width: 900px) {
+      .metadata-row { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body class="debug-off">
@@ -449,6 +456,20 @@ FILM_TEMPLATE = """
       </div>
     </div>
   {% endif %}
+  <div class="panel">
+    <div class="metadata-row">
+      <div>
+        <div class="small">Film</div>
+        <div class="metadata-title">{{ film["title"] }}</div>
+      </div>
+      <div>
+        <div class="small" style="margin-bottom:8px;">Available Metadata</div>
+        <div class="metadata-box">
+          <pre>{{ film_metadata_json }}</pre>
+        </div>
+      </div>
+    </div>
+  </div>
   <div class="panel">
     <h2 class="debug-only">Skim Review</h2>
     <form method="post" action="{{ url_for('build_skim', film_id=film['id']) }}" class="debug-only">
@@ -895,6 +916,15 @@ REVIEW_DATA_TEMPLATE = """
 """
 
 
+def _build_film_metadata_payload(film: sqlite3.Row) -> str:
+    payload = {}
+    for key, value in dict(film).items():
+        if key == "title" or value in (None, "", "[]", "{}"):
+            continue
+        payload[key] = value
+    return json.dumps(payload, indent=2, sort_keys=True)
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     settings = load_settings()
@@ -993,6 +1023,7 @@ def create_app() -> Flask:
         return render_template_string(
             FILM_TEMPLATE,
             film=film,
+            film_metadata_json=_build_film_metadata_payload(film),
             skim=skim,
             marks=marks,
             skim_job=skim_job,
