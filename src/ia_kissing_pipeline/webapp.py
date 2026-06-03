@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import signal
@@ -10,8 +12,11 @@ import sys
 import time
 import re
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
+from PIL import Image
 
 from ia_kissing_pipeline.config import load_settings
 from ia_kissing_pipeline.db import get_connection, init_db
@@ -431,6 +436,7 @@ FILM_TEMPLATE = """
     .skim-frame-actions a { font-size: 11px; color: var(--muted); text-decoration: none; }
     .skim-frame-actions a:hover { color: var(--link); text-decoration: underline; }
     .skim-overview-status { margin-top: 14px; color: var(--muted); font-size: 13px; }
+    .kiss-detector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; }
     .debug-toggle { background: #2a3442; border-color: #3b495d; }
     body.debug-off .debug-only { display: none; }
     .film-tag-button { transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
@@ -535,6 +541,22 @@ FILM_TEMPLATE = """
             <p class="small">All skim frames from first to last. Open this section to generate the grid.</p>
             <div id="skim-overview-status" class="skim-overview-status">Collapsed.</div>
             <div id="skim-overview-grid" class="skim-overview-grid"></div>
+          {% else %}
+            <p class="small">No skim preview built yet.</p>
+          {% endif %}
+        </div>
+      </details>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="fold-section">
+      <details id="kiss-detector-details">
+        <summary>Kiss Detector</summary>
+        <div class="fold-body">
+          {% if skim %}
+            <p class="small">Runs the Roboflow workflow on every skim overview frame and shows the returned visual output.</p>
+            <div id="kiss-detector-status" class="skim-overview-status">Collapsed.</div>
+            <div id="kiss-detector-grid" class="kiss-detector-grid"></div>
           {% else %}
             <p class="small">No skim preview built yet.</p>
           {% endif %}
@@ -698,6 +720,9 @@ FILM_TEMPLATE = """
   const skimOverviewDetails = document.getElementById("skim-overview-details");
   const skimOverviewGrid = document.getElementById("skim-overview-grid");
   const skimOverviewStatus = document.getElementById("skim-overview-status");
+  const kissDetectorDetails = document.getElementById("kiss-detector-details");
+  const kissDetectorGrid = document.getElementById("kiss-detector-grid");
+  const kissDetectorStatus = document.getElementById("kiss-detector-status");
   const previewInput = document.getElementById("preview-seconds");
   const sampleInput = document.getElementById("sample-index");
   const sourceInput = document.getElementById("source-seconds");
@@ -711,6 +736,8 @@ FILM_TEMPLATE = """
   let lastTapAt = 0;
   let skimOverviewBuilt = false;
   let skimOverviewBuilding = false;
+  let kissDetectorBuilt = false;
+  let kissDetectorBuilding = false;
   let scrubFrameRequested = false;
   let pendingSeekTime = null;
   let seekInFlight = false;
@@ -873,6 +900,60 @@ FILM_TEMPLATE = """
     skimOverviewDetails.addEventListener("toggle", () => {
       if (skimOverviewDetails.open) {
         buildSkimOverview();
+      }
+    });
+  }
+
+  const buildKissDetector = async () => {
+    if (kissDetectorBuilt || kissDetectorBuilding || !kissDetectorGrid || !kissDetectorStatus) return;
+    kissDetectorBuilding = true;
+    kissDetectorStatus.textContent = "Running workflow on skim frames...";
+    kissDetectorGrid.innerHTML = "";
+    try {
+      const response = await fetch("{{ url_for('kiss_detector_payload', film_id=film['id']) }}");
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
+      }
+      payload.frames.forEach((frame) => {
+        const card = document.createElement("div");
+        card.className = "skim-frame-card";
+
+        const image = document.createElement("img");
+        image.src = frame.media_url;
+        image.alt = `Kiss detector frame ${frame.index}`;
+
+        const meta = document.createElement("div");
+        meta.className = "skim-frame-meta";
+        meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
+
+        const actions = document.createElement("div");
+        actions.className = "skim-frame-actions";
+
+        const downloadLink = document.createElement("a");
+        downloadLink.href = frame.media_url;
+        downloadLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.png`;
+        downloadLink.textContent = "download";
+
+        card.appendChild(image);
+        card.appendChild(meta);
+        actions.appendChild(downloadLink);
+        card.appendChild(actions);
+        kissDetectorGrid.appendChild(card);
+      });
+      kissDetectorBuilt = true;
+      kissDetectorStatus.textContent = `${payload.frames.length} workflow outputs`;
+    } catch (error) {
+      kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not run kiss detector.";
+    } finally {
+      kissDetectorBuilding = false;
+    }
+  };
+
+  if (kissDetectorDetails) {
+    kissDetectorDetails.addEventListener("toggle", () => {
+      if (kissDetectorDetails.open) {
+        buildKissDetector();
       }
     });
   }
@@ -1568,6 +1649,23 @@ def create_app() -> Flask:
         frames = _ensure_skim_overview(settings, film["archive_identifier"], skim)
         return jsonify({"frames": frames})
 
+    @app.get("/films/<int:film_id>/kiss-detector")
+    def kiss_detector_payload(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+        if skim is None:
+            abort(404)
+        try:
+            frames = _ensure_kiss_detector_outputs(settings, film["archive_identifier"], skim)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 502
+        return jsonify({"frames": frames})
+
     @app.get("/media/<kind>/<path:relpath>")
     def media_file(kind: str, relpath: str):
         roots = {
@@ -1926,6 +2024,108 @@ def _ensure_skim_overview(settings, archive_identifier: str, skim: dict) -> list
             }
         )
     return frames
+
+
+def _ensure_kiss_detector_outputs(settings, archive_identifier: str, skim: dict) -> list[dict[str, str | int]]:
+    if not settings.roboflow_api_key:
+        raise ValueError("Missing ROBOFLOW_API_KEY in your environment.")
+    if not settings.roboflow_workspace_name or not settings.roboflow_workflow_id:
+        raise ValueError("Missing ROBOFLOW_WORKSPACE_NAME or ROBOFLOW_WORKFLOW_ID in your environment.")
+
+    overview_dir = settings.preview_dir / archive_identifier / "skim-overview"
+    if not list(overview_dir.glob("frame_*.jpg")):
+        _ensure_skim_overview(settings, archive_identifier, skim)
+    frame_paths = sorted(overview_dir.glob("frame_*.jpg"))
+    output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    frames = []
+    sample_every_seconds = float(skim.get("sample_every_seconds", 4))
+    for index, frame_path in enumerate(frame_paths, start=1):
+        output_path = output_dir / f"frame_{index:06d}.png"
+        if not output_path.exists():
+            rendered_bytes = _run_roboflow_kiss_detector(settings, frame_path)
+            _save_rendered_workflow_image(rendered_bytes, output_path)
+        relpath = str(output_path.relative_to(settings.preview_dir))
+        frames.append(
+            {
+                "index": index,
+                "source_seconds": int(round((index - 1) * sample_every_seconds)),
+                "media_url": url_for("media_file", kind="preview", relpath=relpath),
+            }
+        )
+    return frames
+
+
+def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
+    image_b64 = base64.b64encode(frame_path.read_bytes()).decode("ascii")
+    payload = {
+        "api_key": settings.roboflow_api_key,
+        "inputs": {
+            "image": {"type": "base64", "value": image_b64},
+            "classes": settings.roboflow_kiss_detector_classes,
+        },
+    }
+    request_url = (
+        f"{settings.roboflow_api_url.rstrip('/')}/infer/workflows/"
+        f"{settings.roboflow_workspace_name}/{settings.roboflow_workflow_id}"
+    )
+    request_obj = urllib_request.Request(
+        request_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request_obj, timeout=60) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Roboflow request failed with HTTP {exc.code}: {error_body}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"Roboflow request failed: {exc.reason}") from exc
+
+    image_payload = _find_first_workflow_image(result)
+    if image_payload is None:
+        raise RuntimeError("Roboflow workflow response did not contain an image output.")
+    return _decode_workflow_image_payload(image_payload)
+
+
+def _find_first_workflow_image(node):
+    if isinstance(node, dict):
+        node_type = node.get("type")
+        node_value = node.get("value")
+        if node_type in {"base64", "url"} and isinstance(node_value, str):
+            return node
+        for value in node.values():
+            found = _find_first_workflow_image(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_first_workflow_image(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _decode_workflow_image_payload(payload: dict) -> bytes:
+    payload_type = payload.get("type")
+    payload_value = payload.get("value", "")
+    if payload_type == "url":
+        with urllib_request.urlopen(payload_value, timeout=60) as response:
+            return response.read()
+    if payload_type == "base64":
+        value = payload_value
+        if value.startswith("data:") and "," in value:
+            value = value.split(",", 1)[1]
+        return base64.b64decode(value)
+    raise RuntimeError(f"Unsupported workflow image payload type: {payload_type}")
+
+
+def _save_rendered_workflow_image(image_bytes: bytes, output_path: Path) -> None:
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image.save(output_path, format="PNG")
 
 
 def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:

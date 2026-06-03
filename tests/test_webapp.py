@@ -1,6 +1,7 @@
 from __future__ import annotations
-
 from pathlib import Path
+
+from PIL import Image
 
 from ia_kissing_pipeline.config import load_settings
 from ia_kissing_pipeline.db import get_connection, init_db
@@ -52,6 +53,7 @@ def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     assert b"Build / Refresh Skim Preview" in detail_response.data
     assert b"Skim Overview" in detail_response.data
     assert b"skim-overview-grid" in detail_response.data
+    assert b"Kiss Detector" in detail_response.data
     assert b"skim-viewport" in detail_response.data
     assert b"No Kissing Scenes. Show Me New Video" not in detail_response.data
     assert clips_response.status_code == 200
@@ -172,6 +174,88 @@ def test_skim_overview_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert overview_dir.exists()
     assert list(overview_dir.glob("frame_*.jpg"))
     assert build_calls["count"] == 2
+    assert second_response.status_code == 200
+    assert second_response.get_json()["frames"] == payload["frames"]
+
+
+def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("ROBOFLOW_WORKSPACE_NAME", "test-workspace")
+    monkeypatch.setenv("ROBOFLOW_WORKFLOW_ID", "test-workflow")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    build_calls = {"overview": 0, "detector": 0}
+
+    def fake_build_skim_overview_frames(skim_preview_path: Path, output_dir: Path, *, force: bool = False):
+        build_calls["overview"] += 1
+        output_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(output_dir.glob("frame_*.jpg"))
+        if existing and not force:
+            return existing
+        created = []
+        for index in range(1, 3):
+            frame_path = output_dir / f"frame_{index:06d}.jpg"
+            frame_path.write_bytes(b"fake-jpeg")
+            created.append(frame_path)
+        return created
+
+    def fake_run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
+        build_calls["detector"] += 1
+        image = Image.new("RGB", (32, 18), color=(255, 0, 0))
+        import io
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.video.skim.build_skim_overview_frames",
+        fake_build_skim_overview_frames,
+    )
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._run_roboflow_kiss_detector",
+        fake_run_roboflow_kiss_detector,
+    )
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    app = create_app()
+    client = app.test_client()
+    response = client.get("/films/1/kiss-detector")
+    second_response = client.get("/films/1/kiss-detector")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["frames"]
+    assert payload["frames"][0]["media_url"].startswith("/media/preview/")
+    output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
+    assert output_dir.exists()
+    assert list(output_dir.glob("frame_*.png"))
+    assert build_calls["detector"] == 2
     assert second_response.status_code == 200
     assert second_response.get_json()["frames"] == payload["frames"]
 

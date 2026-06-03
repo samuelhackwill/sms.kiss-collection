@@ -16,6 +16,11 @@ class Settings:
     clips_dir: Path
     log_dir: Path
     user_agent: str
+    roboflow_api_url: str
+    roboflow_api_key: str
+    roboflow_workspace_name: str
+    roboflow_workflow_id: str
+    roboflow_kiss_detector_classes: str
 
     def ensure_directories(self) -> None:
         for path in (
@@ -45,4 +50,9 @@ def load_settings() -> Settings:
             "USER_AGENT",
             "ia-kissing-pipeline/0.1 (contact: operator@example.com)",
         ),
+        roboflow_api_url=os.getenv("ROBOFLOW_API_URL", "https://serverless.roboflow.com"),
+        roboflow_api_key=os.getenv("ROBOFLOW_API_KEY", ""),
+        roboflow_workspace_name=os.getenv("ROBOFLOW_WORKSPACE_NAME", ""),
+        roboflow_workflow_id=os.getenv("ROBOFLOW_WORKFLOW_ID", ""),
+        roboflow_kiss_detector_classes=os.getenv("ROBOFLOW_KISS_DETECTOR_CLASSES", "head"),
     )
