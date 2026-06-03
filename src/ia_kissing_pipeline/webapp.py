@@ -436,6 +436,7 @@ FILM_TEMPLATE = """
     .skim-frame-actions a:hover { color: var(--link); text-decoration: underline; }
     .skim-overview-status { margin-top: 14px; color: var(--muted); font-size: 13px; }
     .kiss-detector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; }
+    .debug-box { margin-top: 12px; padding: 12px; border-radius: 12px; border: 1px solid #314056; background: #0b1016; color: #d7e5f7; font: 12px/1.45 monospace; white-space: pre-wrap; word-break: break-word; }
     .debug-toggle { background: #2a3442; border-color: #3b495d; }
     body.debug-off .debug-only { display: none; }
     .film-tag-button { transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease; cursor: pointer; }
@@ -556,6 +557,7 @@ FILM_TEMPLATE = """
             <p class="small">Runs the Roboflow workflow on every skim overview frame and shows the returned visual output.</p>
             <div id="kiss-detector-status" class="skim-overview-status">Collapsed.</div>
             <div id="kiss-detector-grid" class="kiss-detector-grid"></div>
+            <div id="kiss-detector-debug" class="debug-box" style="display:none;"></div>
           {% else %}
             <p class="small">No skim preview built yet.</p>
           {% endif %}
@@ -722,6 +724,7 @@ FILM_TEMPLATE = """
   const kissDetectorDetails = document.getElementById("kiss-detector-details");
   const kissDetectorGrid = document.getElementById("kiss-detector-grid");
   const kissDetectorStatus = document.getElementById("kiss-detector-status");
+  const kissDetectorDebug = document.getElementById("kiss-detector-debug");
   const previewInput = document.getElementById("preview-seconds");
   const sampleInput = document.getElementById("sample-index");
   const sourceInput = document.getElementById("source-seconds");
@@ -910,12 +913,20 @@ FILM_TEMPLATE = """
     renderedKissDetectorFrames.clear();
     kissDetectorStatus.textContent = "Running workflow on skim frames...";
     kissDetectorGrid.innerHTML = "";
+    if (kissDetectorDebug) {
+      kissDetectorDebug.style.display = "none";
+      kissDetectorDebug.textContent = "";
+    }
     try {
       let done = false;
       while (!done) {
         const response = await fetch("{{ url_for('kiss_detector_payload', film_id=film['id']) }}");
         const payload = await response.json();
         if (!response.ok) {
+          if (kissDetectorDebug && payload.debug) {
+            kissDetectorDebug.style.display = "block";
+            kissDetectorDebug.textContent = payload.debug;
+          }
           throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
         }
         payload.frames.forEach((frame) => {
@@ -1672,7 +1683,12 @@ def create_app() -> Flask:
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         except RuntimeError as exc:
-            return jsonify({"error": str(exc)}), 502
+            message = str(exc)
+            summary, separator, debug = message.partition("\n\n")
+            response_payload = {"error": summary}
+            if separator:
+                response_payload["debug"] = debug
+            return jsonify(response_payload), 502
         return jsonify(payload)
 
     @app.get("/media/<kind>/<path:relpath>")
@@ -2110,7 +2126,11 @@ def _run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
 
     image_payload = _find_first_workflow_image(result)
     if image_payload is None:
-        raise RuntimeError("Roboflow workflow response did not contain an image output.")
+        debug_payload = json.dumps(result, indent=2, sort_keys=True, default=str)
+        raise RuntimeError(
+            "Roboflow workflow response did not contain an image output.\n\n"
+            f"{debug_payload}"
+        )
     return _decode_workflow_image_payload(image_payload)
 
 
