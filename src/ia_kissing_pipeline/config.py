@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -37,6 +39,7 @@ class Settings:
 
 def load_settings() -> Settings:
     cwd = Path.cwd()
+    load_dotenv(cwd / ".env", override=False)
     return Settings(
         app_env=os.getenv("APP_ENV", "development"),
         db_path=Path(os.getenv("DB_PATH", str(cwd / "data" / "pipeline.db"))),
