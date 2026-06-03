@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from ia_kissing_pipeline.config import load_settings
@@ -8,32 +7,6 @@ from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.ingest.fixture_ingest import ingest_fixture
 from ia_kissing_pipeline.main import run_metadata_scoring
 from ia_kissing_pipeline.webapp import _build_manual_clip_now, _cleanup_nonpending_local_artifacts, _start_get_more_vids, create_app
-
-
-def _make_test_video(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=c=red:s=160x90:d=1",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=c=blue:s=160x90:d=1",
-            "-filter_complex",
-            "[0:v][1:v]concat=n=2:v=1:a=0[outv]",
-            "-map",
-            "[outv]",
-            str(path),
-        ],
-        text=True,
-        capture_output=True,
-        check=True,
-    )
 
 
 def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
@@ -152,10 +125,30 @@ def test_skim_overview_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     settings = load_settings()
     settings.ensure_directories()
     init_db(settings.db_path)
+    build_calls = {"count": 0}
+
+    def fake_build_skim_overview_frames(skim_preview_path: Path, output_dir: Path, *, force: bool = False):
+        build_calls["count"] += 1
+        output_dir.mkdir(parents=True, exist_ok=True)
+        existing = sorted(output_dir.glob("frame_*.jpg"))
+        if existing and not force:
+            return existing
+        created = []
+        for index in range(1, 4):
+            frame_path = output_dir / f"frame_{index:06d}.jpg"
+            frame_path.write_bytes(b"fake-jpeg")
+            created.append(frame_path)
+        return created
+
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.video.skim.build_skim_overview_frames",
+        fake_build_skim_overview_frames,
+    )
     with get_connection(settings.db_path) as conn:
         ingest_fixture(conn, fixture_path)
         preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
-        _make_test_video(preview_path)
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_bytes(b"fake-preview")
         conn.execute(
             """
             INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
@@ -178,6 +171,7 @@ def test_skim_overview_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
     assert overview_dir.exists()
     assert list(overview_dir.glob("frame_*.jpg"))
+    assert build_calls["count"] == 2
     assert second_response.status_code == 200
     assert second_response.get_json()["frames"] == payload["frames"]
 
