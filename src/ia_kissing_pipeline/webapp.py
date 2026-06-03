@@ -427,6 +427,9 @@ FILM_TEMPLATE = """
     .skim-frame-card { background: #0f141b; border: 1px solid #263244; border-radius: 12px; overflow: hidden; }
     .skim-frame-card img { width: 100%; display: block; background: #000; aspect-ratio: 16 / 9; object-fit: cover; }
     .skim-frame-meta { padding: 8px 10px; font: 12px/1.35 monospace; color: #c8d5e6; }
+    .skim-frame-actions { display: flex; justify-content: flex-end; padding: 0 10px 10px; }
+    .skim-frame-actions a { font-size: 11px; color: var(--muted); text-decoration: none; }
+    .skim-frame-actions a:hover { color: var(--link); text-decoration: underline; }
     .skim-overview-status { margin-top: 14px; color: var(--muted); font-size: 13px; }
     .debug-toggle { background: #2a3442; border-color: #3b495d; }
     body.debug-off .debug-only { display: none; }
@@ -778,8 +781,18 @@ FILM_TEMPLATE = """
         meta.className = "skim-frame-meta";
         meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
 
+        const actions = document.createElement("div");
+        actions.className = "skim-frame-actions";
+
+        const downloadLink = document.createElement("a");
+        downloadLink.href = frame.media_url;
+        downloadLink.download = `skim-frame-${String(frame.index).padStart(6, "0")}.jpg`;
+        downloadLink.textContent = "download";
+
         card.appendChild(image);
         card.appendChild(meta);
+        actions.appendChild(downloadLink);
+        card.appendChild(actions);
         skimOverviewGrid.appendChild(card);
       });
 
