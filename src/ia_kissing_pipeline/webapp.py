@@ -562,7 +562,12 @@ FILM_TEMPLATE = """
             <p class="small">Runs the Roboflow workflow on every skim overview frame and shows the returned visual output.</p>
             <div class="action-row">
               <button type="button" id="kiss-detector-analyze">Analyze Frames</button>
+              <button type="button" id="kiss-detector-analyze-collisions" class="ghost">Analyze Collisions</button>
               <button type="button" id="kiss-detector-remove" class="ghost">Remove Frames</button>
+              <label class="small" style="display:inline-flex; gap:8px; align-items:center;">
+                <input type="checkbox" id="kiss-detector-show-collision">
+                Show Collision
+              </label>
               <a id="kiss-detector-download-all" class="button-link ghost-link" href="{{ url_for('kiss_detector_download_all', film_id=film['id']) }}" aria-disabled="true">Download All Frames</a>
             </div>
             <div id="kiss-detector-status" class="skim-overview-status">Collapsed.</div>
@@ -736,7 +741,9 @@ FILM_TEMPLATE = """
   const kissDetectorStatus = document.getElementById("kiss-detector-status");
   const kissDetectorDebug = document.getElementById("kiss-detector-debug");
   const kissDetectorAnalyzeButton = document.getElementById("kiss-detector-analyze");
+  const kissDetectorAnalyzeCollisionsButton = document.getElementById("kiss-detector-analyze-collisions");
   const kissDetectorRemoveButton = document.getElementById("kiss-detector-remove");
+  const kissDetectorShowCollisionToggle = document.getElementById("kiss-detector-show-collision");
   const kissDetectorDownloadAll = document.getElementById("kiss-detector-download-all");
   const previewInput = document.getElementById("preview-seconds");
   const sampleInput = document.getElementById("sample-index");
@@ -751,7 +758,7 @@ FILM_TEMPLATE = """
   let lastTapAt = 0;
   let skimOverviewBuilt = false;
   let skimOverviewBuilding = false;
-  const renderedKissDetectorFrames = new Set();
+  let latestKissDetectorFrames = [];
   let kissDetectorPollingTimer = null;
   let kissDetectorRequestInFlight = false;
   let scrubFrameRequested = false;
@@ -934,15 +941,10 @@ FILM_TEMPLATE = """
 
   const renderKissDetectorFrames = (frames, reset = false) => {
     if (!kissDetectorGrid) return;
-    if (reset) {
-      renderedKissDetectorFrames.clear();
-      kissDetectorGrid.innerHTML = "";
-    }
-    frames.forEach((frame) => {
-      if (renderedKissDetectorFrames.has(frame.index)) {
-        return;
-      }
-      renderedKissDetectorFrames.add(frame.index);
+    kissDetectorGrid.innerHTML = "";
+    const collisionOnly = Boolean(kissDetectorShowCollisionToggle?.checked);
+    const visibleFrames = collisionOnly ? frames.filter((frame) => Boolean(frame.collision)) : frames;
+    visibleFrames.forEach((frame) => {
       const card = document.createElement("div");
       card.className = "skim-frame-card";
 
@@ -952,7 +954,7 @@ FILM_TEMPLATE = """
 
       const meta = document.createElement("div");
       meta.className = "skim-frame-meta";
-      meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s`;
+      meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s${frame.collision ? " | collision: true" : ""}`;
 
       const actions = document.createElement("div");
       actions.className = "skim-frame-actions";
@@ -968,11 +970,12 @@ FILM_TEMPLATE = """
       card.appendChild(actions);
       kissDetectorGrid.appendChild(card);
     });
-    updateKissDetectorDownloadState(renderedKissDetectorFrames.size > 0);
+    updateKissDetectorDownloadState(frames.length > 0);
   };
 
   const applyKissDetectorStatus = (payload) => {
-    renderKissDetectorFrames(payload.frames || []);
+    latestKissDetectorFrames = payload.frames || [];
+    renderKissDetectorFrames(latestKissDetectorFrames, true);
     if (kissDetectorDebug) {
       if (payload.debug) {
         kissDetectorDebug.style.display = "block";
@@ -995,6 +998,9 @@ FILM_TEMPLATE = """
     }
     if (kissDetectorRemoveButton) {
       kissDetectorRemoveButton.disabled = false;
+    }
+    if (kissDetectorAnalyzeCollisionsButton) {
+      kissDetectorAnalyzeCollisionsButton.disabled = active || latestKissDetectorFrames.length === 0;
     }
     if (active && kissDetectorDetails?.open) {
       stopKissDetectorPolling();
@@ -1055,6 +1061,30 @@ FILM_TEMPLATE = """
     });
   }
 
+  if (kissDetectorAnalyzeCollisionsButton) {
+    kissDetectorAnalyzeCollisionsButton.addEventListener("click", async () => {
+      kissDetectorAnalyzeCollisionsButton.disabled = true;
+      kissDetectorStatus.textContent = "Analyzing collision polygons...";
+      try {
+        const response = await fetch("{{ url_for('kiss_detector_analyze_collisions', film_id=film['id']) }}", { method: "POST" });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || `collision analysis failed: ${response.status}`);
+        }
+        applyKissDetectorStatus(payload);
+      } catch (error) {
+        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not analyze collisions.";
+        kissDetectorAnalyzeCollisionsButton.disabled = false;
+      }
+    });
+  }
+
+  if (kissDetectorShowCollisionToggle) {
+    kissDetectorShowCollisionToggle.addEventListener("change", () => {
+      renderKissDetectorFrames(latestKissDetectorFrames, true);
+    });
+  }
+
   if (kissDetectorRemoveButton) {
     kissDetectorRemoveButton.addEventListener("click", async () => {
       stopKissDetectorPolling();
@@ -1064,6 +1094,7 @@ FILM_TEMPLATE = """
         if (!response.ok) {
           throw new Error(payload.error || `kiss detector remove failed: ${response.status}`);
         }
+        latestKissDetectorFrames = [];
         renderKissDetectorFrames([], true);
         applyKissDetectorStatus(payload);
       } catch (error) {
@@ -1807,6 +1838,21 @@ def create_app() -> Flask:
             job = _load_latest_job(conn, film_id, "kiss_detector")
         return jsonify(_build_kiss_detector_payload(settings, film["archive_identifier"], skim, job))
 
+    @app.post("/films/<int:film_id>/kiss-detector/analyze-collisions")
+    def kiss_detector_analyze_collisions(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+            kiss_detector_job = _load_latest_job(conn, film_id, "kiss_detector")
+        if skim is None:
+            abort(404)
+        analyzed = _analyze_kiss_detector_collisions(settings, film["archive_identifier"])
+        payload = _build_kiss_detector_payload(settings, film["archive_identifier"], skim, kiss_detector_job)
+        payload["collision_analysis_count"] = analyzed
+        return jsonify(payload)
+
     @app.post("/films/<int:film_id>/kiss-detector/remove")
     def kiss_detector_remove(film_id: int):
         with get_connection(settings.db_path) as conn:
@@ -2288,15 +2334,142 @@ def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, o
         frame_number = int(output_path.stem.split("_")[-1])
         relpath = str(output_path.relative_to(settings.preview_dir))
         predictions_path = output_path.with_suffix(".json")
+        collision = False
+        if predictions_path.exists():
+            try:
+                predictions_payload = json.loads(predictions_path.read_text())
+                collision = bool(predictions_payload.get("collision", False))
+            except json.JSONDecodeError:
+                collision = False
         frames.append(
             {
                 "index": frame_number,
                 "source_seconds": int(round((frame_number - 1) * sample_every_seconds)),
                 "media_url": url_for("media_file", kind="preview", relpath=relpath),
                 "predictions_url": url_for("media_file", kind="preview", relpath=str(predictions_path.relative_to(settings.preview_dir))) if predictions_path.exists() else None,
+                "collision": collision,
             }
         )
     return frames
+
+
+def _analyze_kiss_detector_collisions(settings, archive_identifier: str) -> int:
+    output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
+    analyzed = 0
+    for predictions_path in sorted(output_dir.glob("frame_*.json")):
+        try:
+            predictions_payload = json.loads(predictions_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        predictions = predictions_payload.get("predictions")
+        if isinstance(predictions, dict):
+            detections = predictions.get("predictions", [])
+        else:
+            detections = predictions_payload.get("predictions", [])
+        collision = _frame_has_polygon_collision(detections if isinstance(detections, list) else [])
+        predictions_payload["collision"] = collision
+        predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
+        analyzed += 1
+    return analyzed
+
+
+def _frame_has_polygon_collision(detections: list[dict]) -> bool:
+    polygons = []
+    for detection in detections:
+        points = detection.get("points")
+        if not isinstance(points, list):
+            continue
+        polygon = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            x = point.get("x")
+            y = point.get("y")
+            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+                polygon.append((float(x), float(y)))
+        if len(polygon) >= 3:
+            polygons.append(polygon)
+    for index, polygon_a in enumerate(polygons):
+        for polygon_b in polygons[index + 1 :]:
+            if _polygons_touch_or_overlap(polygon_a, polygon_b):
+                return True
+    return False
+
+
+def _polygons_touch_or_overlap(polygon_a: list[tuple[float, float]], polygon_b: list[tuple[float, float]]) -> bool:
+    edges_a = list(zip(polygon_a, polygon_a[1:] + polygon_a[:1]))
+    edges_b = list(zip(polygon_b, polygon_b[1:] + polygon_b[:1]))
+    for edge_a_start, edge_a_end in edges_a:
+        for edge_b_start, edge_b_end in edges_b:
+            if _segments_touch_or_intersect(edge_a_start, edge_a_end, edge_b_start, edge_b_end):
+                return True
+    if _point_in_polygon_or_boundary(polygon_a[0], polygon_b):
+        return True
+    if _point_in_polygon_or_boundary(polygon_b[0], polygon_a):
+        return True
+    return False
+
+
+def _segments_touch_or_intersect(
+    point_a1: tuple[float, float],
+    point_a2: tuple[float, float],
+    point_b1: tuple[float, float],
+    point_b2: tuple[float, float],
+) -> bool:
+    orientation1 = _orientation(point_a1, point_a2, point_b1)
+    orientation2 = _orientation(point_a1, point_a2, point_b2)
+    orientation3 = _orientation(point_b1, point_b2, point_a1)
+    orientation4 = _orientation(point_b1, point_b2, point_a2)
+
+    if orientation1 != orientation2 and orientation3 != orientation4:
+        return True
+    if orientation1 == 0 and _point_on_segment(point_b1, point_a1, point_a2):
+        return True
+    if orientation2 == 0 and _point_on_segment(point_b2, point_a1, point_a2):
+        return True
+    if orientation3 == 0 and _point_on_segment(point_a1, point_b1, point_b2):
+        return True
+    if orientation4 == 0 and _point_on_segment(point_a2, point_b1, point_b2):
+        return True
+    return False
+
+
+def _orientation(
+    point_a: tuple[float, float],
+    point_b: tuple[float, float],
+    point_c: tuple[float, float],
+) -> int:
+    value = ((point_b[1] - point_a[1]) * (point_c[0] - point_b[0])) - ((point_b[0] - point_a[0]) * (point_c[1] - point_b[1]))
+    if abs(value) < 1e-9:
+        return 0
+    return 1 if value > 0 else 2
+
+
+def _point_on_segment(
+    point: tuple[float, float],
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+) -> bool:
+    return (
+        min(segment_start[0], segment_end[0]) - 1e-9 <= point[0] <= max(segment_start[0], segment_end[0]) + 1e-9
+        and min(segment_start[1], segment_end[1]) - 1e-9 <= point[1] <= max(segment_start[1], segment_end[1]) + 1e-9
+    )
+
+
+def _point_in_polygon_or_boundary(point: tuple[float, float], polygon: list[tuple[float, float]]) -> bool:
+    for start, end in zip(polygon, polygon[1:] + polygon[:1]):
+        if _orientation(start, end, point) == 0 and _point_on_segment(point, start, end):
+            return True
+    inside = False
+    x, y = point
+    point_count = len(polygon)
+    for index in range(point_count):
+        x1, y1 = polygon[index]
+        x2, y2 = polygon[(index + 1) % point_count]
+        intersects = ((y1 > y) != (y2 > y)) and (x < ((x2 - x1) * (y - y1) / ((y2 - y1) or 1e-12) + x1))
+        if intersects:
+            inside = not inside
+    return inside
 
 
 def _run_roboflow_kiss_detector(settings, frame_path: Path) -> tuple[bytes | None, object]:

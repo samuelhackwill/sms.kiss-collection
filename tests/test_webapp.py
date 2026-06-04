@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 from pathlib import Path
 
 from PIL import Image
@@ -277,6 +278,8 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     client = app.test_client()
     detail_response = client.get("/films/1")
     assert b"Analyze Frames" in detail_response.data
+    assert b"Analyze Collisions" in detail_response.data
+    assert b"Show Collision" in detail_response.data
     assert b"Remove Frames" in detail_response.data
     assert b"Download All Frames" in detail_response.data
     response = client.get("/films/1/kiss-detector")
@@ -302,6 +305,95 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert len(list(output_dir.glob("frame_*.png"))) == 0
     assert len(list(output_dir.glob("frame_*.json"))) == 0
     assert len(list(output_dir.glob("frame_*.skip"))) == 0
+
+
+def test_kiss_detector_collision_analysis_updates_json_and_payload(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "frame_000001.png").write_bytes(b"fake")
+    (output_dir / "frame_000002.png").write_bytes(b"fake")
+    (output_dir / "frame_000001.json").write_text(
+        json.dumps(
+            {
+                "image": {"height": 18, "width": 32},
+                "predictions": [
+                    {
+                        "class": "head",
+                        "points": [{"x": 0, "y": 0}, {"x": 4, "y": 0}, {"x": 4, "y": 4}, {"x": 0, "y": 4}],
+                    },
+                    {
+                        "class": "mouth",
+                        "points": [{"x": 3, "y": 3}, {"x": 7, "y": 3}, {"x": 7, "y": 7}, {"x": 3, "y": 7}],
+                    },
+                ],
+            }
+        )
+    )
+    (output_dir / "frame_000002.json").write_text(
+        json.dumps(
+            {
+                "image": {"height": 18, "width": 32},
+                "predictions": [
+                    {
+                        "class": "head",
+                        "points": [{"x": 0, "y": 0}, {"x": 2, "y": 0}, {"x": 2, "y": 2}, {"x": 0, "y": 2}],
+                    },
+                    {
+                        "class": "mouth",
+                        "points": [{"x": 4, "y": 4}, {"x": 6, "y": 4}, {"x": 6, "y": 6}, {"x": 4, "y": 6}],
+                    },
+                ],
+            }
+        )
+    )
+    overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
+    overview_dir.mkdir(parents=True, exist_ok=True)
+    (overview_dir / "frame_000001.jpg").write_bytes(b"fake-jpeg")
+    (overview_dir / "frame_000002.jpg").write_bytes(b"fake-jpeg")
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/films/1/kiss-detector/analyze-collisions")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["collision_analysis_count"] == 2
+    assert [frame["collision"] for frame in payload["frames"]] == [True, False]
+
+    first_payload = json.loads((output_dir / "frame_000001.json").read_text())
+    second_payload = json.loads((output_dir / "frame_000002.json").read_text())
+    assert first_payload["collision"] is True
+    assert second_payload["collision"] is False
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
