@@ -218,16 +218,19 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
             created.append(frame_path)
         return created
 
-    def fake_run_roboflow_kiss_detector(settings, frame_path: Path) -> bytes:
+    def fake_run_roboflow_kiss_detector(settings, frame_path: Path) -> tuple[bytes | None, object]:
         build_calls["detector"] += 1
         if frame_path.name.endswith("000001.jpg"):
-            return None
+            return None, {"image": {"height": 18, "width": 32}, "predictions": []}
         image = Image.new("RGB", (32, 18), color=(255, 0, 0))
         import io
 
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
-        return buffer.getvalue()
+        return buffer.getvalue(), {
+            "image": {"height": 18, "width": 32},
+            "predictions": [{"class": "head", "confidence": 0.9}],
+        }
 
     monkeypatch.setattr(
         "ia_kissing_pipeline.video.skim.build_skim_overview_frames",
@@ -266,6 +269,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert _run_kiss_detector_now(job_id, 1) == 0
     assert output_dir.exists()
     assert len(list(output_dir.glob("frame_*.png"))) == 1
+    assert len(list(output_dir.glob("frame_*.json"))) == 2
     assert len(list(output_dir.glob("frame_*.skip"))) == 1
     assert build_calls["detector"] == 2
 
@@ -285,6 +289,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert len(payload["frames"]) == 1
     assert payload["frames"][0]["index"] == 2
     assert payload["frames"][0]["media_url"].startswith("/media/preview/")
+    assert payload["frames"][0]["predictions_url"].startswith("/media/preview/")
 
     download_response = client.get("/films/1/kiss-detector/download-all")
     assert download_response.status_code == 200
@@ -295,6 +300,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     remove_payload = remove_response.get_json()
     assert remove_payload["completed"] == 0
     assert len(list(output_dir.glob("frame_*.png"))) == 0
+    assert len(list(output_dir.glob("frame_*.json"))) == 0
     assert len(list(output_dir.glob("frame_*.skip"))) == 0
 
 
