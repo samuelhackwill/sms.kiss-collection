@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib import request as urllib_request
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ia_kissing_pipeline.config import load_settings
 from ia_kissing_pipeline.db import get_connection, init_db
@@ -564,6 +564,7 @@ FILM_TEMPLATE = """
             <div class="action-row">
               <button type="button" id="kiss-detector-analyze">Analyze Frames</button>
               <button type="button" id="kiss-detector-analyze-collisions" class="ghost">Analyze Collisions</button>
+              <button type="button" id="kiss-detector-cluster" class="ghost">Cluster Heads</button>
               <button type="button" id="kiss-detector-make-candidates" class="ghost">Make Kiss Candidates</button>
               <button type="button" id="kiss-detector-remove" class="ghost">Remove Frames</button>
               <label class="small" style="display:inline-flex; gap:8px; align-items:center;">
@@ -749,6 +750,7 @@ FILM_TEMPLATE = """
   const kissDetectorDebug = document.getElementById("kiss-detector-debug");
   const kissDetectorAnalyzeButton = document.getElementById("kiss-detector-analyze");
   const kissDetectorAnalyzeCollisionsButton = document.getElementById("kiss-detector-analyze-collisions");
+  const kissDetectorClusterButton = document.getElementById("kiss-detector-cluster");
   const kissDetectorMakeCandidatesButton = document.getElementById("kiss-detector-make-candidates");
   const kissDetectorRemoveButton = document.getElementById("kiss-detector-remove");
   const kissDetectorMinSizeInput = document.getElementById("kiss-detector-min-size");
@@ -1032,6 +1034,9 @@ FILM_TEMPLATE = """
     if (kissDetectorAnalyzeCollisionsButton) {
       kissDetectorAnalyzeCollisionsButton.disabled = active || latestKissDetectorFrames.length === 0;
     }
+    if (kissDetectorClusterButton) {
+      kissDetectorClusterButton.disabled = active || latestKissDetectorFrames.length === 0;
+    }
     if (kissDetectorMakeCandidatesButton) {
       kissDetectorMakeCandidatesButton.disabled = active || latestKissDetectorFrames.length === 0;
     }
@@ -1108,6 +1113,29 @@ FILM_TEMPLATE = """
       } catch (error) {
         kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not analyze collisions.";
         kissDetectorAnalyzeCollisionsButton.disabled = false;
+      }
+    });
+  }
+
+  if (kissDetectorClusterButton) {
+    kissDetectorClusterButton.addEventListener("click", async () => {
+      kissDetectorClusterButton.disabled = true;
+      kissDetectorStatus.textContent = "Clustering duplicate head masks...";
+      const minSizePixels = Math.max(0, Number.parseInt(kissDetectorMinSizeInput?.value || "0", 10) || 0);
+      try {
+        const response = await fetch("{{ url_for('kiss_detector_cluster', film_id=film['id']) }}", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ min_size_pixels: minSizePixels }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || `cluster analysis failed: ${response.status}`);
+        }
+        applyKissDetectorStatus(payload);
+      } catch (error) {
+        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not cluster duplicate masks.";
+        kissDetectorClusterButton.disabled = false;
       }
     });
   }
@@ -1909,6 +1937,32 @@ def create_app() -> Flask:
         payload["collision_analysis_count"] = analyzed
         return jsonify(payload)
 
+    @app.post("/films/<int:film_id>/kiss-detector/cluster")
+    def kiss_detector_cluster(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+            kiss_detector_job = _load_latest_job(conn, film_id, "kiss_detector")
+        if skim is None:
+            abort(404)
+        payload_json = request.get_json(silent=True) or {}
+        raw_min_size = payload_json.get("min_size_pixels", 0)
+        try:
+            min_size_pixels = max(0.0, float(raw_min_size))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid min_size_pixels value."}), 400
+        analyzed = _cluster_kiss_detector_detections(
+            settings,
+            film["archive_identifier"],
+            min_size_pixels=min_size_pixels,
+        )
+        payload = _build_kiss_detector_payload(settings, film["archive_identifier"], skim, kiss_detector_job)
+        payload["kiss_cluster_analysis_count"] = analyzed
+        payload["kiss_cluster_min_size_pixels"] = min_size_pixels
+        return jsonify(payload)
+
     @app.post("/films/<int:film_id>/kiss-detector/make-candidates")
     def kiss_detector_make_candidates(film_id: int):
         with get_connection(settings.db_path) as conn:
@@ -2414,18 +2468,26 @@ def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, o
     frames = []
     for output_path in sorted(output_dir.glob("frame_*.png")):
         frame_number = int(output_path.stem.split("_")[-1])
-        relpath = str(output_path.relative_to(settings.preview_dir))
         predictions_path = output_path.with_suffix(".json")
         collision = False
         kiss_candidate = False
+        cluster_overlay_relpath = None
         if predictions_path.exists():
             try:
                 predictions_payload = json.loads(predictions_path.read_text())
                 collision = bool(predictions_payload.get("collision", False))
                 kiss_candidate = bool(predictions_payload.get("kiss_candidate", False))
+                cluster_overlay_relpath = predictions_payload.get("kiss_cluster_overlay_relpath")
             except json.JSONDecodeError:
                 collision = False
                 kiss_candidate = False
+                cluster_overlay_relpath = None
+        media_path = output_path
+        if isinstance(cluster_overlay_relpath, str):
+            candidate_overlay_path = settings.preview_dir / cluster_overlay_relpath
+            if candidate_overlay_path.exists():
+                media_path = candidate_overlay_path
+        relpath = str(media_path.relative_to(settings.preview_dir))
         frames.append(
             {
                 "index": frame_number,
@@ -2474,16 +2536,17 @@ def _make_kiss_detector_candidates(
         except json.JSONDecodeError:
             continue
         detections = _extract_prediction_detections(predictions_payload)
-        candidate, candidate_meta = _analyze_kiss_candidate_frame(
+        clusters, cluster_meta = _cluster_frame_detections(
             detections,
             min_size_pixels=min_size_pixels,
-            max_overlap_ratio=max_overlap_ratio,
+            duplicate_overlap_ratio=max_overlap_ratio,
         )
+        candidate = _representative_clusters_touch(clusters)
         predictions_payload["kiss_candidate"] = candidate
         predictions_payload["kiss_candidate_min_size_pixels"] = min_size_pixels
         predictions_payload["kiss_candidate_max_overlap_ratio"] = max_overlap_ratio
-        predictions_payload["kiss_candidate_cluster_count"] = candidate_meta["cluster_count"]
-        predictions_payload["kiss_candidate_representative_ids"] = candidate_meta["representative_ids"]
+        predictions_payload["kiss_candidate_cluster_count"] = cluster_meta["cluster_count"]
+        predictions_payload["kiss_candidate_representative_ids"] = cluster_meta["representative_ids"]
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
     return analyzed
@@ -2513,19 +2576,52 @@ def _frame_has_kiss_candidate(
     min_size_pixels: float,
     max_overlap_ratio: float,
 ) -> bool:
-    return _analyze_kiss_candidate_frame(
+    clusters, _ = _cluster_frame_detections(
         detections,
         min_size_pixels=min_size_pixels,
-        max_overlap_ratio=max_overlap_ratio,
-    )[0]
+        duplicate_overlap_ratio=max_overlap_ratio,
+    )
+    return _representative_clusters_touch(clusters)
 
 
-def _analyze_kiss_candidate_frame(
+def _cluster_kiss_detector_detections(
+    settings,
+    archive_identifier: str,
+    *,
+    min_size_pixels: float,
+    duplicate_overlap_ratio: float = 0.72,
+) -> int:
+    output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
+    analyzed = 0
+    for predictions_path in sorted(output_dir.glob("frame_*.json")):
+        try:
+            predictions_payload = json.loads(predictions_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        detections = _extract_prediction_detections(predictions_payload)
+        clusters, cluster_meta = _cluster_frame_detections(
+            detections,
+            min_size_pixels=min_size_pixels,
+            duplicate_overlap_ratio=duplicate_overlap_ratio,
+        )
+        predictions_payload["kiss_cluster_min_size_pixels"] = min_size_pixels
+        predictions_payload["kiss_cluster_duplicate_overlap_ratio"] = duplicate_overlap_ratio
+        predictions_payload["kiss_cluster_count"] = cluster_meta["cluster_count"]
+        predictions_payload["kiss_cluster_representative_ids"] = cluster_meta["representative_ids"]
+        predictions_payload["kiss_cluster_groups"] = cluster_meta["groups"]
+        overlay_path = _write_cluster_overlay(output_dir, predictions_path, clusters)
+        predictions_payload["kiss_cluster_overlay_relpath"] = str(overlay_path.relative_to(settings.preview_dir))
+        predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
+        analyzed += 1
+    return analyzed
+
+
+def _cluster_frame_detections(
     detections: list[dict],
     *,
     min_size_pixels: float,
-    max_overlap_ratio: float,
-) -> tuple[bool, dict[str, object]]:
+    duplicate_overlap_ratio: float,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
     polygons = [
         polygon
         for polygon in _extract_detection_polygons(detections)
@@ -2533,19 +2629,24 @@ def _analyze_kiss_candidate_frame(
     ]
     representative_polygons = _cluster_duplicate_detections(
         polygons,
-        duplicate_overlap_ratio=max_overlap_ratio,
+        duplicate_overlap_ratio=duplicate_overlap_ratio,
     )
+    return representative_polygons, {
+        "cluster_count": len(representative_polygons),
+        "representative_ids": [polygon.get("detection_id") for polygon in representative_polygons if polygon.get("detection_id")],
+        "groups": [
+            _ordered_cluster_member_ids(polygon)
+            for polygon in representative_polygons
+        ],
+    }
+
+
+def _representative_clusters_touch(representative_polygons: list[dict[str, object]]) -> bool:
     for index, polygon_a in enumerate(representative_polygons):
         for polygon_b in representative_polygons[index + 1 :]:
             if _polygons_touch_or_overlap(polygon_a["points"], polygon_b["points"]):
-                return True, {
-                    "cluster_count": len(representative_polygons),
-                    "representative_ids": [polygon.get("detection_id") for polygon in representative_polygons if polygon.get("detection_id")],
-                }
-    return False, {
-        "cluster_count": len(representative_polygons),
-        "representative_ids": [polygon.get("detection_id") for polygon in representative_polygons if polygon.get("detection_id")],
-    }
+                return True
+    return False
 
 
 def _cluster_duplicate_detections(
@@ -2603,13 +2704,59 @@ def _detections_are_duplicates(
 
 
 def _select_cluster_representative(polygons: list[dict[str, object]], cluster: set[int]) -> dict[str, object]:
-    return max(
+    representative = max(
         (polygons[index] for index in cluster),
         key=lambda polygon: (
             float(polygon.get("confidence") or 0.0),
             float(polygon.get("area") or 0.0),
         ),
     )
+    representative = dict(representative)
+    representative["cluster_members"] = [dict(polygons[index]) for index in sorted(cluster)]
+    return representative
+
+
+def _write_cluster_overlay(
+    output_dir: Path,
+    predictions_path: Path,
+    representative_polygons: list[dict[str, object]],
+) -> Path:
+    source_image_path = predictions_path.with_suffix(".png")
+    overlay_dir = output_dir / "cluster-overlays"
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    overlay_path = overlay_dir / source_image_path.name
+    image = Image.open(source_image_path).convert("RGBA")
+    draw = ImageDraw.Draw(image)
+    palette = [
+        (255, 99, 71, 255),
+        (80, 200, 120, 255),
+        (80, 160, 255, 255),
+        (255, 215, 0, 255),
+        (255, 105, 180, 255),
+        (0, 206, 209, 255),
+    ]
+    for index, representative in enumerate(representative_polygons):
+        color = palette[index % len(palette)]
+        members = representative.get("cluster_members", [])
+        for member in members:
+            draw.line(member["points"] + [member["points"][0]], fill=color, width=1)
+        draw.line(representative["points"] + [representative["points"][0]], fill=color, width=3)
+        center_x, center_y = representative["center"]
+        draw.text((center_x + 3, center_y + 3), f"c{index + 1}", fill=color)
+    image.save(overlay_path)
+    return overlay_path
+
+
+def _ordered_cluster_member_ids(representative_polygon: dict[str, object]) -> list[str]:
+    representative_id = representative_polygon.get("detection_id")
+    members = [
+        member.get("detection_id")
+        for member in representative_polygon.get("cluster_members", [])
+        if member.get("detection_id")
+    ]
+    if not representative_id or representative_id not in members:
+        return members
+    return [representative_id] + [member_id for member_id in members if member_id != representative_id]
 
 
 def _extract_detection_polygons(detections: list[dict]) -> list[dict[str, object]]:
@@ -3335,6 +3482,7 @@ def _remove_kiss_detector_outputs(settings, film_id: int, archive_identifier: st
     for path in output_dir.glob("frame_*.*"):
         if path.suffix.lower() in {".png", ".json", ".skip"}:
             path.unlink()
+    shutil.rmtree(output_dir / "cluster-overlays", ignore_errors=True)
 
 
 def _stop_kiss_detector_job(settings, film_id: int) -> None:

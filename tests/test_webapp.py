@@ -279,6 +279,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     detail_response = client.get("/films/1")
     assert b"Analyze Frames" in detail_response.data
     assert b"Analyze Collisions" in detail_response.data
+    assert b"Cluster Heads" in detail_response.data
     assert b"Make Kiss Candidates" in detail_response.data
     assert b"Min size px" in detail_response.data
     assert b"Collisions" in detail_response.data
@@ -562,6 +563,102 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
     assert first_payload["kiss_candidate_min_size_pixels"] == 8
     assert fourth_payload["kiss_candidate_cluster_count"] == 2
     assert fourth_payload["kiss_candidate_representative_ids"] == ["left-large-b", "right-head"]
+
+
+def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (160, 160), "black").save(output_dir / "frame_000001.png")
+    (output_dir / "frame_000001.json").write_text(
+        json.dumps(
+            {
+                "image": {"height": 160, "width": 160},
+                "predictions": [
+                    {
+                        "class": "head",
+                        "detection_id": "left-large-a",
+                        "confidence": 0.6,
+                        "width": 40,
+                        "height": 40,
+                        "x": 40,
+                        "y": 40,
+                        "points": [{"x": 20, "y": 20}, {"x": 60, "y": 20}, {"x": 60, "y": 60}, {"x": 20, "y": 60}],
+                    },
+                    {
+                        "class": "head",
+                        "detection_id": "left-large-b",
+                        "confidence": 0.9,
+                        "width": 38,
+                        "height": 38,
+                        "x": 42,
+                        "y": 42,
+                        "points": [{"x": 24, "y": 24}, {"x": 62, "y": 24}, {"x": 62, "y": 62}, {"x": 24, "y": 62}],
+                    },
+                    {
+                        "class": "head",
+                        "detection_id": "right-head",
+                        "confidence": 0.8,
+                        "width": 40,
+                        "height": 40,
+                        "x": 76,
+                        "y": 42,
+                        "points": [{"x": 56, "y": 22}, {"x": 96, "y": 22}, {"x": 96, "y": 62}, {"x": 56, "y": 62}],
+                    },
+                ],
+            }
+        )
+    )
+    overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
+    overview_dir.mkdir(parents=True, exist_ok=True)
+    (overview_dir / "frame_000001.jpg").write_bytes(b"fake-jpeg")
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/films/1/kiss-detector/cluster", json={"min_size_pixels": 8})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["kiss_cluster_analysis_count"] == 1
+    assert payload["kiss_cluster_min_size_pixels"] == 8
+    assert len(payload["frames"]) == 1
+    assert "/cluster-overlays/" in payload["frames"][0]["media_url"]
+
+    frame_payload = json.loads((output_dir / "frame_000001.json").read_text())
+    assert frame_payload["kiss_cluster_count"] == 2
+    assert frame_payload["kiss_cluster_representative_ids"] == ["left-large-b", "right-head"]
+    assert frame_payload["kiss_cluster_groups"] == [["left-large-b", "left-large-a"], ["right-head"]]
+    overlay_path = settings.preview_dir / frame_payload["kiss_cluster_overlay_relpath"]
+    assert overlay_path.exists()
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
