@@ -284,7 +284,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert b"Cluster Heads" in detail_response.data
     assert b"Make Kiss Candidates" in detail_response.data
     assert b"Min size px" in detail_response.data
-    assert b"Workflow Cache" in detail_response.data
+    assert b"Clear Cache" in detail_response.data
     assert b"Collisions" in detail_response.data
     assert b"Kiss Candidates" in detail_response.data
     assert b"Remove Frames" in detail_response.data
@@ -536,6 +536,16 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
                         "y": 42,
                         "points": [{"x": 56, "y": 22}, {"x": 96, "y": 22}, {"x": 96, "y": 62}, {"x": 56, "y": 62}],
                     },
+                    {
+                        "class": "head",
+                        "detection_id": "bad-strip",
+                        "confidence": 0.5,
+                        "width": 56,
+                        "height": 8,
+                        "x": 48,
+                        "y": 24,
+                        "points": [{"x": 18, "y": 18}, {"x": 78, "y": 18}, {"x": 78, "y": 26}, {"x": 18, "y": 26}],
+                    },
                 ],
             }
         )
@@ -637,6 +647,16 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
                         "y": 42,
                         "points": [{"x": 56, "y": 22}, {"x": 96, "y": 22}, {"x": 96, "y": 62}, {"x": 56, "y": 62}],
                     },
+                    {
+                        "class": "head",
+                        "detection_id": "bad-strip",
+                        "confidence": 0.5,
+                        "width": 56,
+                        "height": 8,
+                        "x": 48,
+                        "y": 24,
+                        "points": [{"x": 18, "y": 18}, {"x": 78, "y": 18}, {"x": 78, "y": 26}, {"x": 18, "y": 26}],
+                    },
                 ],
             }
         )
@@ -660,8 +680,16 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
     assert frame_payload["kiss_cluster_count"] == 2
     assert frame_payload["kiss_cluster_representative_ids"] == ["left-large-b", "right-head"]
     assert frame_payload["kiss_cluster_groups"] == [["left-large-b", "left-large-a"], ["right-head"]]
+    assert frame_payload["kiss_cluster_irregular_ids"] == ["bad-strip"]
     overlay_path = settings.preview_dir / frame_payload["kiss_cluster_overlay_relpath"]
     assert overlay_path.exists()
+    overlay = Image.open(overlay_path).convert("RGBA")
+    overlay_pixels = overlay.load()
+    assert any(
+        overlay_pixels[x, y][0] > 200 and overlay_pixels[x, y][1] < 80 and overlay_pixels[x, y][2] < 80
+        for y in range(overlay.height)
+        for x in range(overlay.width)
+    )
 
 
 def test_kiss_detector_analyze_can_disable_workflow_cache(tmp_path: Path, monkeypatch) -> None:

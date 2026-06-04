@@ -571,10 +571,7 @@ FILM_TEMPLATE = """
                 Min size px
                 <input type="number" id="kiss-detector-min-size" min="0" step="1" value="40" style="width:90px;">
               </label>
-              <label class="small" style="display:inline-flex; gap:8px; align-items:center;">
-                <input type="checkbox" id="kiss-detector-workflow-cache" checked>
-                Workflow Cache
-              </label>
+              <button type="button" id="kiss-detector-clear-workflow-cache" class="ghost">Clear Cache</button>
               <div class="small" style="display:inline-flex; gap:12px; align-items:center;">
                 <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="all" checked> All</label>
                 <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="collision"> Collisions</label>
@@ -758,7 +755,7 @@ FILM_TEMPLATE = """
   const kissDetectorMakeCandidatesButton = document.getElementById("kiss-detector-make-candidates");
   const kissDetectorRemoveButton = document.getElementById("kiss-detector-remove");
   const kissDetectorMinSizeInput = document.getElementById("kiss-detector-min-size");
-  const kissDetectorWorkflowCacheToggle = document.getElementById("kiss-detector-workflow-cache");
+  const kissDetectorClearWorkflowCacheButton = document.getElementById("kiss-detector-clear-workflow-cache");
   const kissDetectorFilterRadios = Array.from(document.querySelectorAll('input[name="kiss-detector-filter"]'));
   const kissDetectorDownloadAll = document.getElementById("kiss-detector-download-all");
   const previewInput = document.getElementById("preview-seconds");
@@ -777,7 +774,7 @@ FILM_TEMPLATE = """
   let latestKissDetectorFrames = [];
   let kissDetectorPollingTimer = null;
   let kissDetectorRequestInFlight = false;
-  const workflowCacheStorageKey = "ia-kissing-roboflow-workflow-cache";
+  const workflowCacheBypassNextStorageKey = "ia-kissing-roboflow-workflow-cache-bypass-next";
   let scrubFrameRequested = false;
   let pendingSeekTime = null;
   let seekInFlight = false;
@@ -956,13 +953,20 @@ FILM_TEMPLATE = """
     kissDetectorDownloadAll.setAttribute("aria-disabled", hasFrames ? "false" : "true");
   };
 
-  if (kissDetectorWorkflowCacheToggle) {
-    const storedWorkflowCache = window.localStorage.getItem(workflowCacheStorageKey);
-    if (storedWorkflowCache !== null) {
-      kissDetectorWorkflowCacheToggle.checked = storedWorkflowCache === "1";
-    }
-    kissDetectorWorkflowCacheToggle.addEventListener("change", () => {
-      window.localStorage.setItem(workflowCacheStorageKey, kissDetectorWorkflowCacheToggle.checked ? "1" : "0");
+  const updateWorkflowCacheButtonState = () => {
+    if (!kissDetectorClearWorkflowCacheButton) return;
+    const bypassNext = window.localStorage.getItem(workflowCacheBypassNextStorageKey) === "1";
+    kissDetectorClearWorkflowCacheButton.textContent = bypassNext ? "Cache Will Be Bypassed" : "Clear Cache";
+  };
+
+  if (kissDetectorClearWorkflowCacheButton) {
+    updateWorkflowCacheButtonState();
+    kissDetectorClearWorkflowCacheButton.addEventListener("click", () => {
+      window.localStorage.setItem(workflowCacheBypassNextStorageKey, "1");
+      updateWorkflowCacheButtonState();
+      if (kissDetectorStatus) {
+        kissDetectorStatus.textContent = "Workflow cache will be bypassed on the next Analyze Frames run.";
+      }
     });
   }
 
@@ -1106,9 +1110,15 @@ FILM_TEMPLATE = """
             : {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ use_workflow_cache: Boolean(kissDetectorWorkflowCacheToggle?.checked) }),
+                body: JSON.stringify({
+                  use_workflow_cache: window.localStorage.getItem(workflowCacheBypassNextStorageKey) !== "1",
+                }),
               },
         );
+        if (!isActive && window.localStorage.getItem(workflowCacheBypassNextStorageKey) === "1") {
+          window.localStorage.removeItem(workflowCacheBypassNextStorageKey);
+          updateWorkflowCacheButtonState();
+        }
         const payload = await response.json();
         if (!response.ok) {
           throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
@@ -2646,7 +2656,8 @@ def _cluster_kiss_detector_detections(
         predictions_payload["kiss_cluster_count"] = cluster_meta["cluster_count"]
         predictions_payload["kiss_cluster_representative_ids"] = cluster_meta["representative_ids"]
         predictions_payload["kiss_cluster_groups"] = cluster_meta["groups"]
-        overlay_path = _write_cluster_overlay(output_dir, predictions_path, clusters)
+        predictions_payload["kiss_cluster_irregular_ids"] = cluster_meta["irregular_ids"]
+        overlay_path = _write_cluster_overlay(output_dir, predictions_path, clusters, cluster_meta["irregular_polygons"])
         predictions_payload["kiss_cluster_overlay_relpath"] = str(overlay_path.relative_to(settings.preview_dir))
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
@@ -2664,8 +2675,14 @@ def _cluster_frame_detections(
         for polygon in _extract_detection_polygons(detections)
         if polygon["size_pixels"] >= min_size_pixels
     ]
+    irregular_polygons = _find_irregular_colliding_polygons(polygons)
+    cleaned_polygons = [
+        polygon
+        for polygon in polygons
+        if polygon["shape_id"] not in {irregular_polygon["shape_id"] for irregular_polygon in irregular_polygons}
+    ]
     representative_polygons = _cluster_duplicate_detections(
-        polygons,
+        cleaned_polygons,
         duplicate_overlap_ratio=duplicate_overlap_ratio,
     )
     return representative_polygons, {
@@ -2675,7 +2692,38 @@ def _cluster_frame_detections(
             _ordered_cluster_member_ids(polygon)
             for polygon in representative_polygons
         ],
+        "irregular_ids": [polygon["shape_id"] for polygon in irregular_polygons],
+        "irregular_polygons": irregular_polygons,
     }
+
+
+def _find_irregular_colliding_polygons(polygons: list[dict[str, object]]) -> list[dict[str, object]]:
+    irregular: list[dict[str, object]] = []
+    for index, polygon_a in enumerate(polygons):
+        for polygon_b in polygons[index + 1 :]:
+            if not _polygons_touch_or_overlap(polygon_a["points"], polygon_b["points"]):
+                continue
+            if _is_irregular_head_shape(polygon_a) and polygon_a not in irregular:
+                irregular.append(polygon_a)
+            if _is_irregular_head_shape(polygon_b) and polygon_b not in irregular:
+                irregular.append(polygon_b)
+    return irregular
+
+
+def _is_irregular_head_shape(polygon: dict[str, object]) -> bool:
+    circularity = float(polygon.get("circularity") or 0.0)
+    extent = float(polygon.get("extent") or 0.0)
+    aspect_ratio = float(polygon.get("aspect_ratio") or 1.0)
+    if aspect_ratio > 4.0:
+        return True
+    irregular_score = 0
+    if circularity < 0.16:
+        irregular_score += 1
+    if extent < 0.3:
+        irregular_score += 1
+    if aspect_ratio > 2.6:
+        irregular_score += 1
+    return irregular_score >= 2
 
 
 def _representative_clusters_touch(representative_polygons: list[dict[str, object]]) -> bool:
@@ -2757,6 +2805,7 @@ def _write_cluster_overlay(
     output_dir: Path,
     predictions_path: Path,
     representative_polygons: list[dict[str, object]],
+    irregular_polygons: list[dict[str, object]],
 ) -> Path:
     source_image_path = predictions_path.with_suffix(".png")
     overlay_dir = output_dir / "cluster-overlays"
@@ -2772,6 +2821,10 @@ def _write_cluster_overlay(
         (255, 105, 180, 255),
         (0, 206, 209, 255),
     ]
+    for irregular_polygon in irregular_polygons:
+        draw.line(irregular_polygon["points"] + [irregular_polygon["points"][0]], fill=(255, 0, 0, 255), width=3)
+        center_x, center_y = irregular_polygon["center"]
+        draw.text((center_x + 3, center_y + 3), "x", fill=(255, 0, 0, 255))
     for index, representative in enumerate(representative_polygons):
         color = palette[index % len(palette)]
         members = representative.get("cluster_members", [])
@@ -2785,11 +2838,11 @@ def _write_cluster_overlay(
 
 
 def _ordered_cluster_member_ids(representative_polygon: dict[str, object]) -> list[str]:
-    representative_id = representative_polygon.get("detection_id")
+    representative_id = representative_polygon.get("shape_id")
     members = [
-        member.get("detection_id")
+        member.get("shape_id")
         for member in representative_polygon.get("cluster_members", [])
-        if member.get("detection_id")
+        if member.get("shape_id")
     ]
     if not representative_id or representative_id not in members:
         return members
@@ -2798,7 +2851,7 @@ def _ordered_cluster_member_ids(representative_polygon: dict[str, object]) -> li
 
 def _extract_detection_polygons(detections: list[dict]) -> list[dict[str, object]]:
     polygons: list[dict[str, object]] = []
-    for detection in detections:
+    for index, detection in enumerate(detections, start=1):
         points = detection.get("points")
         if not isinstance(points, list):
             continue
@@ -2812,15 +2865,23 @@ def _extract_detection_polygons(detections: list[dict]) -> list[dict[str, object
                 polygon.append((float(x), float(y)))
         if len(polygon) < 3:
             continue
+        bounds = _polygon_bounds(polygon)
+        area = _polygon_area(polygon)
+        perimeter = _polygon_perimeter(polygon)
         polygons.append(
             {
                 "points": polygon,
-                "area": _polygon_area(polygon),
+                "area": area,
                 "size_pixels": _detection_size_pixels(detection, polygon),
                 "confidence": float(detection.get("confidence") or 0.0),
                 "class_name": detection.get("class"),
                 "detection_id": detection.get("detection_id"),
+                "shape_id": detection.get("detection_id") or f"shape-{index}",
                 "center": _detection_center(detection, polygon),
+                "bbox": bounds,
+                "aspect_ratio": _polygon_aspect_ratio(bounds),
+                "extent": _polygon_extent(area, bounds),
+                "circularity": _polygon_circularity(area, perimeter),
             }
         )
     return polygons
@@ -2898,6 +2959,32 @@ def _polygon_area(polygon: list[tuple[float, float]]) -> float:
     for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1]):
         area += x1 * y2 - x2 * y1
     return abs(area) / 2.0
+
+
+def _polygon_perimeter(polygon: list[tuple[float, float]]) -> float:
+    perimeter = 0.0
+    for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1]):
+        perimeter += math.dist((x1, y1), (x2, y2))
+    return perimeter
+
+
+def _polygon_aspect_ratio(bounds: tuple[float, float, float, float]) -> float:
+    min_x, min_y, max_x, max_y = bounds
+    width = max(1e-6, max_x - min_x)
+    height = max(1e-6, max_y - min_y)
+    return max(width / height, height / width)
+
+
+def _polygon_extent(area: float, bounds: tuple[float, float, float, float]) -> float:
+    min_x, min_y, max_x, max_y = bounds
+    bbox_area = max(1e-6, (max_x - min_x) * (max_y - min_y))
+    return area / bbox_area
+
+
+def _polygon_circularity(area: float, perimeter: float) -> float:
+    if area <= 0 or perimeter <= 0:
+        return 0.0
+    return (4.0 * math.pi * area) / (perimeter * perimeter)
 
 
 def _segments_touch_or_intersect(
