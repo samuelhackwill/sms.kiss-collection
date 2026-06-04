@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 import signal
 import sqlite3
@@ -563,11 +564,17 @@ FILM_TEMPLATE = """
             <div class="action-row">
               <button type="button" id="kiss-detector-analyze">Analyze Frames</button>
               <button type="button" id="kiss-detector-analyze-collisions" class="ghost">Analyze Collisions</button>
+              <button type="button" id="kiss-detector-make-candidates" class="ghost">Make Kiss Candidates</button>
               <button type="button" id="kiss-detector-remove" class="ghost">Remove Frames</button>
               <label class="small" style="display:inline-flex; gap:8px; align-items:center;">
-                <input type="checkbox" id="kiss-detector-show-collision">
-                Show Collision
+                Min area px
+                <input type="number" id="kiss-detector-min-area" min="0" step="1" value="1500" style="width:90px;">
               </label>
+              <div class="small" style="display:inline-flex; gap:12px; align-items:center;">
+                <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="all" checked> All</label>
+                <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="collision"> Collisions</label>
+                <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="candidate"> Kiss Candidates</label>
+              </div>
               <a id="kiss-detector-download-all" class="button-link ghost-link" href="{{ url_for('kiss_detector_download_all', film_id=film['id']) }}" aria-disabled="true">Download All Frames</a>
             </div>
             <div id="kiss-detector-status" class="skim-overview-status">Collapsed.</div>
@@ -742,8 +749,10 @@ FILM_TEMPLATE = """
   const kissDetectorDebug = document.getElementById("kiss-detector-debug");
   const kissDetectorAnalyzeButton = document.getElementById("kiss-detector-analyze");
   const kissDetectorAnalyzeCollisionsButton = document.getElementById("kiss-detector-analyze-collisions");
+  const kissDetectorMakeCandidatesButton = document.getElementById("kiss-detector-make-candidates");
   const kissDetectorRemoveButton = document.getElementById("kiss-detector-remove");
-  const kissDetectorShowCollisionToggle = document.getElementById("kiss-detector-show-collision");
+  const kissDetectorMinAreaInput = document.getElementById("kiss-detector-min-area");
+  const kissDetectorFilterRadios = Array.from(document.querySelectorAll('input[name="kiss-detector-filter"]'));
   const kissDetectorDownloadAll = document.getElementById("kiss-detector-download-all");
   const previewInput = document.getElementById("preview-seconds");
   const sampleInput = document.getElementById("sample-index");
@@ -939,11 +948,24 @@ FILM_TEMPLATE = """
     kissDetectorDownloadAll.setAttribute("aria-disabled", hasFrames ? "false" : "true");
   };
 
+  const getKissDetectorFilter = () => {
+    const selected = kissDetectorFilterRadios.find((radio) => radio.checked);
+    return selected ? selected.value : "all";
+  };
+
   const renderKissDetectorFrames = (frames, reset = false) => {
     if (!kissDetectorGrid) return;
     kissDetectorGrid.innerHTML = "";
-    const collisionOnly = Boolean(kissDetectorShowCollisionToggle?.checked);
-    const visibleFrames = collisionOnly ? frames.filter((frame) => Boolean(frame.collision)) : frames;
+    const filterMode = getKissDetectorFilter();
+    const visibleFrames = frames.filter((frame) => {
+      if (filterMode === "collision") {
+        return Boolean(frame.collision);
+      }
+      if (filterMode === "candidate") {
+        return Boolean(frame.kiss_candidate);
+      }
+      return true;
+    });
     visibleFrames.forEach((frame) => {
       const card = document.createElement("div");
       card.className = "skim-frame-card";
@@ -954,7 +976,7 @@ FILM_TEMPLATE = """
 
       const meta = document.createElement("div");
       meta.className = "skim-frame-meta";
-      meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s${frame.collision ? " | collision: true" : ""}`;
+      meta.textContent = `frame ${frame.index} | source ${frame.source_seconds}s${frame.collision ? " | collision: true" : ""}${frame.kiss_candidate ? " | kiss candidate: true" : ""}`;
 
       const actions = document.createElement("div");
       actions.className = "skim-frame-actions";
@@ -1001,6 +1023,9 @@ FILM_TEMPLATE = """
     }
     if (kissDetectorAnalyzeCollisionsButton) {
       kissDetectorAnalyzeCollisionsButton.disabled = active || latestKissDetectorFrames.length === 0;
+    }
+    if (kissDetectorMakeCandidatesButton) {
+      kissDetectorMakeCandidatesButton.disabled = active || latestKissDetectorFrames.length === 0;
     }
     if (active && kissDetectorDetails?.open) {
       stopKissDetectorPolling();
@@ -1079,10 +1104,33 @@ FILM_TEMPLATE = """
     });
   }
 
-  if (kissDetectorShowCollisionToggle) {
-    kissDetectorShowCollisionToggle.addEventListener("change", () => {
-      renderKissDetectorFrames(latestKissDetectorFrames, true);
+  if (kissDetectorMakeCandidatesButton) {
+    kissDetectorMakeCandidatesButton.addEventListener("click", async () => {
+      kissDetectorMakeCandidatesButton.disabled = true;
+      kissDetectorStatus.textContent = "Making kiss candidates...";
+      const minAreaPixels = Math.max(0, Number.parseInt(kissDetectorMinAreaInput?.value || "0", 10) || 0);
+      try {
+        const response = await fetch("{{ url_for('kiss_detector_make_candidates', film_id=film['id']) }}", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ min_area_pixels: minAreaPixels }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || `candidate analysis failed: ${response.status}`);
+        }
+        applyKissDetectorStatus(payload);
+      } catch (error) {
+        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not make kiss candidates.";
+        kissDetectorMakeCandidatesButton.disabled = false;
+      }
     });
+  }
+
+  if (kissDetectorFilterRadios.length) {
+    kissDetectorFilterRadios.forEach((radio) => radio.addEventListener("change", () => {
+      renderKissDetectorFrames(latestKissDetectorFrames, true);
+    }));
   }
 
   if (kissDetectorRemoveButton) {
@@ -1853,6 +1901,32 @@ def create_app() -> Flask:
         payload["collision_analysis_count"] = analyzed
         return jsonify(payload)
 
+    @app.post("/films/<int:film_id>/kiss-detector/make-candidates")
+    def kiss_detector_make_candidates(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+            kiss_detector_job = _load_latest_job(conn, film_id, "kiss_detector")
+        if skim is None:
+            abort(404)
+        payload_json = request.get_json(silent=True) or {}
+        raw_min_area = payload_json.get("min_area_pixels", 0)
+        try:
+            min_area_pixels = max(0.0, float(raw_min_area))
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid min_area_pixels value."}), 400
+        analyzed = _make_kiss_detector_candidates(
+            settings,
+            film["archive_identifier"],
+            min_area_pixels=min_area_pixels,
+        )
+        payload = _build_kiss_detector_payload(settings, film["archive_identifier"], skim, kiss_detector_job)
+        payload["kiss_candidate_analysis_count"] = analyzed
+        payload["kiss_candidate_min_area_pixels"] = min_area_pixels
+        return jsonify(payload)
+
     @app.post("/films/<int:film_id>/kiss-detector/remove")
     def kiss_detector_remove(film_id: int):
         with get_connection(settings.db_path) as conn:
@@ -2326,7 +2400,7 @@ def _build_kiss_detector_payload(settings, archive_identifier: str, skim: dict, 
     return payload
 
 
-def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, output_dir: Path | None = None) -> list[dict[str, str | int]]:
+def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, output_dir: Path | None = None) -> list[dict[str, str | int | bool | None]]:
     output_dir = output_dir or (settings.preview_dir / archive_identifier / "kiss-detector")
     sample_every_seconds = float(skim.get("sample_every_seconds", 4))
     frames = []
@@ -2335,12 +2409,15 @@ def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, o
         relpath = str(output_path.relative_to(settings.preview_dir))
         predictions_path = output_path.with_suffix(".json")
         collision = False
+        kiss_candidate = False
         if predictions_path.exists():
             try:
                 predictions_payload = json.loads(predictions_path.read_text())
                 collision = bool(predictions_payload.get("collision", False))
+                kiss_candidate = bool(predictions_payload.get("kiss_candidate", False))
             except json.JSONDecodeError:
                 collision = False
+                kiss_candidate = False
         frames.append(
             {
                 "index": frame_number,
@@ -2348,6 +2425,7 @@ def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, o
                 "media_url": url_for("media_file", kind="preview", relpath=relpath),
                 "predictions_url": url_for("media_file", kind="preview", relpath=str(predictions_path.relative_to(settings.preview_dir))) if predictions_path.exists() else None,
                 "collision": collision,
+                "kiss_candidate": kiss_candidate,
             }
         )
     return frames
@@ -2373,8 +2451,75 @@ def _analyze_kiss_detector_collisions(settings, archive_identifier: str) -> int:
     return analyzed
 
 
+def _make_kiss_detector_candidates(
+    settings,
+    archive_identifier: str,
+    *,
+    min_area_pixels: float,
+    max_overlap_ratio: float = 0.72,
+) -> int:
+    output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
+    analyzed = 0
+    for predictions_path in sorted(output_dir.glob("frame_*.json")):
+        try:
+            predictions_payload = json.loads(predictions_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        detections = _extract_prediction_detections(predictions_payload)
+        candidate = _frame_has_kiss_candidate(
+            detections,
+            min_area_pixels=min_area_pixels,
+            max_overlap_ratio=max_overlap_ratio,
+        )
+        predictions_payload["kiss_candidate"] = candidate
+        predictions_payload["kiss_candidate_min_area_pixels"] = min_area_pixels
+        predictions_payload["kiss_candidate_max_overlap_ratio"] = max_overlap_ratio
+        predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
+        analyzed += 1
+    return analyzed
+
+
+def _extract_prediction_detections(predictions_payload: dict) -> list[dict]:
+    predictions = predictions_payload.get("predictions")
+    if isinstance(predictions, dict):
+        detections = predictions.get("predictions", [])
+    else:
+        detections = predictions_payload.get("predictions", [])
+    return detections if isinstance(detections, list) else []
+
+
 def _frame_has_polygon_collision(detections: list[dict]) -> bool:
-    polygons = []
+    polygons = _extract_detection_polygons(detections)
+    for index, polygon_a in enumerate(polygons):
+        for polygon_b in polygons[index + 1 :]:
+            if _polygons_touch_or_overlap(polygon_a["points"], polygon_b["points"]):
+                return True
+    return False
+
+
+def _frame_has_kiss_candidate(
+    detections: list[dict],
+    *,
+    min_area_pixels: float,
+    max_overlap_ratio: float,
+) -> bool:
+    polygons = [
+        polygon
+        for polygon in _extract_detection_polygons(detections)
+        if polygon["area"] >= min_area_pixels
+    ]
+    for index, polygon_a in enumerate(polygons):
+        for polygon_b in polygons[index + 1 :]:
+            if not _polygons_touch_or_overlap(polygon_a["points"], polygon_b["points"]):
+                continue
+            overlap_ratio = _polygon_overlap_ratio(polygon_a["points"], polygon_b["points"])
+            if overlap_ratio <= max_overlap_ratio:
+                return True
+    return False
+
+
+def _extract_detection_polygons(detections: list[dict]) -> list[dict[str, object]]:
+    polygons: list[dict[str, object]] = []
     for detection in detections:
         points = detection.get("points")
         if not isinstance(points, list):
@@ -2387,13 +2532,15 @@ def _frame_has_polygon_collision(detections: list[dict]) -> bool:
             y = point.get("y")
             if isinstance(x, (int, float)) and isinstance(y, (int, float)):
                 polygon.append((float(x), float(y)))
-        if len(polygon) >= 3:
-            polygons.append(polygon)
-    for index, polygon_a in enumerate(polygons):
-        for polygon_b in polygons[index + 1 :]:
-            if _polygons_touch_or_overlap(polygon_a, polygon_b):
-                return True
-    return False
+        if len(polygon) < 3:
+            continue
+        polygons.append(
+            {
+                "points": polygon,
+                "area": _polygon_area(polygon),
+            }
+        )
+    return polygons
 
 
 def _polygons_touch_or_overlap(polygon_a: list[tuple[float, float]], polygon_b: list[tuple[float, float]]) -> bool:
@@ -2408,6 +2555,49 @@ def _polygons_touch_or_overlap(polygon_a: list[tuple[float, float]], polygon_b: 
     if _point_in_polygon_or_boundary(polygon_b[0], polygon_a):
         return True
     return False
+
+
+def _polygon_overlap_ratio(polygon_a: list[tuple[float, float]], polygon_b: list[tuple[float, float]]) -> float:
+    area_a = _polygon_area(polygon_a)
+    area_b = _polygon_area(polygon_b)
+    if area_a <= 0 or area_b <= 0:
+        return 0.0
+    overlap_area = _polygon_overlap_area_estimate(polygon_a, polygon_b)
+    return overlap_area / min(area_a, area_b)
+
+
+def _polygon_overlap_area_estimate(
+    polygon_a: list[tuple[float, float]],
+    polygon_b: list[tuple[float, float]],
+) -> float:
+    min_x_a, min_y_a, max_x_a, max_y_a = _polygon_bounds(polygon_a)
+    min_x_b, min_y_b, max_x_b, max_y_b = _polygon_bounds(polygon_b)
+    min_x = math.floor(max(min_x_a, min_x_b))
+    min_y = math.floor(max(min_y_a, min_y_b))
+    max_x = math.ceil(min(max_x_a, max_x_b))
+    max_y = math.ceil(min(max_y_a, max_y_b))
+    if min_x >= max_x or min_y >= max_y:
+        return 0.0
+    overlap_area = 0.0
+    for x in range(min_x, max_x):
+        for y in range(min_y, max_y):
+            sample_point = (x + 0.5, y + 0.5)
+            if _point_in_polygon_or_boundary(sample_point, polygon_a) and _point_in_polygon_or_boundary(sample_point, polygon_b):
+                overlap_area += 1.0
+    return overlap_area
+
+
+def _polygon_bounds(polygon: list[tuple[float, float]]) -> tuple[float, float, float, float]:
+    xs = [point[0] for point in polygon]
+    ys = [point[1] for point in polygon]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _polygon_area(polygon: list[tuple[float, float]]) -> float:
+    area = 0.0
+    for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1]):
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
 
 
 def _segments_touch_or_intersect(
