@@ -2649,7 +2649,9 @@ def _cluster_kiss_detector_detections(
         predictions_payload["kiss_cluster_representative_ids"] = cluster_meta["representative_ids"]
         predictions_payload["kiss_cluster_groups"] = cluster_meta["groups"]
         predictions_payload["kiss_cluster_irregular_ids"] = cluster_meta["irregular_ids"]
-        _write_cluster_overlay(output_dir, predictions_path, clusters, cluster_meta["irregular_polygons"])
+        source_image_path = predictions_path.with_suffix(".png")
+        if source_image_path.exists():
+            _write_cluster_overlay(output_dir, predictions_path, clusters, cluster_meta["irregular_polygons"])
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
     return analyzed

@@ -690,6 +690,83 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
     )
 
 
+def test_kiss_detector_cluster_handles_json_without_png(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "frame_000001.json").write_text(
+        json.dumps(
+            {
+                "image": {"height": 160, "width": 160},
+                "predictions": [
+                    {
+                        "class": "head",
+                        "detection_id": "shape-a",
+                        "confidence": 0.9,
+                        "width": 40,
+                        "height": 40,
+                        "x": 40,
+                        "y": 40,
+                        "points": [{"x": 20, "y": 20}, {"x": 60, "y": 20}, {"x": 60, "y": 60}, {"x": 20, "y": 60}],
+                    },
+                    {
+                        "class": "head",
+                        "detection_id": "shape-b",
+                        "confidence": 0.8,
+                        "width": 40,
+                        "height": 40,
+                        "x": 76,
+                        "y": 42,
+                        "points": [{"x": 56, "y": 22}, {"x": 96, "y": 22}, {"x": 96, "y": 62}, {"x": 56, "y": 62}],
+                    },
+                ],
+            }
+        )
+    )
+    overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
+    overview_dir.mkdir(parents=True, exist_ok=True)
+    (overview_dir / "frame_000001.jpg").write_bytes(b"fake-jpeg")
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/films/1/kiss-detector/cluster", json={"min_size_pixels": 8})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["kiss_cluster_analysis_count"] == 1
+    frame_payload = json.loads((output_dir / "frame_000001.json").read_text())
+    assert frame_payload["kiss_cluster_count"] == 2
+
+
 def test_kiss_detector_analyze_can_disable_workflow_cache(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)
