@@ -981,14 +981,22 @@ FILM_TEMPLATE = """
       const actions = document.createElement("div");
       actions.className = "skim-frame-actions";
 
-      const downloadLink = document.createElement("a");
-      downloadLink.href = frame.media_url;
-      downloadLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.png`;
-      downloadLink.textContent = "download";
+      const pngLink = document.createElement("a");
+      pngLink.href = frame.media_url;
+      pngLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.png`;
+      pngLink.textContent = "get png";
+
+      const jsonLink = document.createElement("a");
+      jsonLink.href = frame.predictions_url;
+      jsonLink.download = `kiss-detector-${String(frame.index).padStart(6, "0")}.json`;
+      jsonLink.textContent = "get json";
 
       card.appendChild(image);
       card.appendChild(meta);
-      actions.appendChild(downloadLink);
+      actions.appendChild(pngLink);
+      if (frame.predictions_url) {
+        actions.appendChild(jsonLink);
+      }
       card.appendChild(actions);
       kissDetectorGrid.appendChild(card);
     });
