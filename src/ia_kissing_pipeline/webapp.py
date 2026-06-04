@@ -989,8 +989,9 @@ FILM_TEMPLATE = """
     kissDetectorStatus.textContent = `${counts} | ${statusText}`;
     const active = payload.status === "queued" || payload.status === "running";
     if (kissDetectorAnalyzeButton) {
-      kissDetectorAnalyzeButton.disabled = active;
-      kissDetectorAnalyzeButton.textContent = active ? "Analyzing..." : "Analyze Frames";
+      kissDetectorAnalyzeButton.disabled = false;
+      kissDetectorAnalyzeButton.dataset.mode = active ? "stop" : "start";
+      kissDetectorAnalyzeButton.textContent = active ? "Stop Analyzing" : "Analyze Frames";
     }
     if (kissDetectorRemoveButton) {
       kissDetectorRemoveButton.disabled = false;
@@ -1032,17 +1033,23 @@ FILM_TEMPLATE = """
 
   if (kissDetectorAnalyzeButton) {
     kissDetectorAnalyzeButton.addEventListener("click", async () => {
-      kissDetectorAnalyzeButton.disabled = true;
-      kissDetectorStatus.textContent = "Queueing kiss detector job...";
       try {
-        const response = await fetch("{{ url_for('kiss_detector_analyze', film_id=film['id']) }}", { method: "POST" });
+        const isActive = kissDetectorAnalyzeButton.dataset.mode === "stop";
+        kissDetectorAnalyzeButton.disabled = true;
+        kissDetectorStatus.textContent = isActive ? "Stopping kiss detector job..." : "Queueing kiss detector job...";
+        const response = await fetch(
+          isActive
+            ? "{{ url_for('kiss_detector_stop', film_id=film['id']) }}"
+            : "{{ url_for('kiss_detector_analyze', film_id=film['id']) }}",
+          { method: "POST" },
+        );
         const payload = await response.json();
         if (!response.ok) {
           throw new Error(payload.error || `kiss detector request failed: ${response.status}`);
         }
         applyKissDetectorStatus(payload);
       } catch (error) {
-        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not start kiss detector.";
+        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not update kiss detector job.";
         kissDetectorAnalyzeButton.disabled = false;
       }
     });
@@ -1785,6 +1792,20 @@ def create_app() -> Flask:
         payload = _build_kiss_detector_payload(settings, film["archive_identifier"], skim, job)
         payload["job_id"] = job_id
         return jsonify(payload)
+
+    @app.post("/films/<int:film_id>/kiss-detector/stop")
+    def kiss_detector_stop(film_id: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            skim = _load_latest_skim(conn, settings.preview_dir, film_id)
+        if skim is None:
+            abort(404)
+        _stop_kiss_detector_job(settings, film_id)
+        with get_connection(settings.db_path) as conn:
+            job = _load_latest_job(conn, film_id, "kiss_detector")
+        return jsonify(_build_kiss_detector_payload(settings, film["archive_identifier"], skim, job))
 
     @app.post("/films/<int:film_id>/kiss-detector/remove")
     def kiss_detector_remove(film_id: int):
@@ -2804,6 +2825,20 @@ def _remove_kiss_detector_outputs(settings, film_id: int, archive_identifier: st
     for path in output_dir.glob("frame_*.*"):
         if path.suffix.lower() in {".png", ".skip"}:
             path.unlink()
+
+
+def _stop_kiss_detector_job(settings, film_id: int) -> None:
+    _terminate_film_workers(film_id)
+    now = utc_now_iso()
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'error', error_text = 'kiss detector interrupted by user', updated_at = ?
+            WHERE film_id = ? AND job_type = 'kiss_detector' AND status IN ('queued', 'running')
+            """,
+            (now, film_id),
+        )
 
 
 def _queue_build_skim(settings, film_id: int, sample_every_seconds: float = 4, output_fps: int = 12, max_height: int = 360) -> int:

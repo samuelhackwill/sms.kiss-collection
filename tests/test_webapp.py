@@ -422,6 +422,67 @@ def test_kiss_detector_analyze_route_queues_background_job(tmp_path: Path, monke
     assert job["status"] == "queued"
 
 
+def test_kiss_detector_stop_route_interrupts_active_job(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    terminated = {}
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._terminate_film_workers",
+        lambda film_id: terminated.setdefault("film_id", film_id),
+    )
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_dir = settings.preview_dir / "kiss_in_spring_1932"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_path = preview_dir / "skim-preview.mp4"
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'kiss_detector', 'running', '{}', ?, '2026-04-01T00:00:01Z', '2026-04-01T00:00:01Z')
+            """,
+            ('{"phase":"detecting_frames","progress":0.5}',),
+        )
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/films/1/kiss-detector/stop")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "error"
+    assert payload["error"] == "kiss detector interrupted by user"
+    assert terminated["film_id"] == 1
+    with get_connection(settings.db_path) as conn:
+        job = conn.execute(
+            "SELECT status, error_text FROM analysis_jobs WHERE film_id = 1 AND job_type = 'kiss_detector' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert job["status"] == "error"
+    assert job["error_text"] == "kiss detector interrupted by user"
+
+
 def test_random_clips_api_returns_json_payload(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)
