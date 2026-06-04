@@ -2474,7 +2474,7 @@ def _make_kiss_detector_candidates(
         except json.JSONDecodeError:
             continue
         detections = _extract_prediction_detections(predictions_payload)
-        candidate = _frame_has_kiss_candidate(
+        candidate, candidate_meta = _analyze_kiss_candidate_frame(
             detections,
             min_size_pixels=min_size_pixels,
             max_overlap_ratio=max_overlap_ratio,
@@ -2482,6 +2482,8 @@ def _make_kiss_detector_candidates(
         predictions_payload["kiss_candidate"] = candidate
         predictions_payload["kiss_candidate_min_size_pixels"] = min_size_pixels
         predictions_payload["kiss_candidate_max_overlap_ratio"] = max_overlap_ratio
+        predictions_payload["kiss_candidate_cluster_count"] = candidate_meta["cluster_count"]
+        predictions_payload["kiss_candidate_representative_ids"] = candidate_meta["representative_ids"]
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
     return analyzed
@@ -2511,19 +2513,103 @@ def _frame_has_kiss_candidate(
     min_size_pixels: float,
     max_overlap_ratio: float,
 ) -> bool:
+    return _analyze_kiss_candidate_frame(
+        detections,
+        min_size_pixels=min_size_pixels,
+        max_overlap_ratio=max_overlap_ratio,
+    )[0]
+
+
+def _analyze_kiss_candidate_frame(
+    detections: list[dict],
+    *,
+    min_size_pixels: float,
+    max_overlap_ratio: float,
+) -> tuple[bool, dict[str, object]]:
     polygons = [
         polygon
         for polygon in _extract_detection_polygons(detections)
         if polygon["size_pixels"] >= min_size_pixels
     ]
-    for index, polygon_a in enumerate(polygons):
-        for polygon_b in polygons[index + 1 :]:
-            if not _polygons_touch_or_overlap(polygon_a["points"], polygon_b["points"]):
-                continue
-            overlap_ratio = _polygon_overlap_ratio(polygon_a["points"], polygon_b["points"])
-            if overlap_ratio <= max_overlap_ratio:
-                return True
-    return False
+    representative_polygons = _cluster_duplicate_detections(
+        polygons,
+        duplicate_overlap_ratio=max_overlap_ratio,
+    )
+    for index, polygon_a in enumerate(representative_polygons):
+        for polygon_b in representative_polygons[index + 1 :]:
+            if _polygons_touch_or_overlap(polygon_a["points"], polygon_b["points"]):
+                return True, {
+                    "cluster_count": len(representative_polygons),
+                    "representative_ids": [polygon.get("detection_id") for polygon in representative_polygons if polygon.get("detection_id")],
+                }
+    return False, {
+        "cluster_count": len(representative_polygons),
+        "representative_ids": [polygon.get("detection_id") for polygon in representative_polygons if polygon.get("detection_id")],
+    }
+
+
+def _cluster_duplicate_detections(
+    polygons: list[dict[str, object]],
+    *,
+    duplicate_overlap_ratio: float,
+    center_distance_ratio: float = 0.35,
+) -> list[dict[str, object]]:
+    if len(polygons) < 2:
+        return polygons
+    cluster_indices: list[set[int]] = []
+    assigned = [False] * len(polygons)
+    for index, polygon in enumerate(polygons):
+        if assigned[index]:
+            continue
+        cluster = {index}
+        queue = [index]
+        assigned[index] = True
+        while queue:
+            current_index = queue.pop()
+            current = polygons[current_index]
+            for candidate_index, candidate in enumerate(polygons):
+                if candidate_index in cluster:
+                    continue
+                if not _detections_are_duplicates(
+                    current,
+                    candidate,
+                    duplicate_overlap_ratio=duplicate_overlap_ratio,
+                    center_distance_ratio=center_distance_ratio,
+                ):
+                    continue
+                cluster.add(candidate_index)
+                if not assigned[candidate_index]:
+                    assigned[candidate_index] = True
+                    queue.append(candidate_index)
+        cluster_indices.append(cluster)
+    return [_select_cluster_representative(polygons, cluster) for cluster in cluster_indices]
+
+
+def _detections_are_duplicates(
+    polygon_a: dict[str, object],
+    polygon_b: dict[str, object],
+    *,
+    duplicate_overlap_ratio: float,
+    center_distance_ratio: float,
+) -> bool:
+    overlap_ratio = _polygon_overlap_ratio(polygon_a["points"], polygon_b["points"])
+    if overlap_ratio < duplicate_overlap_ratio:
+        return False
+    center_a = polygon_a["center"]
+    center_b = polygon_b["center"]
+    distance = math.dist(center_a, center_b)
+    size_limit = min(float(polygon_a["size_pixels"]), float(polygon_b["size_pixels"])) * center_distance_ratio
+    return distance <= size_limit
+
+
+def _select_cluster_representative(polygons: list[dict[str, object]], cluster: set[int]) -> dict[str, object]:
+    return max(
+        (polygons[index] for index in cluster),
+        key=lambda polygon: (
+            float(polygon.get("confidence") or 0.0),
+            float(polygon.get("area") or 0.0),
+        ),
+    )
 
 
 def _extract_detection_polygons(detections: list[dict]) -> list[dict[str, object]]:
@@ -2547,6 +2633,10 @@ def _extract_detection_polygons(detections: list[dict]) -> list[dict[str, object
                 "points": polygon,
                 "area": _polygon_area(polygon),
                 "size_pixels": _detection_size_pixels(detection, polygon),
+                "confidence": float(detection.get("confidence") or 0.0),
+                "class_name": detection.get("class"),
+                "detection_id": detection.get("detection_id"),
+                "center": _detection_center(detection, polygon),
             }
         )
     return polygons
@@ -2558,6 +2648,15 @@ def _detection_size_pixels(detection: dict, polygon: list[tuple[float, float]]) 
     if isinstance(width, (int, float)) and isinstance(height, (int, float)):
         return max(0.0, min(float(width), float(height)))
     return math.sqrt(max(0.0, _polygon_area(polygon)))
+
+
+def _detection_center(detection: dict, polygon: list[tuple[float, float]]) -> tuple[float, float]:
+    x = detection.get("x")
+    y = detection.get("y")
+    if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+        return float(x), float(y)
+    min_x, min_y, max_x, max_y = _polygon_bounds(polygon)
+    return ((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
 
 
 def _polygons_touch_or_overlap(polygon_a: list[tuple[float, float]], polygon_b: list[tuple[float, float]]) -> bool:

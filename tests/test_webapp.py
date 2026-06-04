@@ -432,7 +432,7 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
 
     output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
     output_dir.mkdir(parents=True, exist_ok=True)
-    for index in range(1, 4):
+    for index in range(1, 5):
         (output_dir / f"frame_{index:06d}.png").write_bytes(b"fake")
     (output_dir / "frame_000001.json").write_text(
         json.dumps(
@@ -497,9 +497,48 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
             }
         )
     )
+    (output_dir / "frame_000004.json").write_text(
+        json.dumps(
+            {
+                "image": {"height": 160, "width": 160},
+                "predictions": [
+                    {
+                        "class": "head",
+                        "detection_id": "left-large-a",
+                        "confidence": 0.6,
+                        "width": 40,
+                        "height": 40,
+                        "x": 40,
+                        "y": 40,
+                        "points": [{"x": 20, "y": 20}, {"x": 60, "y": 20}, {"x": 60, "y": 60}, {"x": 20, "y": 60}],
+                    },
+                    {
+                        "class": "head",
+                        "detection_id": "left-large-b",
+                        "confidence": 0.9,
+                        "width": 38,
+                        "height": 38,
+                        "x": 42,
+                        "y": 42,
+                        "points": [{"x": 24, "y": 24}, {"x": 62, "y": 24}, {"x": 62, "y": 62}, {"x": 24, "y": 62}],
+                    },
+                    {
+                        "class": "head",
+                        "detection_id": "right-head",
+                        "confidence": 0.8,
+                        "width": 40,
+                        "height": 40,
+                        "x": 76,
+                        "y": 42,
+                        "points": [{"x": 56, "y": 22}, {"x": 96, "y": 22}, {"x": 96, "y": 62}, {"x": 56, "y": 62}],
+                    },
+                ],
+            }
+        )
+    )
     overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
     overview_dir.mkdir(parents=True, exist_ok=True)
-    for index in range(1, 4):
+    for index in range(1, 5):
         (overview_dir / f"frame_{index:06d}.jpg").write_bytes(b"fake-jpeg")
 
     app = create_app()
@@ -508,17 +547,21 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
 
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload["kiss_candidate_analysis_count"] == 3
+    assert payload["kiss_candidate_analysis_count"] == 4
     assert payload["kiss_candidate_min_size_pixels"] == 8
-    assert [frame["kiss_candidate"] for frame in payload["frames"]] == [True, False, False]
+    assert [frame["kiss_candidate"] for frame in payload["frames"]] == [True, False, False, True]
 
     first_payload = json.loads((output_dir / "frame_000001.json").read_text())
     second_payload = json.loads((output_dir / "frame_000002.json").read_text())
     third_payload = json.loads((output_dir / "frame_000003.json").read_text())
+    fourth_payload = json.loads((output_dir / "frame_000004.json").read_text())
     assert first_payload["kiss_candidate"] is True
     assert second_payload["kiss_candidate"] is False
     assert third_payload["kiss_candidate"] is False
+    assert fourth_payload["kiss_candidate"] is True
     assert first_payload["kiss_candidate_min_size_pixels"] == 8
+    assert fourth_payload["kiss_candidate_cluster_count"] == 2
+    assert fourth_payload["kiss_candidate_representative_ids"] == ["left-large-b", "right-head"]
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
