@@ -2518,23 +2518,15 @@ def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, o
         predictions_path = output_path.with_suffix(".json")
         collision = False
         kiss_candidate = False
-        cluster_overlay_relpath = None
         if predictions_path.exists():
             try:
                 predictions_payload = json.loads(predictions_path.read_text())
                 collision = bool(predictions_payload.get("collision", False))
                 kiss_candidate = bool(predictions_payload.get("kiss_candidate", False))
-                cluster_overlay_relpath = predictions_payload.get("kiss_cluster_overlay_relpath")
             except json.JSONDecodeError:
                 collision = False
                 kiss_candidate = False
-                cluster_overlay_relpath = None
-        media_path = output_path
-        if isinstance(cluster_overlay_relpath, str):
-            candidate_overlay_path = settings.preview_dir / cluster_overlay_relpath
-            if candidate_overlay_path.exists():
-                media_path = candidate_overlay_path
-        relpath = str(media_path.relative_to(settings.preview_dir))
+        relpath = str(output_path.relative_to(settings.preview_dir))
         frames.append(
             {
                 "index": frame_number,
@@ -2657,8 +2649,7 @@ def _cluster_kiss_detector_detections(
         predictions_payload["kiss_cluster_representative_ids"] = cluster_meta["representative_ids"]
         predictions_payload["kiss_cluster_groups"] = cluster_meta["groups"]
         predictions_payload["kiss_cluster_irregular_ids"] = cluster_meta["irregular_ids"]
-        overlay_path = _write_cluster_overlay(output_dir, predictions_path, clusters, cluster_meta["irregular_polygons"])
-        predictions_payload["kiss_cluster_overlay_relpath"] = str(overlay_path.relative_to(settings.preview_dir))
+        _write_cluster_overlay(output_dir, predictions_path, clusters, cluster_meta["irregular_polygons"])
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
     return analyzed
@@ -2806,11 +2797,8 @@ def _write_cluster_overlay(
     predictions_path: Path,
     representative_polygons: list[dict[str, object]],
     irregular_polygons: list[dict[str, object]],
-) -> Path:
+) -> None:
     source_image_path = predictions_path.with_suffix(".png")
-    overlay_dir = output_dir / "cluster-overlays"
-    overlay_dir.mkdir(parents=True, exist_ok=True)
-    overlay_path = overlay_dir / source_image_path.name
     image = Image.open(source_image_path).convert("RGBA")
     draw = ImageDraw.Draw(image)
     palette = [
@@ -2833,8 +2821,7 @@ def _write_cluster_overlay(
         draw.line(representative["points"] + [representative["points"][0]], fill=color, width=3)
         center_x, center_y = representative["center"]
         draw.text((center_x + 3, center_y + 3), f"c{index + 1}", fill=color)
-    image.save(overlay_path)
-    return overlay_path
+    image.save(source_image_path)
 
 
 def _ordered_cluster_member_ids(representative_polygon: dict[str, object]) -> list[str]:

@@ -674,16 +674,14 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
     assert payload["kiss_cluster_analysis_count"] == 1
     assert payload["kiss_cluster_min_size_pixels"] == 8
     assert len(payload["frames"]) == 1
-    assert "/cluster-overlays/" in payload["frames"][0]["media_url"]
+    assert payload["frames"][0]["media_url"].startswith("/media/preview/")
 
     frame_payload = json.loads((output_dir / "frame_000001.json").read_text())
     assert frame_payload["kiss_cluster_count"] == 2
     assert frame_payload["kiss_cluster_representative_ids"] == ["left-large-b", "right-head"]
     assert frame_payload["kiss_cluster_groups"] == [["left-large-b", "left-large-a"], ["right-head"]]
     assert frame_payload["kiss_cluster_irregular_ids"] == ["bad-strip"]
-    overlay_path = settings.preview_dir / frame_payload["kiss_cluster_overlay_relpath"]
-    assert overlay_path.exists()
-    overlay = Image.open(overlay_path).convert("RGBA")
+    overlay = Image.open(output_dir / "frame_000001.png").convert("RGBA")
     overlay_pixels = overlay.load()
     assert any(
         overlay_pixels[x, y][0] > 200 and overlay_pixels[x, y][1] < 80 and overlay_pixels[x, y][2] < 80
