@@ -280,7 +280,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert b"Analyze Frames" in detail_response.data
     assert b"Analyze Collisions" in detail_response.data
     assert b"Make Kiss Candidates" in detail_response.data
-    assert b"Min area px" in detail_response.data
+    assert b"Min size px" in detail_response.data
     assert b"Collisions" in detail_response.data
     assert b"Kiss Candidates" in detail_response.data
     assert b"Remove Frames" in detail_response.data
@@ -441,10 +441,14 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
                 "predictions": [
                     {
                         "class": "head",
+                        "width": 10,
+                        "height": 10,
                         "points": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}, {"x": 0, "y": 10}],
                     },
                     {
                         "class": "mouth",
+                        "width": 10,
+                        "height": 10,
                         "points": [{"x": 8, "y": 2}, {"x": 18, "y": 2}, {"x": 18, "y": 12}, {"x": 8, "y": 12}],
                     },
                 ],
@@ -458,10 +462,14 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
                 "predictions": [
                     {
                         "class": "head",
+                        "width": 10,
+                        "height": 10,
                         "points": [{"x": 0, "y": 0}, {"x": 10, "y": 0}, {"x": 10, "y": 10}, {"x": 0, "y": 10}],
                     },
                     {
                         "class": "hat",
+                        "width": 8,
+                        "height": 8,
                         "points": [{"x": 1, "y": 1}, {"x": 9, "y": 1}, {"x": 9, "y": 9}, {"x": 1, "y": 9}],
                     },
                 ],
@@ -475,10 +483,14 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
                 "predictions": [
                     {
                         "class": "head",
+                        "width": 6,
+                        "height": 6,
                         "points": [{"x": 0, "y": 0}, {"x": 6, "y": 0}, {"x": 6, "y": 6}, {"x": 0, "y": 6}],
                     },
                     {
                         "class": "mouth",
+                        "width": 6,
+                        "height": 6,
                         "points": [{"x": 5, "y": 1}, {"x": 11, "y": 1}, {"x": 11, "y": 7}, {"x": 5, "y": 7}],
                     },
                 ],
@@ -492,12 +504,12 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
 
     app = create_app()
     client = app.test_client()
-    response = client.post("/films/1/kiss-detector/make-candidates", json={"min_area_pixels": 60})
+    response = client.post("/films/1/kiss-detector/make-candidates", json={"min_size_pixels": 8})
 
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["kiss_candidate_analysis_count"] == 3
-    assert payload["kiss_candidate_min_area_pixels"] == 60
+    assert payload["kiss_candidate_min_size_pixels"] == 8
     assert [frame["kiss_candidate"] for frame in payload["frames"]] == [True, False, False]
 
     first_payload = json.loads((output_dir / "frame_000001.json").read_text())
@@ -506,7 +518,7 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
     assert first_payload["kiss_candidate"] is True
     assert second_payload["kiss_candidate"] is False
     assert third_payload["kiss_candidate"] is False
-    assert first_payload["kiss_candidate_min_area_pixels"] == 60
+    assert first_payload["kiss_candidate_min_size_pixels"] == 8
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:

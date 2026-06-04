@@ -567,8 +567,8 @@ FILM_TEMPLATE = """
               <button type="button" id="kiss-detector-make-candidates" class="ghost">Make Kiss Candidates</button>
               <button type="button" id="kiss-detector-remove" class="ghost">Remove Frames</button>
               <label class="small" style="display:inline-flex; gap:8px; align-items:center;">
-                Min area px
-                <input type="number" id="kiss-detector-min-area" min="0" step="1" value="1500" style="width:90px;">
+                Min size px
+                <input type="number" id="kiss-detector-min-size" min="0" step="1" value="40" style="width:90px;">
               </label>
               <div class="small" style="display:inline-flex; gap:12px; align-items:center;">
                 <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="all" checked> All</label>
@@ -751,7 +751,7 @@ FILM_TEMPLATE = """
   const kissDetectorAnalyzeCollisionsButton = document.getElementById("kiss-detector-analyze-collisions");
   const kissDetectorMakeCandidatesButton = document.getElementById("kiss-detector-make-candidates");
   const kissDetectorRemoveButton = document.getElementById("kiss-detector-remove");
-  const kissDetectorMinAreaInput = document.getElementById("kiss-detector-min-area");
+  const kissDetectorMinSizeInput = document.getElementById("kiss-detector-min-size");
   const kissDetectorFilterRadios = Array.from(document.querySelectorAll('input[name="kiss-detector-filter"]'));
   const kissDetectorDownloadAll = document.getElementById("kiss-detector-download-all");
   const previewInput = document.getElementById("preview-seconds");
@@ -1113,15 +1113,15 @@ FILM_TEMPLATE = """
   }
 
   if (kissDetectorMakeCandidatesButton) {
-    kissDetectorMakeCandidatesButton.addEventListener("click", async () => {
+      kissDetectorMakeCandidatesButton.addEventListener("click", async () => {
       kissDetectorMakeCandidatesButton.disabled = true;
       kissDetectorStatus.textContent = "Making kiss candidates...";
-      const minAreaPixels = Math.max(0, Number.parseInt(kissDetectorMinAreaInput?.value || "0", 10) || 0);
+      const minSizePixels = Math.max(0, Number.parseInt(kissDetectorMinSizeInput?.value || "0", 10) || 0);
       try {
         const response = await fetch("{{ url_for('kiss_detector_make_candidates', film_id=film['id']) }}", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ min_area_pixels: minAreaPixels }),
+          body: JSON.stringify({ min_size_pixels: minSizePixels }),
         });
         const payload = await response.json();
         if (!response.ok) {
@@ -1920,19 +1920,19 @@ def create_app() -> Flask:
         if skim is None:
             abort(404)
         payload_json = request.get_json(silent=True) or {}
-        raw_min_area = payload_json.get("min_area_pixels", 0)
+        raw_min_size = payload_json.get("min_size_pixels", payload_json.get("min_area_pixels", 0))
         try:
-            min_area_pixels = max(0.0, float(raw_min_area))
+            min_size_pixels = max(0.0, float(raw_min_size))
         except (TypeError, ValueError):
-            return jsonify({"error": "Invalid min_area_pixels value."}), 400
+            return jsonify({"error": "Invalid min_size_pixels value."}), 400
         analyzed = _make_kiss_detector_candidates(
             settings,
             film["archive_identifier"],
-            min_area_pixels=min_area_pixels,
+            min_size_pixels=min_size_pixels,
         )
         payload = _build_kiss_detector_payload(settings, film["archive_identifier"], skim, kiss_detector_job)
         payload["kiss_candidate_analysis_count"] = analyzed
-        payload["kiss_candidate_min_area_pixels"] = min_area_pixels
+        payload["kiss_candidate_min_size_pixels"] = min_size_pixels
         return jsonify(payload)
 
     @app.post("/films/<int:film_id>/kiss-detector/remove")
@@ -2463,7 +2463,7 @@ def _make_kiss_detector_candidates(
     settings,
     archive_identifier: str,
     *,
-    min_area_pixels: float,
+    min_size_pixels: float,
     max_overlap_ratio: float = 0.72,
 ) -> int:
     output_dir = settings.preview_dir / archive_identifier / "kiss-detector"
@@ -2476,11 +2476,11 @@ def _make_kiss_detector_candidates(
         detections = _extract_prediction_detections(predictions_payload)
         candidate = _frame_has_kiss_candidate(
             detections,
-            min_area_pixels=min_area_pixels,
+            min_size_pixels=min_size_pixels,
             max_overlap_ratio=max_overlap_ratio,
         )
         predictions_payload["kiss_candidate"] = candidate
-        predictions_payload["kiss_candidate_min_area_pixels"] = min_area_pixels
+        predictions_payload["kiss_candidate_min_size_pixels"] = min_size_pixels
         predictions_payload["kiss_candidate_max_overlap_ratio"] = max_overlap_ratio
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
@@ -2508,13 +2508,13 @@ def _frame_has_polygon_collision(detections: list[dict]) -> bool:
 def _frame_has_kiss_candidate(
     detections: list[dict],
     *,
-    min_area_pixels: float,
+    min_size_pixels: float,
     max_overlap_ratio: float,
 ) -> bool:
     polygons = [
         polygon
         for polygon in _extract_detection_polygons(detections)
-        if polygon["area"] >= min_area_pixels
+        if polygon["size_pixels"] >= min_size_pixels
     ]
     for index, polygon_a in enumerate(polygons):
         for polygon_b in polygons[index + 1 :]:
@@ -2546,9 +2546,18 @@ def _extract_detection_polygons(detections: list[dict]) -> list[dict[str, object
             {
                 "points": polygon,
                 "area": _polygon_area(polygon),
+                "size_pixels": _detection_size_pixels(detection, polygon),
             }
         )
     return polygons
+
+
+def _detection_size_pixels(detection: dict, polygon: list[tuple[float, float]]) -> float:
+    width = detection.get("width")
+    height = detection.get("height")
+    if isinstance(width, (int, float)) and isinstance(height, (int, float)):
+        return max(0.0, min(float(width), float(height)))
+    return math.sqrt(max(0.0, _polygon_area(polygon)))
 
 
 def _polygons_touch_or_overlap(polygon_a: list[tuple[float, float]], polygon_b: list[tuple[float, float]]) -> bool:
