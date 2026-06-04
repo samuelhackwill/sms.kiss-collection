@@ -571,6 +571,10 @@ FILM_TEMPLATE = """
                 Min size px
                 <input type="number" id="kiss-detector-min-size" min="0" step="1" value="40" style="width:90px;">
               </label>
+              <label class="small" style="display:inline-flex; gap:8px; align-items:center;">
+                <input type="checkbox" id="kiss-detector-workflow-cache" checked>
+                Workflow Cache
+              </label>
               <div class="small" style="display:inline-flex; gap:12px; align-items:center;">
                 <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="all" checked> All</label>
                 <label style="display:inline-flex; gap:6px; align-items:center;"><input type="radio" name="kiss-detector-filter" value="collision"> Collisions</label>
@@ -754,6 +758,7 @@ FILM_TEMPLATE = """
   const kissDetectorMakeCandidatesButton = document.getElementById("kiss-detector-make-candidates");
   const kissDetectorRemoveButton = document.getElementById("kiss-detector-remove");
   const kissDetectorMinSizeInput = document.getElementById("kiss-detector-min-size");
+  const kissDetectorWorkflowCacheToggle = document.getElementById("kiss-detector-workflow-cache");
   const kissDetectorFilterRadios = Array.from(document.querySelectorAll('input[name="kiss-detector-filter"]'));
   const kissDetectorDownloadAll = document.getElementById("kiss-detector-download-all");
   const previewInput = document.getElementById("preview-seconds");
@@ -772,6 +777,7 @@ FILM_TEMPLATE = """
   let latestKissDetectorFrames = [];
   let kissDetectorPollingTimer = null;
   let kissDetectorRequestInFlight = false;
+  const workflowCacheStorageKey = "ia-kissing-roboflow-workflow-cache";
   let scrubFrameRequested = false;
   let pendingSeekTime = null;
   let seekInFlight = false;
@@ -950,6 +956,16 @@ FILM_TEMPLATE = """
     kissDetectorDownloadAll.setAttribute("aria-disabled", hasFrames ? "false" : "true");
   };
 
+  if (kissDetectorWorkflowCacheToggle) {
+    const storedWorkflowCache = window.localStorage.getItem(workflowCacheStorageKey);
+    if (storedWorkflowCache !== null) {
+      kissDetectorWorkflowCacheToggle.checked = storedWorkflowCache === "1";
+    }
+    kissDetectorWorkflowCacheToggle.addEventListener("change", () => {
+      window.localStorage.setItem(workflowCacheStorageKey, kissDetectorWorkflowCacheToggle.checked ? "1" : "0");
+    });
+  }
+
   const getKissDetectorFilter = () => {
     const selected = kissDetectorFilterRadios.find((radio) => radio.checked);
     return selected ? selected.value : "all";
@@ -1085,7 +1101,13 @@ FILM_TEMPLATE = """
           isActive
             ? "{{ url_for('kiss_detector_stop', film_id=film['id']) }}"
             : "{{ url_for('kiss_detector_analyze', film_id=film['id']) }}",
-          { method: "POST" },
+          isActive
+            ? { method: "POST" }
+            : {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ use_workflow_cache: Boolean(kissDetectorWorkflowCacheToggle?.checked) }),
+              },
         );
         const payload = await response.json();
         if (!response.ok) {
@@ -1894,8 +1916,13 @@ def create_app() -> Flask:
 
     @app.post("/films/<int:film_id>/kiss-detector/analyze")
     def kiss_detector_analyze(film_id: int):
+        payload_json = request.get_json(silent=True) or {}
         try:
-            job_id = _queue_kiss_detector(settings, film_id)
+            job_id = _queue_kiss_detector(
+                settings,
+                film_id,
+                use_workflow_cache=bool(payload_json.get("use_workflow_cache", True)),
+            )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
         with get_connection(settings.db_path) as conn:
@@ -2390,7 +2417,13 @@ def _ensure_skim_overview_paths(settings, archive_identifier: str, skim: dict) -
     return build_skim_overview_frames(Path(skim["path"]), overview_dir)
 
 
-def _process_kiss_detector_batch(settings, archive_identifier: str, skim: dict) -> dict[str, object]:
+def _process_kiss_detector_batch(
+    settings,
+    archive_identifier: str,
+    skim: dict,
+    *,
+    use_workflow_cache: bool = True,
+) -> dict[str, object]:
     if not settings.roboflow_api_key:
         raise ValueError("Missing ROBOFLOW_API_KEY in your environment.")
     if not settings.roboflow_workspace_name or not settings.roboflow_workflow_id:
@@ -2409,7 +2442,11 @@ def _process_kiss_detector_batch(settings, archive_identifier: str, skim: dict) 
             break
     if next_missing is not None:
         _, frame_path, output_path, predictions_path, skipped_path = next_missing
-        rendered_bytes, predictions_payload = _run_roboflow_kiss_detector(settings, frame_path)
+        rendered_bytes, predictions_payload = _run_roboflow_kiss_detector(
+            settings,
+            frame_path,
+            use_workflow_cache=use_workflow_cache,
+        )
         _save_workflow_predictions(predictions_payload, predictions_path)
         if rendered_bytes is not None:
             _save_rendered_workflow_image(rendered_bytes, output_path)
@@ -2925,7 +2962,12 @@ def _point_in_polygon_or_boundary(point: tuple[float, float], polygon: list[tupl
     return inside
 
 
-def _run_roboflow_kiss_detector(settings, frame_path: Path) -> tuple[bytes | None, object]:
+def _run_roboflow_kiss_detector(
+    settings,
+    frame_path: Path,
+    *,
+    use_workflow_cache: bool = True,
+) -> tuple[bytes | None, object]:
     try:
         from inference_sdk import InferenceHTTPClient
     except ImportError as exc:
@@ -2944,7 +2986,7 @@ def _run_roboflow_kiss_detector(settings, frame_path: Path) -> tuple[bytes | Non
             workflow_id=settings.roboflow_workflow_id,
             images={"image": str(frame_path)},
             parameters={"classes": settings.roboflow_kiss_detector_classes},
-            use_cache=True,
+            use_cache=use_workflow_cache,
         )
     except Exception as exc:
         raise RuntimeError(f"Roboflow workflow request failed: {exc}") from exc
@@ -3423,7 +3465,7 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
         subprocess.Popen(command, cwd=project_root, env=env, stdout=log_file, stderr=log_file, start_new_session=True)
 
 
-def _queue_kiss_detector(settings, film_id: int) -> int:
+def _queue_kiss_detector(settings, film_id: int, *, use_workflow_cache: bool = True) -> int:
     with get_connection(settings.db_path) as conn:
         film = conn.execute("SELECT id FROM films WHERE id = ?", (film_id,)).fetchone()
         if not film:
@@ -3441,7 +3483,7 @@ def _queue_kiss_detector(settings, film_id: int) -> int:
             """,
             (
                 film_id,
-                json.dumps({}, sort_keys=True),
+                json.dumps({"use_workflow_cache": use_workflow_cache}, sort_keys=True),
                 json.dumps({"phase": "queued", "progress": 0.05}, sort_keys=True),
                 utc_now_iso(),
                 utc_now_iso(),
@@ -3704,6 +3746,9 @@ def _run_kiss_detector_now(job_id: int, film_id: int) -> int:
             skim = _load_latest_skim(conn, settings.preview_dir, film_id)
             if skim is None:
                 raise ValueError("Build a skim preview before running the kiss detector.")
+            job_config_row = conn.execute("SELECT payload_json FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+            job_config = json.loads(job_config_row["payload_json"] or "{}") if job_config_row else {}
+            use_workflow_cache = bool(job_config.get("use_workflow_cache", True))
             _update_job(conn, job_id, "running", "queued", 0.05)
             conn.commit()
         frame_paths = _ensure_skim_overview_paths(settings, film["archive_identifier"], skim)
@@ -3715,7 +3760,11 @@ def _run_kiss_detector_now(job_id: int, film_id: int) -> int:
             predictions_path = output_dir / f"frame_{index:06d}.json"
             skipped_path = output_dir / f"frame_{index:06d}.skip"
             if not output_path.exists() and not predictions_path.exists() and not skipped_path.exists():
-                rendered_bytes, predictions_payload = _run_roboflow_kiss_detector(settings, frame_path)
+                rendered_bytes, predictions_payload = _run_roboflow_kiss_detector(
+                    settings,
+                    frame_path,
+                    use_workflow_cache=use_workflow_cache,
+                )
                 _save_workflow_predictions(predictions_payload, predictions_path)
                 if rendered_bytes is not None:
                     _save_rendered_workflow_image(rendered_bytes, output_path)

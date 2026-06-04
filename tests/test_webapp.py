@@ -204,7 +204,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     settings = load_settings()
     settings.ensure_directories()
     init_db(settings.db_path)
-    build_calls = {"overview": 0, "detector": 0}
+    build_calls = {"overview": 0, "detector": 0, "use_workflow_cache": []}
 
     def fake_build_skim_overview_frames(skim_preview_path: Path, output_dir: Path, *, force: bool = False):
         build_calls["overview"] += 1
@@ -219,8 +219,9 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
             created.append(frame_path)
         return created
 
-    def fake_run_roboflow_kiss_detector(settings, frame_path: Path) -> tuple[bytes | None, object]:
+    def fake_run_roboflow_kiss_detector(settings, frame_path: Path, *, use_workflow_cache: bool = True) -> tuple[bytes | None, object]:
         build_calls["detector"] += 1
+        build_calls["use_workflow_cache"].append(use_workflow_cache)
         if frame_path.name.endswith("000001.jpg"):
             return None, {"image": {"height": 18, "width": 32}, "predictions": []}
         image = Image.new("RGB", (32, 18), color=(255, 0, 0))
@@ -273,6 +274,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert len(list(output_dir.glob("frame_*.json"))) == 2
     assert len(list(output_dir.glob("frame_*.skip"))) == 1
     assert build_calls["detector"] == 2
+    assert build_calls["use_workflow_cache"] == [True, True]
 
     app = create_app()
     client = app.test_client()
@@ -282,6 +284,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     assert b"Cluster Heads" in detail_response.data
     assert b"Make Kiss Candidates" in detail_response.data
     assert b"Min size px" in detail_response.data
+    assert b"Workflow Cache" in detail_response.data
     assert b"Collisions" in detail_response.data
     assert b"Kiss Candidates" in detail_response.data
     assert b"Remove Frames" in detail_response.data
@@ -659,6 +662,58 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
     assert frame_payload["kiss_cluster_groups"] == [["left-large-b", "left-large-a"], ["right-head"]]
     overlay_path = settings.preview_dir / frame_payload["kiss_cluster_overlay_relpath"]
     assert overlay_path.exists()
+
+
+def test_kiss_detector_analyze_can_disable_workflow_cache(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    spawned_commands: list[list[str]] = []
+
+    def fake_spawn_pipeline_command(settings, command: list[str]) -> None:
+        spawned_commands.append(command)
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._spawn_pipeline_command", fake_spawn_pipeline_command)
+
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/films/1/kiss-detector/analyze", json={"use_workflow_cache": False})
+
+    assert response.status_code == 200
+    assert spawned_commands
+    with get_connection(settings.db_path) as conn:
+        job_row = conn.execute(
+            "SELECT payload_json FROM analysis_jobs WHERE film_id = 1 AND job_type = 'kiss_detector' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert job_row is not None
+    assert json.loads(job_row["payload_json"]) == {"use_workflow_cache": False}
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
