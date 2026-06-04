@@ -2337,6 +2337,11 @@ def _find_first_workflow_image(node):
         annotated_image = node.get("annotated_image")
         if isinstance(annotated_image, str) and annotated_image.strip():
             return {"type": "base64", "value": annotated_image}
+        for key, value in node.items():
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if key == "label_visualization_output" or key.endswith("_visualization_output"):
+                return {"type": "base64", "value": value}
         node_type = node.get("type")
         node_value = node.get("value")
         if node_type in {"base64", "url"} and isinstance(node_value, str):

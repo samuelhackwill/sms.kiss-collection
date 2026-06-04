@@ -8,6 +8,7 @@ from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.ingest.fixture_ingest import ingest_fixture
 from ia_kissing_pipeline.main import run_metadata_scoring
 from ia_kissing_pipeline.webapp import (
+    _find_first_workflow_image,
     _build_manual_clip_now,
     _cleanup_nonpending_local_artifacts,
     _run_kiss_detector_now,
@@ -481,6 +482,19 @@ def test_kiss_detector_stop_route_interrupts_active_job(tmp_path: Path, monkeypa
         ).fetchone()
     assert job["status"] == "error"
     assert job["error_text"] == "kiss detector interrupted by user"
+
+
+def test_find_first_workflow_image_accepts_label_visualization_output() -> None:
+    payload = [
+        {
+            "label_visualization_output": "/9j/4AAQSkZJRgABAQAAAQABAAD",
+            "predictions": {"image": {"height": 360, "width": 640}, "predictions": []},
+        }
+    ]
+
+    image_payload = _find_first_workflow_image(payload)
+
+    assert image_payload == {"type": "base64", "value": "/9j/4AAQSkZJRgABAQAAAQABAAD"}
 
 
 def test_random_clips_api_returns_json_payload(tmp_path: Path, monkeypatch) -> None:
