@@ -17,7 +17,7 @@ from pathlib import Path
 from urllib import request as urllib_request
 
 from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, UnidentifiedImageError
 
 from ia_kissing_pipeline.config import load_settings
 from ia_kissing_pipeline.db import get_connection, init_db
@@ -564,7 +564,7 @@ FILM_TEMPLATE = """
             <div class="action-row">
               <button type="button" id="kiss-detector-analyze">Analyze Frames</button>
               <button type="button" id="kiss-detector-analyze-collisions" class="ghost">Analyze Collisions</button>
-              <button type="button" id="kiss-detector-cluster" class="ghost">Cluster Heads</button>
+              <button type="button" id="kiss-detector-cluster" class="ghost">Remove Suspicious Masks</button>
               <button type="button" id="kiss-detector-make-candidates" class="ghost">Make Kiss Candidates</button>
               <button type="button" id="kiss-detector-remove" class="ghost">Remove Frames</button>
               <label class="small" style="display:inline-flex; gap:8px; align-items:center;">
@@ -1152,7 +1152,7 @@ FILM_TEMPLATE = """
   if (kissDetectorClusterButton) {
     kissDetectorClusterButton.addEventListener("click", async () => {
       kissDetectorClusterButton.disabled = true;
-      kissDetectorStatus.textContent = "Clustering duplicate head masks...";
+      kissDetectorStatus.textContent = "Removing suspicious masks...";
       const minSizePixels = Math.max(0, Number.parseInt(kissDetectorMinSizeInput?.value || "0", 10) || 0);
       try {
         const response = await fetch("{{ url_for('kiss_detector_cluster', film_id=film['id']) }}", {
@@ -1166,7 +1166,7 @@ FILM_TEMPLATE = """
         }
         applyKissDetectorStatus(payload);
       } catch (error) {
-        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not cluster duplicate masks.";
+        kissDetectorStatus.textContent = error instanceof Error ? error.message : "Could not remove suspicious masks.";
         kissDetectorClusterButton.disabled = false;
       }
     });
@@ -2670,7 +2670,7 @@ def _cluster_kiss_detector_detections(
         predictions_payload["kiss_cluster_irregular_ids"] = cluster_meta["irregular_ids"]
         source_image_path = predictions_path.with_suffix(".png")
         if source_image_path.exists():
-            _write_cluster_overlay(output_dir, predictions_path, clusters)
+            _write_cluster_overlay(settings, output_dir, predictions_path, clusters)
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
     return analyzed
@@ -2814,12 +2814,21 @@ def _select_cluster_representative(polygons: list[dict[str, object]], cluster: s
 
 
 def _write_cluster_overlay(
+    settings,
     output_dir: Path,
     predictions_path: Path,
     representative_polygons: list[dict[str, object]],
 ) -> None:
     source_image_path = predictions_path.with_suffix(".png")
-    image = Image.open(source_image_path).convert("RGBA")
+    frame_stem = predictions_path.stem
+    overview_path = output_dir.parent / "skim-overview" / f"{frame_stem}.jpg"
+    try:
+        if overview_path.exists():
+            image = Image.open(overview_path).convert("RGBA")
+        else:
+            image = Image.open(source_image_path).convert("RGBA")
+    except (FileNotFoundError, UnidentifiedImageError):
+        image = Image.open(source_image_path).convert("RGBA")
     draw = ImageDraw.Draw(image)
     palette = [
         (255, 99, 71, 255),

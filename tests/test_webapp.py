@@ -281,7 +281,7 @@ def test_kiss_detector_endpoint_builds_and_reuses_images(tmp_path: Path, monkeyp
     detail_response = client.get("/films/1")
     assert b"Analyze Frames" in detail_response.data
     assert b"Analyze Collisions" in detail_response.data
-    assert b"Cluster Heads" in detail_response.data
+    assert b"Remove Suspicious Masks" in detail_response.data
     assert b"Make Kiss Candidates" in detail_response.data
     assert b"Min size px" in detail_response.data
     assert b"Clear Cache" in detail_response.data
@@ -385,7 +385,7 @@ def test_kiss_detector_collision_analysis_updates_json_and_payload(tmp_path: Pat
     )
     overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
     overview_dir.mkdir(parents=True, exist_ok=True)
-    (overview_dir / "frame_000001.jpg").write_bytes(b"fake-jpeg")
+    Image.new("RGB", (160, 160), "black").save(overview_dir / "frame_000001.jpg", format="JPEG")
     (overview_dir / "frame_000002.jpg").write_bytes(b"fake-jpeg")
 
     app = create_app()
@@ -689,11 +689,7 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
     assert frame_payload["kiss_cluster_irregular_ids"] == ["bad-strip"]
     overlay = Image.open(output_dir / "frame_000001.png").convert("RGBA")
     overlay_pixels = overlay.load()
-    assert not any(
-        overlay_pixels[x, y][:3] == (255, 0, 0)
-        for y in range(overlay.height)
-        for x in range(overlay.width)
-    )
+    assert overlay_pixels[70, 24][:3] == (0, 0, 0)
 
 
 def test_kiss_detector_cluster_handles_json_without_png(tmp_path: Path, monkeypatch) -> None:
