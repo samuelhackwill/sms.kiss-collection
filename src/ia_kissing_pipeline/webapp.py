@@ -2574,6 +2574,15 @@ def _make_kiss_detector_candidates(
             predictions_payload = json.loads(predictions_path.read_text())
         except json.JSONDecodeError:
             continue
+        if not bool(predictions_payload.get("collision", False)):
+            predictions_payload["kiss_candidate"] = False
+            predictions_payload["kiss_candidate_cluster_count"] = 0
+            predictions_payload["kiss_candidate_representative_ids"] = []
+            predictions_payload["kiss_candidate_min_size_pixels"] = min_size_pixels
+            predictions_payload["kiss_candidate_max_overlap_ratio"] = max_overlap_ratio
+            predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
+            analyzed += 1
+            continue
         detections = _extract_prediction_detections(predictions_payload)
         clusters, cluster_meta = _cluster_frame_detections(
             detections,
@@ -2637,6 +2646,16 @@ def _cluster_kiss_detector_detections(
             predictions_payload = json.loads(predictions_path.read_text())
         except json.JSONDecodeError:
             continue
+        if not bool(predictions_payload.get("collision", False)):
+            predictions_payload["kiss_cluster_min_size_pixels"] = min_size_pixels
+            predictions_payload["kiss_cluster_duplicate_overlap_ratio"] = duplicate_overlap_ratio
+            predictions_payload["kiss_cluster_count"] = 0
+            predictions_payload["kiss_cluster_representative_ids"] = []
+            predictions_payload["kiss_cluster_groups"] = []
+            predictions_payload["kiss_cluster_irregular_ids"] = []
+            predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
+            analyzed += 1
+            continue
         detections = _extract_prediction_detections(predictions_payload)
         clusters, cluster_meta = _cluster_frame_detections(
             detections,
@@ -2651,7 +2670,7 @@ def _cluster_kiss_detector_detections(
         predictions_payload["kiss_cluster_irregular_ids"] = cluster_meta["irregular_ids"]
         source_image_path = predictions_path.with_suffix(".png")
         if source_image_path.exists():
-            _write_cluster_overlay(output_dir, predictions_path, clusters, cluster_meta["irregular_polygons"])
+            _write_cluster_overlay(output_dir, predictions_path, clusters)
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
     return analyzed
@@ -2798,7 +2817,6 @@ def _write_cluster_overlay(
     output_dir: Path,
     predictions_path: Path,
     representative_polygons: list[dict[str, object]],
-    irregular_polygons: list[dict[str, object]],
 ) -> None:
     source_image_path = predictions_path.with_suffix(".png")
     image = Image.open(source_image_path).convert("RGBA")
@@ -2811,10 +2829,6 @@ def _write_cluster_overlay(
         (255, 105, 180, 255),
         (0, 206, 209, 255),
     ]
-    for irregular_polygon in irregular_polygons:
-        draw.line(irregular_polygon["points"] + [irregular_polygon["points"][0]], fill=(255, 0, 0, 255), width=3)
-        center_x, center_y = irregular_polygon["center"]
-        draw.text((center_x + 3, center_y + 3), "x", fill=(255, 0, 0, 255))
     for index, representative in enumerate(representative_polygons):
         color = palette[index % len(palette)]
         members = representative.get("cluster_members", [])

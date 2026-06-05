@@ -441,6 +441,7 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
     (output_dir / "frame_000001.json").write_text(
         json.dumps(
             {
+                "collision": True,
                 "image": {"height": 40, "width": 40},
                 "predictions": [
                     {
@@ -462,6 +463,7 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
     (output_dir / "frame_000002.json").write_text(
         json.dumps(
             {
+                "collision": True,
                 "image": {"height": 40, "width": 40},
                 "predictions": [
                     {
@@ -483,6 +485,7 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
     (output_dir / "frame_000003.json").write_text(
         json.dumps(
             {
+                "collision": False,
                 "image": {"height": 40, "width": 40},
                 "predictions": [
                     {
@@ -504,6 +507,7 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
     (output_dir / "frame_000004.json").write_text(
         json.dumps(
             {
+                "collision": True,
                 "image": {"height": 160, "width": 160},
                 "predictions": [
                     {
@@ -574,6 +578,7 @@ def test_kiss_detector_make_candidates_updates_json_and_payload(tmp_path: Path, 
     assert third_payload["kiss_candidate"] is False
     assert fourth_payload["kiss_candidate"] is True
     assert first_payload["kiss_candidate_min_size_pixels"] == 8
+    assert third_payload["kiss_candidate_cluster_count"] == 0
     assert fourth_payload["kiss_candidate_cluster_count"] == 2
     assert fourth_payload["kiss_candidate_representative_ids"] == ["left-large-b", "right-head"]
 
@@ -615,6 +620,7 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
     (output_dir / "frame_000001.json").write_text(
         json.dumps(
             {
+                "collision": True,
                 "image": {"height": 160, "width": 160},
                 "predictions": [
                     {
@@ -683,8 +689,8 @@ def test_kiss_detector_cluster_duplicates_updates_json_and_overlay(tmp_path: Pat
     assert frame_payload["kiss_cluster_irregular_ids"] == ["bad-strip"]
     overlay = Image.open(output_dir / "frame_000001.png").convert("RGBA")
     overlay_pixels = overlay.load()
-    assert any(
-        overlay_pixels[x, y][0] > 200 and overlay_pixels[x, y][1] < 80 and overlay_pixels[x, y][2] < 80
+    assert not any(
+        overlay_pixels[x, y][:3] == (255, 0, 0)
         for y in range(overlay.height)
         for x in range(overlay.width)
     )
@@ -726,6 +732,7 @@ def test_kiss_detector_cluster_handles_json_without_png(tmp_path: Path, monkeypa
     (output_dir / "frame_000001.json").write_text(
         json.dumps(
             {
+                "collision": True,
                 "image": {"height": 160, "width": 160},
                 "predictions": [
                     {
@@ -765,6 +772,76 @@ def test_kiss_detector_cluster_handles_json_without_png(tmp_path: Path, monkeypa
     assert payload["kiss_cluster_analysis_count"] == 1
     frame_payload = json.loads((output_dir / "frame_000001.json").read_text())
     assert frame_payload["kiss_cluster_count"] == 2
+
+
+def test_kiss_detector_cluster_skips_non_collision_frames(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        preview_path.write_bytes(b"fake-preview")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', '{}', ?, '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z')
+            """,
+            (
+                '{"output_fps":12,"preview_path":"%s","sample_every_seconds":4}' % str(preview_path),
+            ),
+        )
+
+    output_dir = settings.preview_dir / "kiss_in_spring_1932" / "kiss-detector"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (32, 32), "black").save(output_dir / "frame_000001.png")
+    (output_dir / "frame_000001.json").write_text(
+        json.dumps(
+            {
+                "collision": False,
+                "image": {"height": 32, "width": 32},
+                "predictions": [
+                    {
+                        "class": "head",
+                        "detection_id": "shape-a",
+                        "confidence": 0.9,
+                        "width": 20,
+                        "height": 20,
+                        "x": 16,
+                        "y": 16,
+                        "points": [{"x": 6, "y": 6}, {"x": 26, "y": 6}, {"x": 26, "y": 26}, {"x": 6, "y": 26}],
+                    }
+                ],
+            }
+        )
+    )
+    overview_dir = settings.preview_dir / "kiss_in_spring_1932" / "skim-overview"
+    overview_dir.mkdir(parents=True, exist_ok=True)
+    (overview_dir / "frame_000001.jpg").write_bytes(b"fake-jpeg")
+
+    before = Image.open(output_dir / "frame_000001.png").tobytes()
+    app = create_app()
+    client = app.test_client()
+    response = client.post("/films/1/kiss-detector/cluster", json={"min_size_pixels": 8})
+
+    assert response.status_code == 200
+    frame_payload = json.loads((output_dir / "frame_000001.json").read_text())
+    assert frame_payload["kiss_cluster_count"] == 0
+    assert frame_payload["kiss_cluster_representative_ids"] == []
+    assert Image.open(output_dir / "frame_000001.png").tobytes() == before
 
 
 def test_kiss_detector_analyze_can_disable_workflow_cache(tmp_path: Path, monkeypatch) -> None:
