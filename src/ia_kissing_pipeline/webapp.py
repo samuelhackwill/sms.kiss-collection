@@ -2657,23 +2657,48 @@ def _cluster_kiss_detector_detections(
             analyzed += 1
             continue
         detections = _extract_prediction_detections(predictions_payload)
-        clusters, cluster_meta = _cluster_frame_detections(
+        kept_polygons, removed_polygons = _filter_suspicious_polygons(
             detections,
             min_size_pixels=min_size_pixels,
-            duplicate_overlap_ratio=duplicate_overlap_ratio,
         )
         predictions_payload["kiss_cluster_min_size_pixels"] = min_size_pixels
         predictions_payload["kiss_cluster_duplicate_overlap_ratio"] = duplicate_overlap_ratio
-        predictions_payload["kiss_cluster_count"] = cluster_meta["cluster_count"]
-        predictions_payload["kiss_cluster_representative_ids"] = cluster_meta["representative_ids"]
-        predictions_payload["kiss_cluster_groups"] = cluster_meta["groups"]
-        predictions_payload["kiss_cluster_irregular_ids"] = cluster_meta["irregular_ids"]
+        predictions_payload["kiss_cluster_count"] = len(kept_polygons)
+        predictions_payload["kiss_cluster_representative_ids"] = [
+            polygon.get("detection_id") for polygon in kept_polygons if polygon.get("detection_id")
+        ]
+        predictions_payload["kiss_cluster_groups"] = [
+            [polygon.get("shape_id")] for polygon in kept_polygons if polygon.get("shape_id")
+        ]
+        predictions_payload["kiss_cluster_irregular_ids"] = [
+            polygon.get("shape_id") for polygon in removed_polygons if polygon.get("shape_id")
+        ]
         source_image_path = predictions_path.with_suffix(".png")
         if source_image_path.exists():
-            _write_cluster_overlay(settings, output_dir, predictions_path, clusters)
+            _write_cluster_overlay(settings, output_dir, predictions_path, kept_polygons)
         predictions_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True))
         analyzed += 1
     return analyzed
+
+
+def _filter_suspicious_polygons(
+    detections: list[dict],
+    *,
+    min_size_pixels: float,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    polygons = [
+        polygon
+        for polygon in _extract_detection_polygons(detections)
+        if polygon["size_pixels"] >= min_size_pixels
+    ]
+    kept_polygons = []
+    removed_polygons = []
+    for polygon in polygons:
+        if _is_suspicious_head_shape(polygon, min_size_pixels=min_size_pixels):
+            removed_polygons.append(polygon)
+        else:
+            kept_polygons.append(polygon)
+    return kept_polygons, removed_polygons
 
 
 def _cluster_frame_detections(
@@ -2736,6 +2761,26 @@ def _is_irregular_head_shape(polygon: dict[str, object]) -> bool:
     if aspect_ratio > 2.6:
         irregular_score += 1
     return irregular_score >= 2
+
+
+def _is_suspicious_head_shape(
+    polygon: dict[str, object],
+    *,
+    min_size_pixels: float,
+) -> bool:
+    area = float(polygon.get("area") or 0.0)
+    circularity = float(polygon.get("circularity") or 0.0)
+    extent = float(polygon.get("extent") or 0.0)
+    aspect_ratio = float(polygon.get("aspect_ratio") or 1.0)
+    if area < max(40.0, min_size_pixels * min_size_pixels * 0.35):
+        return True
+    if aspect_ratio > 4.0:
+        return True
+    if extent < 0.28:
+        return True
+    if circularity < 0.12:
+        return True
+    return False
 
 
 def _representative_clusters_touch(representative_polygons: list[dict[str, object]]) -> bool:
