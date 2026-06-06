@@ -1333,6 +1333,69 @@ CLIPS_TEMPLATE = """
 """
 
 
+WHAT_IS_A_KISS_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>What Is A Kiss</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #111720; --border: #263244; --text: #edf3ff; --muted: #93a4bc; --link: #7cc7ff; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    .page { display: grid; gap: 16px; }
+    .row { display: grid; grid-template-columns: minmax(260px, 320px) minmax(200px, 260px) minmax(0, 1fr); gap: 16px; align-items: start; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 16px; padding: 14px; }
+    .clip-column video { width: 100%; display: block; background: #000; border-radius: 10px; }
+    .kiss-column img { width: 100%; display: block; background: #000; border-radius: 10px; }
+    .frames-column { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+    .frames-column img { width: 100%; display: block; background: #000; border-radius: 8px; }
+    .meta { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+    .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
+    .empty { padding: 24px; border: 1px solid var(--border); border-radius: 16px; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); }
+    @media (max-width: 1100px) {
+      .row { grid-template-columns: 1fr; }
+      .frames-column { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+    @media (max-width: 700px) {
+      .frames-column { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+  </style>
+</head>
+<body>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <h1>What Is A Kiss</h1>
+  {% if rows %}
+    <div class="page">
+      {% for row in rows %}
+        <div class="row">
+          <div class="clip-column">
+            <div class="section-title">Confirmed Clip</div>
+            <div class="meta">{{ row["title"] }} | clip {{ row["id"] }} | kiss {{ "%.2f"|format(row["kiss_start_seconds"]) }}s</div>
+            <video controls preload="metadata" src="{{ row['clip_media_url'] }}"></video>
+          </div>
+          <div class="kiss-column">
+            <div class="section-title">Kiss Frame</div>
+            <img src="{{ row['kiss_frame_url'] }}" alt="Kiss frame for clip {{ row['id'] }}">
+          </div>
+          <div>
+            <div class="section-title">Lead-In Frames</div>
+            <div class="frames-column">
+              {% for frame in row["lead_in_frames"] %}
+                <img src="{{ frame['media_url'] }}" alt="Lead-in frame {{ loop.index }} for clip {{ row['id'] }}">
+              {% endfor %}
+            </div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="empty">No kiss clips with saved kiss timing yet.</div>
+  {% endif %}
+</body>
+</html>
+"""
+
+
 REVIEW_DATA_TEMPLATE = """
 <!doctype html>
 <html>
@@ -1711,6 +1774,12 @@ def create_app() -> Flask:
                 tag=request.args.get("tag", type=str),
             )
         return render_template_string(CLIPS_TEMPLATE, clips=clips)
+
+    @app.get("/what-is-a-kiss")
+    def what_is_a_kiss_page():
+        with get_connection(settings.db_path) as conn:
+            clips = _load_kiss_reference_rows(conn, settings)
+        return render_template_string(WHAT_IS_A_KISS_TEMPLATE, rows=clips)
 
     @app.get("/review_data")
     def review_data_index():
@@ -3408,6 +3477,86 @@ def _hydrate_clip_rows(rows, clips_dir: Path) -> list[dict]:
         item["kind"] = kind
         clips.append(item)
     return clips
+
+
+def _load_kiss_reference_rows(conn, settings) -> list[dict]:
+    clips = [
+        clip
+        for clip in _load_clips(conn, settings.clips_dir, tag="kiss")
+        if clip.get("kiss_start_seconds") is not None
+    ]
+    rows: list[dict] = []
+    for clip in clips:
+        frame_assets = _ensure_what_is_a_kiss_frames(settings, clip)
+        rows.append(
+            {
+                "id": clip["id"],
+                "title": clip["title"],
+                "kiss_start_seconds": float(clip["kiss_start_seconds"]),
+                "clip_media_url": url_for("media_file", kind=clip["kind"], relpath=clip["relpath"]),
+                "kiss_frame_url": frame_assets["kiss_frame_url"],
+                "lead_in_frames": frame_assets["lead_in_frames"],
+            }
+        )
+    return rows
+
+
+def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
+    clip_path_value = clip.get("cropped_clip_path") or clip.get("clip_path")
+    clip_path = Path(clip_path_value)
+    if not clip_path.exists():
+        raise FileNotFoundError(f"Clip file not found: {clip_path}")
+    clip_dir = settings.preview_dir / "what-is-a-kiss" / f"clip-{int(clip['id']):04d}"
+    kiss_dir = clip_dir / "kiss"
+    lead_dir = clip_dir / "lead-in"
+    kiss_start_seconds = float(clip["kiss_start_seconds"])
+    kiss_frame_path = kiss_dir / "kiss.jpg"
+    _ensure_video_frame(clip_path, kiss_frame_path, kiss_start_seconds)
+
+    lead_in_frames: list[dict[str, str]] = []
+    lead_start = max(0.0, kiss_start_seconds - 5.0)
+    frame_times: list[float] = []
+    current_time = lead_start
+    while current_time < kiss_start_seconds and len(frame_times) < 20:
+        frame_times.append(current_time)
+        current_time += 0.25
+    for index, timestamp in enumerate(frame_times, start=1):
+        frame_path = lead_dir / f"frame_{index:02d}.jpg"
+        _ensure_video_frame(clip_path, frame_path, timestamp)
+        lead_in_frames.append(
+            {
+                "media_url": url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+            }
+        )
+    return {
+        "kiss_frame_url": url_for("media_file", kind="preview", relpath=str(kiss_frame_path.relative_to(settings.preview_dir))),
+        "lead_in_frames": lead_in_frames,
+    }
+
+
+def _ensure_video_frame(video_path: Path, output_path: Path, seconds: float) -> Path:
+    if output_path.exists():
+        return output_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(max(0.0, seconds)),
+            "-i",
+            str(video_path),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(output_path),
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return output_path
 
 
 def _clip_order_cursor_key(tag: str | None) -> str:

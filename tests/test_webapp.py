@@ -892,6 +892,74 @@ def test_kiss_detector_analyze_can_disable_workflow_cache(tmp_path: Path, monkey
     assert json.loads(job_row["payload_json"]) == {"use_workflow_cache": False}
 
 
+def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        clip_dir = settings.clips_dir / "kiss_in_spring_1932"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        kiss_clip_path = clip_dir / "kiss-001.mp4"
+        missing_timing_path = clip_dir / "kiss-002.mp4"
+        other_tag_path = clip_dir / "dance-001.mp4"
+        kiss_clip_path.write_text("clip")
+        missing_timing_path.write_text("clip")
+        other_tag_path.write_text("clip")
+        conn.execute(
+            """
+            INSERT INTO manual_marks (
+                id, film_id, skim_path, skim_sample_every_seconds, skim_output_fps,
+                preview_seconds, sample_index, source_seconds, selected_tag, note, created_at
+            ) VALUES
+                (1, 1, '', 4, 12, 0, 1, 5, 'kiss', 'kiss', '2026-03-24T00:00:00Z'),
+                (2, 1, '', 4, 12, 0, 2, 12, 'kiss', 'kiss', '2026-03-25T00:00:00Z'),
+                (3, 1, '', 4, 12, 0, 3, 18, 'dance', 'dance', '2026-03-26T00:00:00Z')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO manual_clips (
+                id, manual_mark_id, film_id, clip_path, clip_tag, metadata_json, start_seconds, end_seconds, created_at, ignored
+            ) VALUES
+                (1, 1, 1, ?, 'kiss', '{"kiss_start_seconds": 1.25, "kiss_end_seconds": 2.5}', 5, 9, '2026-03-24T00:00:00Z', 0),
+                (2, 1, 1, ?, 'kiss', '{}', 5, 9, '2026-03-25T00:00:00Z', 0),
+                (3, 1, 1, ?, 'dance', '{"kiss_start_seconds": 1.25}', 5, 9, '2026-03-26T00:00:00Z', 0)
+            """,
+            (str(kiss_clip_path), str(missing_timing_path), str(other_tag_path)),
+        )
+
+    def fake_ensure_video_frame(video_path: Path, output_path: Path, seconds: float) -> Path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 36), "black").save(output_path, format="JPEG")
+        return output_path
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._ensure_video_frame", fake_ensure_video_frame)
+
+    app = create_app()
+    client = app.test_client()
+    response = client.get("/what-is-a-kiss")
+
+    assert response.status_code == 200
+    assert b"What Is A Kiss" in response.data
+    assert b"clip 1" in response.data
+    assert b"kiss 1.25s" in response.data
+    assert b"clip 2" not in response.data
+    assert b"dance" not in response.data
+
+
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)
