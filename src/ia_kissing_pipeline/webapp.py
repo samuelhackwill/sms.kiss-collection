@@ -3686,9 +3686,10 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     kiss_frame_path = kiss_dir / "kiss.jpg"
     _ensure_video_frame(clip_path, kiss_frame_path, kiss_start_seconds)
 
+    _clear_what_is_a_kiss_lead_in_cache(clip_dir)
     lead_in_frames: list[dict[str, str]] = []
     lead_frame_count = 15
-    lead_frame_step = 1.0 / 12.0
+    lead_frame_step = 1.0 / 5.0
     frame_times = [
         timestamp
         for timestamp in (
@@ -3709,6 +3710,15 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
         "kiss_frame_url": url_for("media_file", kind="preview", relpath=str(kiss_frame_path.relative_to(settings.preview_dir))),
         "lead_in_frames": lead_in_frames,
     }
+
+
+def _clear_what_is_a_kiss_lead_in_cache(clip_dir: Path) -> None:
+    lead_dir = clip_dir / "lead-in"
+    roboflow_dir = clip_dir / "roboflow"
+    for frame_path in lead_dir.glob("frame_*.jpg"):
+        frame_path.unlink()
+    for artifact_path in roboflow_dir.glob("frame_*.*"):
+        artifact_path.unlink()
 
 
 def _ensure_what_is_a_kiss_roboflow_outputs(settings, clip: dict) -> dict[str, object]:

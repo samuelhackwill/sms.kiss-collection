@@ -939,12 +939,16 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
             INSERT INTO manual_clips (
                 id, manual_mark_id, film_id, clip_path, clip_tag, metadata_json, start_seconds, end_seconds, created_at, ignored
             ) VALUES
-                (1, 1, 1, ?, 'kiss', '{"kiss_start_seconds": 1.25, "kiss_end_seconds": 2.5}', 5, 9, '2026-03-24T00:00:00Z', 0),
+                (1, 1, 1, ?, 'kiss', '{"kiss_start_seconds": 4.25, "kiss_end_seconds": 5.5}', 5, 9, '2026-03-24T00:00:00Z', 0),
                 (2, 1, 1, ?, 'kiss', '{}', 5, 9, '2026-03-25T00:00:00Z', 0),
-                (3, 1, 1, ?, 'dance', '{"kiss_start_seconds": 1.25}', 5, 9, '2026-03-26T00:00:00Z', 0)
+                (3, 1, 1, ?, 'dance', '{"kiss_start_seconds": 4.25}', 5, 9, '2026-03-26T00:00:00Z', 0)
             """,
             (str(kiss_clip_path), str(missing_timing_path), str(other_tag_path)),
         )
+    stale_lead_dir = settings.preview_dir / "what-is-a-kiss" / "clip-0001" / "lead-in"
+    stale_lead_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(1, 21):
+        Image.new("RGB", (16, 9), "blue").save(stale_lead_dir / f"frame_{index:02d}.jpg", format="JPEG")
 
     extracted_frames: list[float] = []
 
@@ -971,7 +975,7 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
     assert response.status_code == 200
     assert b"What Is A Kiss" in response.data
     assert b"clip 1" in response.data
-    assert b"kiss 1.25s" in response.data
+    assert b"kiss 4.25s" in response.data
     assert b"clip 2" not in response.data
     assert b"dance" not in response.data
     assert not extracted_frames
@@ -986,26 +990,29 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
     assert load_payload["kiss_frame_url"].startswith("/media/preview/")
     assert len(load_payload["lead_in_frames"]) == 15
     assert len(extracted_frames) == 16
-    assert extracted_frames[0] == 1.25
+    assert extracted_frames[0] == 4.25
     assert extracted_frames[1:] == pytest.approx(
         [
-            0.0,
-            1.0 / 12.0,
-            2.0 / 12.0,
-            3.0 / 12.0,
-            4.0 / 12.0,
-            5.0 / 12.0,
-            6.0 / 12.0,
-            7.0 / 12.0,
-            8.0 / 12.0,
-            9.0 / 12.0,
-            10.0 / 12.0,
-            11.0 / 12.0,
-            1.0,
-            13.0 / 12.0,
-            14.0 / 12.0,
+            1.25,
+            1.45,
+            1.65,
+            1.85,
+            2.05,
+            2.25,
+            2.45,
+            2.65,
+            2.85,
+            3.05,
+            3.25,
+            3.45,
+            3.65,
+            3.85,
+            4.05,
         ]
     )
+    rebuilt_lead_paths = sorted(stale_lead_dir.glob("frame_*.jpg"))
+    assert len(rebuilt_lead_paths) == 15
+    assert rebuilt_lead_paths[-1].name == "frame_15.jpg"
 
     analyze_response = client.post("/what-is-a-kiss/1/analyze-frames")
     assert analyze_response.status_code == 200
