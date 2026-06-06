@@ -35,7 +35,6 @@ QUEUE_INGEST_ROWS = 4
 QUEUE_STALE_SECONDS = 600
 QUEUE_NAME = "download_batch"
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
-KISS_HIGHLIGHT = (255, 72, 172)
 
 
 EMPTY_TEMPLATE = """
@@ -1351,6 +1350,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
     .kiss-frame-block img { width: 100%; display: block; background: #000; border-radius: 10px; }
     .frames-column { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
     .frames-column img { width: 100%; display: block; background: #000; border-radius: 8px; }
+    .frames-column img.kiss-frame-marker { outline: 4px solid rgb(255, 72, 172); outline-offset: 1px; }
     .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
     .load-button { border: 1px solid var(--border); background: #182334; color: var(--text); border-radius: 999px; padding: 6px 12px; cursor: pointer; font: inherit; text-decoration: none; }
     .load-button[disabled] { opacity: 0.6; cursor: wait; }
@@ -1399,7 +1399,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
             <div class="frames-column">
               {% if row["lead_in_frames"] %}
                 {% for frame in row["lead_in_frames"] %}
-                  <img src="{{ frame['media_url'] }}" alt="Sequence frame {{ loop.index }} for clip {{ row['id'] }}">
+                  <img src="{{ frame['media_url'] }}" alt="Sequence frame {{ loop.index }} for clip {{ row['id'] }}" class="{{ 'kiss-frame-marker' if frame['is_kiss_frame'] else '' }}">
                 {% endfor %}
               {% else %}
                 <div class="frame-placeholder">Load frames to inspect the sequence.</div>
@@ -1439,6 +1439,9 @@ WHAT_IS_A_KISS_TEMPLATE = """
         const image = document.createElement("img");
         image.src = frame.media_url;
         image.alt = `Sequence frame ${index + 1} for clip ${payload.id}`;
+        if (frame.is_kiss_frame) {
+          image.classList.add("kiss-frame-marker");
+        }
         framesColumn.appendChild(image);
       });
       status.textContent = `Loaded ${payload.lead_in_frames.length + 1} frames.`;
@@ -1475,6 +1478,9 @@ WHAT_IS_A_KISS_TEMPLATE = """
         const image = document.createElement("img");
         image.src = frame.annotated_url || frame.media_url;
         image.alt = `Annotated sequence frame ${index + 1} for clip ${payload.id}`;
+        if (frame.is_kiss_frame) {
+          image.classList.add("kiss-frame-marker");
+        }
         framesColumn.appendChild(image);
       });
       status.textContent = `Roboflow answered for ${payload.annotated_count} frames.`;
@@ -3674,11 +3680,14 @@ def _what_is_a_kiss_frame_assets(settings, clip: dict) -> dict[str, object]:
     clip_dir = settings.preview_dir / "what-is-a-kiss" / f"clip-{int(clip['id']):04d}"
     kiss_frame_path = clip_dir / "kiss" / "kiss.jpg"
     lead_dir = clip_dir / "lead-in"
-    lead_in_frames: list[dict[str, str]] = []
-    for frame_path in sorted(lead_dir.glob("frame_*.jpg")):
+    lead_paths = sorted(lead_dir.glob("frame_*.jpg"))
+    kiss_frame_index = _what_is_a_kiss_sequence_kiss_index(lead_paths)
+    lead_in_frames: list[dict[str, object]] = []
+    for index, frame_path in enumerate(lead_paths):
         lead_in_frames.append(
             {
                 "media_url": url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+                "is_kiss_frame": index == kiss_frame_index,
             }
         )
     return {
@@ -3703,21 +3712,19 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     kiss_start_seconds = float(clip["kiss_start_seconds"])
     kiss_frame_path = kiss_dir / "kiss.jpg"
     _ensure_video_frame(clip_path, kiss_frame_path, kiss_start_seconds)
-    _add_kiss_outline(kiss_frame_path)
 
     _clear_what_is_a_kiss_lead_in_cache(clip_dir)
-    lead_in_frames: list[dict[str, str]] = []
+    lead_in_frames: list[dict[str, object]] = []
     lead_frame_step = 1.0 / 5.0
     frame_times = _what_is_a_kiss_sequence_times(kiss_start_seconds, lead_frame_step)
-    kiss_frame_index = min(9, len(frame_times) - 1)
+    kiss_frame_index = _what_is_a_kiss_sequence_kiss_index(frame_times)
     for index, timestamp in enumerate(frame_times, start=1):
         frame_path = lead_dir / f"frame_{index:02d}.jpg"
         _ensure_video_frame(clip_path, frame_path, timestamp)
-        if index - 1 == kiss_frame_index:
-            _add_kiss_outline(frame_path)
         lead_in_frames.append(
             {
                 "media_url": url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+                "is_kiss_frame": index - 1 == kiss_frame_index,
             }
         )
     return {
@@ -3746,18 +3753,8 @@ def _what_is_a_kiss_sequence_times(kiss_start_seconds: float, frame_step: float)
     return frame_times
 
 
-def _add_kiss_outline(image_path: Path) -> None:
-    with Image.open(image_path).convert("RGB") as image:
-        draw = ImageDraw.Draw(image)
-        width, height = image.size
-        inset = max(2, min(width, height) // 24)
-        line_width = max(3, min(width, height) // 40)
-        draw.rectangle(
-            [(inset, inset), (width - inset - 1, height - inset - 1)],
-            outline=KISS_HIGHLIGHT,
-            width=line_width,
-        )
-        image.save(image_path, format="JPEG", quality=95)
+def _what_is_a_kiss_sequence_kiss_index(sequence_items: list[object]) -> int:
+    return min(9, max(0, len(sequence_items) - 6))
 
 
 def _build_what_is_a_kiss_frames_archive(settings, clip: dict) -> Path:
