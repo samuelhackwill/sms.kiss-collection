@@ -35,6 +35,7 @@ QUEUE_INGEST_ROWS = 4
 QUEUE_STALE_SECONDS = 600
 QUEUE_NAME = "download_batch"
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+KISS_HIGHLIGHT = (255, 72, 172)
 
 
 EMPTY_TEMPLATE = """
@@ -1351,7 +1352,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
     .frames-column { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
     .frames-column img { width: 100%; display: block; background: #000; border-radius: 8px; }
     .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
-    .load-button { border: 1px solid var(--border); background: #182334; color: var(--text); border-radius: 999px; padding: 6px 12px; cursor: pointer; font: inherit; }
+    .load-button { border: 1px solid var(--border); background: #182334; color: var(--text); border-radius: 999px; padding: 6px 12px; cursor: pointer; font: inherit; text-decoration: none; }
     .load-button[disabled] { opacity: 0.6; cursor: wait; }
     .status { color: var(--muted); font-size: 12px; }
     .frame-placeholder { min-height: 160px; border: 1px dashed var(--border); border-radius: 10px; display: grid; place-items: center; color: var(--muted); background: rgba(0, 0, 0, 0.2); }
@@ -1380,6 +1381,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
             <div class="controls">
               <button class="load-button" type="button">Load Frames</button>
               <button class="load-button analyze-button" type="button">Analyze In Roboflow</button>
+              <a class="load-button" href="{{ row['download_frames_url'] }}">Download Frames</a>
               <span class="status">{% if row["frames_ready"] %}Frames cached on disk.{% else %}Frames not loaded yet.{% endif %}</span>
             </div>
             <video controls preload="metadata" src="{{ row['clip_media_url'] }}"></video>
@@ -1393,14 +1395,14 @@ WHAT_IS_A_KISS_TEMPLATE = """
             </div>
           </div>
           <div>
-            <div class="section-title">Lead-In Frames</div>
+            <div class="section-title">Sequence Frames</div>
             <div class="frames-column">
               {% if row["lead_in_frames"] %}
                 {% for frame in row["lead_in_frames"] %}
-                  <img src="{{ frame['media_url'] }}" alt="Lead-in frame {{ loop.index }} for clip {{ row['id'] }}">
+                  <img src="{{ frame['media_url'] }}" alt="Sequence frame {{ loop.index }} for clip {{ row['id'] }}">
                 {% endfor %}
               {% else %}
-                <div class="frame-placeholder">Load frames to inspect the lead-in.</div>
+                <div class="frame-placeholder">Load frames to inspect the sequence.</div>
               {% endif %}
             </div>
           </div>
@@ -1436,7 +1438,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
       payload.lead_in_frames.forEach((frame, index) => {
         const image = document.createElement("img");
         image.src = frame.media_url;
-        image.alt = `Lead-in frame ${index + 1} for clip ${payload.id}`;
+        image.alt = `Sequence frame ${index + 1} for clip ${payload.id}`;
         framesColumn.appendChild(image);
       });
       status.textContent = `Loaded ${payload.lead_in_frames.length + 1} frames.`;
@@ -1472,7 +1474,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
       payload.lead_in_frames.forEach((frame, index) => {
         const image = document.createElement("img");
         image.src = frame.annotated_url || frame.media_url;
-        image.alt = `Annotated lead-in frame ${index + 1} for clip ${payload.id}`;
+        image.alt = `Annotated sequence frame ${index + 1} for clip ${payload.id}`;
         framesColumn.appendChild(image);
       });
       status.textContent = `Roboflow answered for ${payload.annotated_count} frames.`;
@@ -1893,6 +1895,21 @@ def create_app() -> Flask:
                 "kiss_frame_url": frame_assets["kiss_frame_url"],
                 "lead_in_frames": frame_assets["lead_in_frames"],
             }
+        )
+
+    @app.get("/what-is-a-kiss/<int:clip_id>/download-frames")
+    def what_is_a_kiss_download_frames(clip_id: int):
+        with get_connection(settings.db_path) as conn:
+            clip = _load_kiss_reference_clip(conn, settings, clip_id)
+        if clip is None:
+            abort(404)
+        _ensure_what_is_a_kiss_frames(settings, clip)
+        archive_path = _build_what_is_a_kiss_frames_archive(settings, clip)
+        return send_file(
+            archive_path,
+            as_attachment=True,
+            download_name=f"what-is-a-kiss-clip-{clip_id:04d}.zip",
+            mimetype="application/zip",
         )
 
     @app.post("/what-is-a-kiss/<int:clip_id>/analyze-frames")
@@ -3631,6 +3648,7 @@ def _load_kiss_reference_rows(conn, settings) -> list[dict]:
                 "lead_in_frames": frame_assets["lead_in_frames"],
                 "frames_ready": frame_assets["frames_ready"],
                 "load_frames_url": url_for("what_is_a_kiss_load_frames", clip_id=int(clip["id"])),
+                "download_frames_url": url_for("what_is_a_kiss_download_frames", clip_id=int(clip["id"])),
                 "analyze_frames_url": url_for("what_is_a_kiss_analyze_frames", clip_id=int(clip["id"])),
             }
         )
@@ -3685,22 +3703,18 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     kiss_start_seconds = float(clip["kiss_start_seconds"])
     kiss_frame_path = kiss_dir / "kiss.jpg"
     _ensure_video_frame(clip_path, kiss_frame_path, kiss_start_seconds)
+    _add_kiss_outline(kiss_frame_path)
 
     _clear_what_is_a_kiss_lead_in_cache(clip_dir)
     lead_in_frames: list[dict[str, str]] = []
-    lead_frame_count = 15
     lead_frame_step = 1.0 / 5.0
-    frame_times = [
-        timestamp
-        for timestamp in (
-            kiss_start_seconds - (offset * lead_frame_step)
-            for offset in range(lead_frame_count, 0, -1)
-        )
-        if timestamp >= 0.0
-    ]
+    frame_times = _what_is_a_kiss_sequence_times(kiss_start_seconds, lead_frame_step)
+    kiss_frame_index = min(9, len(frame_times) - 1)
     for index, timestamp in enumerate(frame_times, start=1):
         frame_path = lead_dir / f"frame_{index:02d}.jpg"
         _ensure_video_frame(clip_path, frame_path, timestamp)
+        if index - 1 == kiss_frame_index:
+            _add_kiss_outline(frame_path)
         lead_in_frames.append(
             {
                 "media_url": url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
@@ -3719,6 +3733,43 @@ def _clear_what_is_a_kiss_lead_in_cache(clip_dir: Path) -> None:
         frame_path.unlink()
     for artifact_path in roboflow_dir.glob("frame_*.*"):
         artifact_path.unlink()
+
+
+def _what_is_a_kiss_sequence_times(kiss_start_seconds: float, frame_step: float) -> list[float]:
+    frame_times = [
+        kiss_start_seconds - (offset * frame_step)
+        for offset in range(9, 0, -1)
+        if kiss_start_seconds - (offset * frame_step) >= 0.0
+    ]
+    frame_times.append(max(0.0, kiss_start_seconds))
+    frame_times.extend(kiss_start_seconds + (offset * frame_step) for offset in range(1, 6))
+    return frame_times
+
+
+def _add_kiss_outline(image_path: Path) -> None:
+    with Image.open(image_path).convert("RGB") as image:
+        draw = ImageDraw.Draw(image)
+        width, height = image.size
+        inset = max(2, min(width, height) // 24)
+        line_width = max(3, min(width, height) // 40)
+        draw.rectangle(
+            [(inset, inset), (width - inset - 1, height - inset - 1)],
+            outline=KISS_HIGHLIGHT,
+            width=line_width,
+        )
+        image.save(image_path, format="JPEG", quality=95)
+
+
+def _build_what_is_a_kiss_frames_archive(settings, clip: dict) -> Path:
+    clip_dir = settings.preview_dir / "what-is-a-kiss" / f"clip-{int(clip['id']):04d}"
+    archive_path = clip_dir / "sequence-frames.zip"
+    kiss_frame_path = clip_dir / "kiss" / "kiss.jpg"
+    lead_paths = sorted((clip_dir / "lead-in").glob("frame_*.jpg"))
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(kiss_frame_path, arcname="kiss.jpg")
+        for frame_path in lead_paths:
+            zf.write(frame_path, arcname=f"sequence/{frame_path.name}")
+    return archive_path
 
 
 def _ensure_what_is_a_kiss_roboflow_outputs(settings, clip: dict) -> dict[str, object]:

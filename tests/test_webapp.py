@@ -1,6 +1,7 @@
 from __future__ import annotations
 import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -993,12 +994,6 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
     assert extracted_frames[0] == 4.25
     assert extracted_frames[1:] == pytest.approx(
         [
-            1.25,
-            1.45,
-            1.65,
-            1.85,
-            2.05,
-            2.25,
             2.45,
             2.65,
             2.85,
@@ -1008,11 +1003,40 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
             3.65,
             3.85,
             4.05,
+            4.25,
+            4.45,
+            4.65,
+            4.85,
+            5.05,
+            5.25,
         ]
     )
     rebuilt_lead_paths = sorted(stale_lead_dir.glob("frame_*.jpg"))
     assert len(rebuilt_lead_paths) == 15
     assert rebuilt_lead_paths[-1].name == "frame_15.jpg"
+
+    download_response = client.get("/what-is-a-kiss/1/download-frames")
+    assert download_response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(download_response.data)) as zf:
+        names = sorted(zf.namelist())
+    assert names == [
+        "kiss.jpg",
+        "sequence/frame_01.jpg",
+        "sequence/frame_02.jpg",
+        "sequence/frame_03.jpg",
+        "sequence/frame_04.jpg",
+        "sequence/frame_05.jpg",
+        "sequence/frame_06.jpg",
+        "sequence/frame_07.jpg",
+        "sequence/frame_08.jpg",
+        "sequence/frame_09.jpg",
+        "sequence/frame_10.jpg",
+        "sequence/frame_11.jpg",
+        "sequence/frame_12.jpg",
+        "sequence/frame_13.jpg",
+        "sequence/frame_14.jpg",
+        "sequence/frame_15.jpg",
+    ]
 
     analyze_response = client.post("/what-is-a-kiss/1/analyze-frames")
     assert analyze_response.status_code == 200
