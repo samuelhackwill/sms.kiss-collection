@@ -3687,14 +3687,16 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     _ensure_video_frame(clip_path, kiss_frame_path, kiss_start_seconds)
 
     lead_in_frames: list[dict[str, str]] = []
-    lead_frame_count = 12
+    lead_frame_count = 15
     lead_frame_step = 1.0 / 12.0
-    lead_start = max(0.0, kiss_start_seconds - (lead_frame_count * lead_frame_step))
-    frame_times: list[float] = []
-    current_time = lead_start
-    while current_time < kiss_start_seconds and len(frame_times) < lead_frame_count:
-        frame_times.append(current_time)
-        current_time += lead_frame_step
+    frame_times = [
+        timestamp
+        for timestamp in (
+            kiss_start_seconds - (offset * lead_frame_step)
+            for offset in range(lead_frame_count, 0, -1)
+        )
+        if timestamp >= 0.0
+    ]
     for index, timestamp in enumerate(frame_times, start=1):
         frame_path = lead_dir / f"frame_{index:02d}.jpg"
         _ensure_video_frame(clip_path, frame_path, timestamp)

@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from ia_kissing_pipeline.config import load_settings
@@ -983,15 +984,35 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
     assert load_response.status_code == 200
     load_payload = load_response.get_json()
     assert load_payload["kiss_frame_url"].startswith("/media/preview/")
-    assert len(load_payload["lead_in_frames"]) == 12
-    assert len(extracted_frames) == 13
+    assert len(load_payload["lead_in_frames"]) == 15
+    assert len(extracted_frames) == 16
+    assert extracted_frames[0] == 1.25
+    assert extracted_frames[1:] == pytest.approx(
+        [
+            0.0,
+            1.0 / 12.0,
+            2.0 / 12.0,
+            3.0 / 12.0,
+            4.0 / 12.0,
+            5.0 / 12.0,
+            6.0 / 12.0,
+            7.0 / 12.0,
+            8.0 / 12.0,
+            9.0 / 12.0,
+            10.0 / 12.0,
+            11.0 / 12.0,
+            1.0,
+            13.0 / 12.0,
+            14.0 / 12.0,
+        ]
+    )
 
     analyze_response = client.post("/what-is-a-kiss/1/analyze-frames")
     assert analyze_response.status_code == 200
     analyze_payload = analyze_response.get_json()
-    assert analyze_payload["annotated_count"] == 13
+    assert analyze_payload["annotated_count"] == 16
     assert analyze_payload["kiss_frame"]["annotated_url"].startswith("/media/preview/")
-    assert len(analyze_payload["lead_in_frames"]) == 12
+    assert len(analyze_payload["lead_in_frames"]) == 15
     assert all(frame["annotated_url"].startswith("/media/preview/") for frame in analyze_payload["lead_in_frames"])
 
 
