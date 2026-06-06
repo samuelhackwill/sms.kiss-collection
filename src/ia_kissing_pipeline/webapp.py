@@ -125,7 +125,7 @@ FILMS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a> | <a href="{{ url_for('what_is_a_kiss_page') }}">What Is A Kiss</a></p>
   <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
     <h1 style="margin:0;">Film Database</h1>
     {% for stat in tag_stats %}
@@ -1344,11 +1344,17 @@ WHAT_IS_A_KISS_TEMPLATE = """
     body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
     a { color: var(--link); text-decoration: none; }
     .page { display: grid; gap: 16px; }
-    .row { display: grid; grid-template-columns: minmax(260px, 320px) minmax(200px, 260px) minmax(0, 1fr); gap: 16px; align-items: start; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 16px; padding: 14px; }
+    .row { display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr); gap: 16px; align-items: start; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 16px; padding: 14px; }
     .clip-column video { width: 100%; display: block; background: #000; border-radius: 10px; }
-    .kiss-column img { width: 100%; display: block; background: #000; border-radius: 10px; }
+    .kiss-frame-block { margin-top: 12px; }
+    .kiss-frame-block img { width: 100%; display: block; background: #000; border-radius: 10px; }
     .frames-column { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
     .frames-column img { width: 100%; display: block; background: #000; border-radius: 8px; }
+    .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+    .load-button { border: 1px solid var(--border); background: #182334; color: var(--text); border-radius: 999px; padding: 6px 12px; cursor: pointer; font: inherit; }
+    .load-button[disabled] { opacity: 0.6; cursor: wait; }
+    .status { color: var(--muted); font-size: 12px; }
+    .frame-placeholder { min-height: 160px; border: 1px dashed var(--border); border-radius: 10px; display: grid; place-items: center; color: var(--muted); background: rgba(0, 0, 0, 0.2); }
     .meta { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
     .section-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
     .empty { padding: 24px; border: 1px solid var(--border); border-radius: 16px; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); }
@@ -1367,22 +1373,35 @@ WHAT_IS_A_KISS_TEMPLATE = """
   {% if rows %}
     <div class="page">
       {% for row in rows %}
-        <div class="row">
+        <div class="row" data-load-url="{{ row['load_frames_url'] }}">
           <div class="clip-column">
             <div class="section-title">Confirmed Clip</div>
             <div class="meta">{{ row["title"] }} | clip {{ row["id"] }} | kiss {{ "%.2f"|format(row["kiss_start_seconds"]) }}s</div>
+            <div class="controls">
+              <button class="load-button" type="button">Load Frames</button>
+              <button class="load-button analyze-button" type="button">Analyze In Roboflow</button>
+              <span class="status">{% if row["frames_ready"] %}Frames cached on disk.{% else %}Frames not loaded yet.{% endif %}</span>
+            </div>
             <video controls preload="metadata" src="{{ row['clip_media_url'] }}"></video>
-          </div>
-          <div class="kiss-column">
-            <div class="section-title">Kiss Frame</div>
-            <img src="{{ row['kiss_frame_url'] }}" alt="Kiss frame for clip {{ row['id'] }}">
+            <div class="kiss-frame-block" data-analyze-url="{{ row['analyze_frames_url'] }}">
+              <div class="section-title">Kiss Frame</div>
+              {% if row["kiss_frame_url"] %}
+                <img src="{{ row['kiss_frame_url'] }}" alt="Kiss frame for clip {{ row['id'] }}">
+              {% else %}
+                <div class="frame-placeholder">Load frames to render the kiss moment.</div>
+              {% endif %}
+            </div>
           </div>
           <div>
             <div class="section-title">Lead-In Frames</div>
             <div class="frames-column">
-              {% for frame in row["lead_in_frames"] %}
-                <img src="{{ frame['media_url'] }}" alt="Lead-in frame {{ loop.index }} for clip {{ row['id'] }}">
-              {% endfor %}
+              {% if row["lead_in_frames"] %}
+                {% for frame in row["lead_in_frames"] %}
+                  <img src="{{ frame['media_url'] }}" alt="Lead-in frame {{ loop.index }} for clip {{ row['id'] }}">
+                {% endfor %}
+              {% else %}
+                <div class="frame-placeholder">Load frames to inspect the lead-in.</div>
+              {% endif %}
             </div>
           </div>
         </div>
@@ -1391,6 +1410,86 @@ WHAT_IS_A_KISS_TEMPLATE = """
   {% else %}
     <div class="empty">No kiss clips with saved kiss timing yet.</div>
   {% endif %}
+<script>
+  async function loadWhatIsAKissFrames(row) {
+    const button = row.querySelector(".load-button");
+    const status = row.querySelector(".status");
+    const kissColumn = row.querySelector(".kiss-frame-block");
+    const framesColumn = row.querySelector(".frames-column");
+    const loadUrl = row.dataset.loadUrl;
+    if (!loadUrl) return;
+    button.disabled = true;
+    status.textContent = "Loading frames...";
+    try {
+      const response = await fetch(loadUrl, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "Failed to load frames.");
+      }
+      kissColumn.innerHTML = '<div class="section-title">Kiss Frame</div>';
+      const kissImage = document.createElement("img");
+      kissImage.src = payload.kiss_frame_url;
+      kissImage.alt = `Kiss frame for clip ${payload.id}`;
+      kissColumn.appendChild(kissImage);
+
+      framesColumn.innerHTML = "";
+      payload.lead_in_frames.forEach((frame, index) => {
+        const image = document.createElement("img");
+        image.src = frame.media_url;
+        image.alt = `Lead-in frame ${index + 1} for clip ${payload.id}`;
+        framesColumn.appendChild(image);
+      });
+      status.textContent = `Loaded ${payload.lead_in_frames.length + 1} frames.`;
+    } catch (error) {
+      status.textContent = error.message || "Failed to load frames.";
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function analyzeWhatIsAKissFrames(row) {
+    const button = row.querySelector(".analyze-button");
+    const status = row.querySelector(".status");
+    const kissColumn = row.querySelector(".kiss-frame-block");
+    const framesColumn = row.querySelector(".frames-column");
+    const analyzeUrl = kissColumn?.dataset.analyzeUrl;
+    if (!analyzeUrl) return;
+    button.disabled = true;
+    status.textContent = "Sending frames to Roboflow...";
+    try {
+      const response = await fetch(analyzeUrl, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || "Failed to analyze frames.");
+      }
+      kissColumn.innerHTML = '<div class="section-title">Kiss Frame</div>';
+      const kissImage = document.createElement("img");
+      kissImage.src = payload.kiss_frame.annotated_url || payload.kiss_frame.media_url;
+      kissImage.alt = `Annotated kiss frame for clip ${payload.id}`;
+      kissColumn.appendChild(kissImage);
+
+      framesColumn.innerHTML = "";
+      payload.lead_in_frames.forEach((frame, index) => {
+        const image = document.createElement("img");
+        image.src = frame.annotated_url || frame.media_url;
+        image.alt = `Annotated lead-in frame ${index + 1} for clip ${payload.id}`;
+        framesColumn.appendChild(image);
+      });
+      status.textContent = `Roboflow answered for ${payload.annotated_count} frames.`;
+    } catch (error) {
+      status.textContent = error.message || "Failed to analyze frames.";
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  document.querySelectorAll(".row[data-load-url]").forEach((row) => {
+    const button = row.querySelector(".load-button");
+    button?.addEventListener("click", () => loadWhatIsAKissFrames(row));
+    const analyzeButton = row.querySelector(".analyze-button");
+    analyzeButton?.addEventListener("click", () => analyzeWhatIsAKissFrames(row));
+  });
+</script>
 </body>
 </html>
 """
@@ -1780,6 +1879,44 @@ def create_app() -> Flask:
         with get_connection(settings.db_path) as conn:
             clips = _load_kiss_reference_rows(conn, settings)
         return render_template_string(WHAT_IS_A_KISS_TEMPLATE, rows=clips)
+
+    @app.post("/what-is-a-kiss/<int:clip_id>/load-frames")
+    def what_is_a_kiss_load_frames(clip_id: int):
+        with get_connection(settings.db_path) as conn:
+            clip = _load_kiss_reference_clip(conn, settings, clip_id)
+        if clip is None:
+            return jsonify({"error": "Clip not found."}), 404
+        frame_assets = _ensure_what_is_a_kiss_frames(settings, clip)
+        return jsonify(
+            {
+                "id": clip["id"],
+                "kiss_frame_url": frame_assets["kiss_frame_url"],
+                "lead_in_frames": frame_assets["lead_in_frames"],
+            }
+        )
+
+    @app.post("/what-is-a-kiss/<int:clip_id>/analyze-frames")
+    def what_is_a_kiss_analyze_frames(clip_id: int):
+        if not settings.roboflow_api_key:
+            return jsonify({"error": "Missing ROBOFLOW_API_KEY in your environment."}), 400
+        if not settings.roboflow_workspace_name or not settings.roboflow_workflow_id:
+            return jsonify({"error": "Missing ROBOFLOW_WORKSPACE_NAME or ROBOFLOW_WORKFLOW_ID in your environment."}), 400
+        with get_connection(settings.db_path) as conn:
+            clip = _load_kiss_reference_clip(conn, settings, clip_id)
+        if clip is None:
+            return jsonify({"error": "Clip not found."}), 404
+        try:
+            analysis = _ensure_what_is_a_kiss_roboflow_outputs(settings, clip)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 500
+        return jsonify(
+            {
+                "id": clip["id"],
+                "kiss_frame": analysis["kiss_frame"],
+                "lead_in_frames": analysis["lead_in_frames"],
+                "annotated_count": analysis["annotated_count"],
+            }
+        )
 
     @app.get("/review_data")
     def review_data_index():
@@ -3480,14 +3617,10 @@ def _hydrate_clip_rows(rows, clips_dir: Path) -> list[dict]:
 
 
 def _load_kiss_reference_rows(conn, settings) -> list[dict]:
-    clips = [
-        clip
-        for clip in _load_clips(conn, settings.clips_dir, tag="kiss")
-        if clip.get("kiss_start_seconds") is not None
-    ]
+    clips = _load_kiss_reference_clips(conn, settings)
     rows: list[dict] = []
     for clip in clips:
-        frame_assets = _ensure_what_is_a_kiss_frames(settings, clip)
+        frame_assets = _what_is_a_kiss_frame_assets(settings, clip)
         rows.append(
             {
                 "id": clip["id"],
@@ -3496,9 +3629,49 @@ def _load_kiss_reference_rows(conn, settings) -> list[dict]:
                 "clip_media_url": url_for("media_file", kind=clip["kind"], relpath=clip["relpath"]),
                 "kiss_frame_url": frame_assets["kiss_frame_url"],
                 "lead_in_frames": frame_assets["lead_in_frames"],
+                "frames_ready": frame_assets["frames_ready"],
+                "load_frames_url": url_for("what_is_a_kiss_load_frames", clip_id=int(clip["id"])),
+                "analyze_frames_url": url_for("what_is_a_kiss_analyze_frames", clip_id=int(clip["id"])),
             }
         )
     return rows
+
+
+def _load_kiss_reference_clips(conn, settings) -> list[dict]:
+    return [
+        clip
+        for clip in _load_clips(conn, settings.clips_dir, tag="kiss")
+        if clip.get("kiss_start_seconds") is not None
+    ]
+
+
+def _load_kiss_reference_clip(conn, settings, clip_id: int) -> dict | None:
+    for clip in _load_kiss_reference_clips(conn, settings):
+        if int(clip["id"]) == clip_id:
+            return clip
+    return None
+
+
+def _what_is_a_kiss_frame_assets(settings, clip: dict) -> dict[str, object]:
+    clip_dir = settings.preview_dir / "what-is-a-kiss" / f"clip-{int(clip['id']):04d}"
+    kiss_frame_path = clip_dir / "kiss" / "kiss.jpg"
+    lead_dir = clip_dir / "lead-in"
+    lead_in_frames: list[dict[str, str]] = []
+    for frame_path in sorted(lead_dir.glob("frame_*.jpg")):
+        lead_in_frames.append(
+            {
+                "media_url": url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+            }
+        )
+    return {
+        "frames_ready": kiss_frame_path.exists() and bool(lead_in_frames),
+        "kiss_frame_url": (
+            url_for("media_file", kind="preview", relpath=str(kiss_frame_path.relative_to(settings.preview_dir)))
+            if kiss_frame_path.exists()
+            else None
+        ),
+        "lead_in_frames": lead_in_frames,
+    }
 
 
 def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
@@ -3514,12 +3687,14 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     _ensure_video_frame(clip_path, kiss_frame_path, kiss_start_seconds)
 
     lead_in_frames: list[dict[str, str]] = []
-    lead_start = max(0.0, kiss_start_seconds - 5.0)
+    lead_frame_count = 12
+    lead_frame_step = 1.0 / 12.0
+    lead_start = max(0.0, kiss_start_seconds - (lead_frame_count * lead_frame_step))
     frame_times: list[float] = []
     current_time = lead_start
-    while current_time < kiss_start_seconds and len(frame_times) < 20:
+    while current_time < kiss_start_seconds and len(frame_times) < lead_frame_count:
         frame_times.append(current_time)
-        current_time += 0.25
+        current_time += lead_frame_step
     for index, timestamp in enumerate(frame_times, start=1):
         frame_path = lead_dir / f"frame_{index:02d}.jpg"
         _ensure_video_frame(clip_path, frame_path, timestamp)
@@ -3531,6 +3706,64 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     return {
         "kiss_frame_url": url_for("media_file", kind="preview", relpath=str(kiss_frame_path.relative_to(settings.preview_dir))),
         "lead_in_frames": lead_in_frames,
+    }
+
+
+def _ensure_what_is_a_kiss_roboflow_outputs(settings, clip: dict) -> dict[str, object]:
+    clip_dir = settings.preview_dir / "what-is-a-kiss" / f"clip-{int(clip['id']):04d}"
+    frame_assets = _ensure_what_is_a_kiss_frames(settings, clip)
+    kiss_source_path = clip_dir / "kiss" / "kiss.jpg"
+    lead_source_paths = sorted((clip_dir / "lead-in").glob("frame_*.jpg"))
+    roboflow_dir = clip_dir / "roboflow"
+    roboflow_dir.mkdir(parents=True, exist_ok=True)
+
+    kiss_frame = _ensure_what_is_a_kiss_roboflow_frame(
+        settings,
+        kiss_source_path,
+        roboflow_dir / "kiss.png",
+        roboflow_dir / "kiss.json",
+        frame_assets["kiss_frame_url"],
+    )
+    lead_in_frames: list[dict[str, str | None]] = []
+    for index, frame_path in enumerate(lead_source_paths, start=1):
+        lead_in_frames.append(
+            _ensure_what_is_a_kiss_roboflow_frame(
+                settings,
+                frame_path,
+                roboflow_dir / f"frame_{index:02d}.png",
+                roboflow_dir / f"frame_{index:02d}.json",
+                url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+            )
+        )
+    annotated_count = sum(1 for frame in [kiss_frame, *lead_in_frames] if frame["annotated_url"])
+    return {
+        "kiss_frame": kiss_frame,
+        "lead_in_frames": lead_in_frames,
+        "annotated_count": annotated_count,
+    }
+
+
+def _ensure_what_is_a_kiss_roboflow_frame(
+    settings,
+    source_path: Path,
+    annotated_path: Path,
+    predictions_path: Path,
+    fallback_url: str,
+) -> dict[str, str | None]:
+    if not source_path.exists():
+        raise FileNotFoundError(f"Frame file not found: {source_path}")
+    if not annotated_path.exists() and not predictions_path.exists():
+        rendered_bytes, predictions_payload = _run_roboflow_kiss_detector(settings, source_path)
+        _save_workflow_predictions(predictions_payload, predictions_path)
+        if rendered_bytes is not None:
+            _save_rendered_workflow_image(rendered_bytes, annotated_path)
+    return {
+        "media_url": fallback_url,
+        "annotated_url": (
+            url_for("media_file", kind="preview", relpath=str(annotated_path.relative_to(settings.preview_dir)))
+            if annotated_path.exists()
+            else None
+        ),
     }
 
 

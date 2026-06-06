@@ -1,4 +1,5 @@
 from __future__ import annotations
+import io
 import json
 from pathlib import Path
 
@@ -904,6 +905,9 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("IA_KISSING_USE_CODEX_TEXT_GATE", "0")
     monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "test-key")
+    monkeypatch.setenv("ROBOFLOW_WORKSPACE_NAME", "test-workspace")
+    monkeypatch.setenv("ROBOFLOW_WORKFLOW_ID", "test-workflow")
 
     settings = load_settings()
     settings.ensure_directories()
@@ -941,12 +945,23 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
             (str(kiss_clip_path), str(missing_timing_path), str(other_tag_path)),
         )
 
+    extracted_frames: list[float] = []
+
     def fake_ensure_video_frame(video_path: Path, output_path: Path, seconds: float) -> Path:
+        extracted_frames.append(seconds)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (64, 36), "black").save(output_path, format="JPEG")
         return output_path
 
     monkeypatch.setattr("ia_kissing_pipeline.webapp._ensure_video_frame", fake_ensure_video_frame)
+
+    def fake_run_roboflow(settings, frame_path: Path, *, use_workflow_cache: bool = True) -> tuple[bytes | None, object]:
+        image = Image.new("RGB", (64, 36), "red")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue(), {"predictions": [{"class": "head", "confidence": 0.9}]}
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._run_roboflow_kiss_detector", fake_run_roboflow)
 
     app = create_app()
     client = app.test_client()
@@ -958,6 +973,26 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
     assert b"kiss 1.25s" in response.data
     assert b"clip 2" not in response.data
     assert b"dance" not in response.data
+    assert not extracted_frames
+
+    films_response = client.get("/films")
+    assert films_response.status_code == 200
+    assert b"What Is A Kiss" in films_response.data
+
+    load_response = client.post("/what-is-a-kiss/1/load-frames")
+    assert load_response.status_code == 200
+    load_payload = load_response.get_json()
+    assert load_payload["kiss_frame_url"].startswith("/media/preview/")
+    assert len(load_payload["lead_in_frames"]) == 12
+    assert len(extracted_frames) == 13
+
+    analyze_response = client.post("/what-is-a-kiss/1/analyze-frames")
+    assert analyze_response.status_code == 200
+    analyze_payload = analyze_response.get_json()
+    assert analyze_payload["annotated_count"] == 13
+    assert analyze_payload["kiss_frame"]["annotated_url"].startswith("/media/preview/")
+    assert len(analyze_payload["lead_in_frames"]) == 12
+    assert all(frame["annotated_url"].startswith("/media/preview/") for frame in analyze_payload["lead_in_frames"])
 
 
 def test_force_exclude_marks_review_and_cleans_artifacts(tmp_path: Path, monkeypatch) -> None:
