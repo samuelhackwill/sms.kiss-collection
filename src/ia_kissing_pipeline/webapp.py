@@ -10,6 +10,7 @@ import sqlite3
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import re
 import zipfile
@@ -23,8 +24,9 @@ from ia_kissing_pipeline.config import load_settings
 from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.main import _resolve_source_video
 from ia_kissing_pipeline.ingest.ia_client import IAClient
-from ia_kissing_pipeline.ingest.ia_ingest import ingest_from_ia, make_checkpoint_key
+from ia_kissing_pipeline.ingest.ia_ingest import ingest_from_ia, make_checkpoint_key, normalize_item
 from ia_kissing_pipeline.main import run_metadata_scoring
+from ia_kissing_pipeline.scoring.metadata_rules import score_metadata
 from ia_kissing_pipeline.utils.time import utc_now_iso
 
 
@@ -35,6 +37,42 @@ QUEUE_INGEST_ROWS = 4
 QUEUE_STALE_SECONDS = 600
 QUEUE_NAME = "download_batch"
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+CODE_ARCHIVE_EXCLUDED_TOP_LEVEL = {
+    ".venv",
+    "data",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    "__pycache__",
+}
+CODE_ARCHIVE_EXCLUDED_FILE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    ".env.test",
+}
+CODE_ARCHIVE_EXCLUDED_SUFFIXES = {
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".pyc",
+    ".pyo",
+    ".log",
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".wav",
+    ".flac",
+    ".mp3",
+    ".zip",
+}
 
 
 EMPTY_TEMPLATE = """
@@ -52,7 +90,7 @@ EMPTY_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div class="panel">
     <h1>No Ready Film Yet</h1>
     <p>The review queue is being filled in the background.</p>
@@ -125,7 +163,7 @@ FILMS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a> | <a href="{{ url_for('what_is_a_kiss_page') }}">What Is A Kiss</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a> | <a href="{{ url_for('what_is_a_kiss_page') }}">What Is A Kiss</a></p>
   <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
     <h1 style="margin:0;">Film Database</h1>
     {% for stat in tag_stats %}
@@ -357,7 +395,7 @@ ADMIN_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div class="panel">
     <h1 style="margin-top:0;">Admin</h1>
     <p class="muted">Launch the get more films batch from the web UI. This queues the same download-batch flow used by the Python tooling.</p>
@@ -382,6 +420,142 @@ ADMIN_TEMPLATE = """
       {% endif %}
     </div>
   </div>
+</body>
+</html>
+"""
+
+
+INGESTOR_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>IA Kissing Ingestor</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #0f141b; --border: #263244; --text: #edf3ff; --muted: #94a4bd; --link: #7cc7ff; --active: #87f0ae; --warn: #ffcf75; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    .panel { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 18px; padding: 18px; margin-bottom: 18px; box-shadow: 0 18px 60px rgba(0,0,0,0.28); }
+    .muted { color: var(--muted); }
+    form { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 12px; align-items: end; }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+    input { padding: 9px 10px; border-radius: 10px; border: 1px solid var(--border); background: #0d1117; color: var(--text); }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #3b495d; background: #2a3442; color: #d9e5f7; cursor: pointer; }
+    .machine { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+    .state { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: #0b1016; }
+    .state.active { border-color: #2d7f55; box-shadow: inset 0 0 0 1px rgba(135,240,174,0.24); }
+    .state-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; }
+    .state-value { font: 13px/1.4 monospace; color: #d7e5f7; white-space: pre-wrap; }
+    .film-card { border: 1px solid var(--border); border-radius: 16px; overflow: hidden; margin-top: 16px; background: #0b1016; }
+    .film-head { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+    .film-title { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+    .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; border: 1px solid #324054; background: #1b2430; color: #c8d5e6; font-size: 12px; }
+    .badge.blocked { background: #3a2025; border-color: #8d4b58; color: #ffd3db; }
+    .badge.ok { background: #103923; border-color: #26714a; color: var(--active); }
+    .film-grid { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr); gap: 16px; padding: 16px; }
+    .subpanel { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: #111720; }
+    .subpanel h3 { margin: 0 0 10px 0; font-size: 14px; }
+    .mono { font: 12px/1.5 monospace; color: #d7e5f7; white-space: pre-wrap; word-break: break-word; }
+    .dup-list { display: grid; gap: 10px; }
+    .dup-item { border: 1px solid #314056; border-radius: 12px; padding: 10px; background: #0b1016; }
+    .dup-title { font-weight: 700; margin-bottom: 4px; }
+    .dup-meta { color: var(--muted); font-size: 12px; }
+    @media (max-width: 1050px) {
+      form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .machine, .film-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <div class="panel">
+    <h1 style="margin-top:0;">Ingestor</h1>
+    <p class="muted">Dry-run only. This page mirrors the current ingestor state machine: checkpoint, Internet Archive search, metadata normalization, then duplicate-title search across Archive metadata.</p>
+    <form method="get" action="{{ url_for('ingestor_index') }}">
+      <label>Query <input type="text" name="query" value="{{ form_data['query'] }}"></label>
+      <label>Start page <input type="number" min="1" name="page" value="{{ form_data['page'] }}"></label>
+      <label>Limit <input type="number" min="1" max="20" name="limit" value="{{ form_data['limit'] }}"></label>
+      <label>Rows per IA hit <input type="number" min="1" max="20" name="rows" value="{{ form_data['rows'] }}"></label>
+      <label>Duplicate hits <input type="number" min="1" max="12" name="duplicate_rows" value="{{ form_data['duplicate_rows'] }}"></label>
+      <button type="submit" name="run" value="1">Run Dry Ingest</button>
+    </form>
+    <div class="machine">
+      <div class="state {{ 'active' if state['checkpoint'] else '' }}">
+        <div class="state-title">1. Checkpoint</div>
+        <div class="state-value">{{ checkpoint_text }}</div>
+      </div>
+      <div class="state {{ 'active' if state['search'] else '' }}">
+        <div class="state-title">2. IA Search</div>
+        <div class="state-value">{{ search_text }}</div>
+      </div>
+      <div class="state {{ 'active' if state['metadata'] else '' }}">
+        <div class="state-title">3. Metadata Debug</div>
+        <div class="state-value">{{ metadata_text }}</div>
+      </div>
+      <div class="state {{ 'active' if state['duplicates'] else '' }}">
+        <div class="state-title">4. Duplicate Probe</div>
+        <div class="state-value">{{ duplicate_text }}</div>
+      </div>
+    </div>
+  </div>
+  {% for film in results %}
+    <div class="film-card">
+      <div class="film-head">
+        <div class="film-title">{{ film['metadata']['title'] }}</div>
+        <div class="badges">
+          <span class="badge">{{ film['metadata']['archive_identifier'] }}</span>
+          <span class="badge">{{ film['metadata']['collection'] or 'no collection' }}</span>
+          <span class="badge">{{ film['metadata']['language'] or 'language unknown' }}</span>
+          <span class="badge {{ 'blocked' if film['score']['blocked'] else 'ok' }}">{{ 'excluded_metadata' if film['score']['blocked'] else 'metadata_scored' }}</span>
+        </div>
+      </div>
+      <div class="film-grid">
+        <div class="subpanel">
+          <h3>Metadata Summary</h3>
+          <div class="mono">year={{ film['metadata']['year'] or 'unknown' }}
+language={{ film['metadata']['language'] or 'unknown' }}
+runtime_seconds={{ film['metadata']['runtime_seconds'] or 'unknown' }}
+creator={{ film['metadata']['creator'] or 'unknown' }}
+subjects={{ film['metadata']['subjects']|join(', ') if film['metadata']['subjects'] else 'none' }}
+item_url={{ film['metadata']['item_url'] }}</div>
+        </div>
+        <div class="subpanel">
+          <h3>Heuristics And Decisions</h3>
+          <div class="dup-list">
+            {% for item in film['heuristics'] %}
+              <div class="dup-item">
+                <div class="dup-title">{{ item['heuristic'] }}</div>
+                <div class="mono">{{ item['decision'] }}</div>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      </div>
+      <div class="film-grid" style="padding-top:0;">
+        <div class="subpanel" style="grid-column: 1 / -1;">
+          <h3>Internet Archive Duplicate Title Hits</h3>
+          {% if film['duplicate_hits'] %}
+            <div class="dup-list">
+              {% for item in film['duplicate_hits'] %}
+                <div class="dup-item">
+                  <div class="dup-title"><a href="{{ item['item_url'] }}" target="_blank" rel="noreferrer">{{ item['title'] }}</a></div>
+                  <div class="dup-meta">{{ item['archive_identifier'] }} | year={{ item['year'] or 'unknown' }} | language={{ item['language'] or 'unknown' }} | collection={{ item['collection'] or 'unknown' }}</div>
+                  <div class="mono">decision={{ item['decision'] }}
+has_video_source={{ 'yes' if item['has_video_source'] else 'no' }}
+media_gate={{ item['media_gate_reason'] or 'none' }}
+variant_flags={{ item['variant_flags']|map(attribute='decision')|join(', ') if item['variant_flags'] else 'none' }}
+metadata_block={{ item['metadata_block_reasons']|join(', ') if item['metadata_block_reasons'] else 'none' }}</div>
+                </div>
+              {% endfor %}
+            </div>
+          {% else %}
+            <div class="muted">No sibling hits found for the same title.</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  {% endfor %}
 </body>
 </html>
 """
@@ -462,7 +636,7 @@ FILM_TEMPLATE = """
 </head>
 <body class="debug-off">
   <div class="topbar">
-    <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+    <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
     <button type="button" id="debug-toggle" class="debug-toggle">Debug: Off</button>
   </div>
   <h1 class="debug-only">{{ film["title"] }}</h1>
@@ -1369,7 +1543,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <h1>What Is A Kiss</h1>
   {% if rows %}
     <div class="page">
@@ -1536,7 +1710,7 @@ REVIEW_DATA_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <h1>Review Data</h1>
   {% for section in sections %}
     <details class="section" {% if section["open"] %}open{% endif %}>
@@ -1887,6 +2061,73 @@ def create_app() -> Flask:
         with get_connection(settings.db_path) as conn:
             clips = _load_kiss_reference_rows(conn, settings)
         return render_template_string(WHAT_IS_A_KISS_TEMPLATE, rows=clips)
+
+    @app.get("/ingestor")
+    def ingestor_index():
+        default_query = request.args.get("query", type=str) or QUEUE_INGEST_QUERY
+        with get_connection(settings.db_path) as conn:
+            checkpoint = _load_ingest_checkpoint(conn, default_query)
+        default_page = int(request.args.get("page", type=int) or (checkpoint["next_page"] if checkpoint else 1))
+        form_data = {
+            "query": default_query,
+            "page": max(1, default_page),
+            "limit": max(1, min(20, request.args.get("limit", type=int) or QUEUE_INGEST_LIMIT)),
+            "rows": max(1, min(20, request.args.get("rows", type=int) or QUEUE_INGEST_ROWS)),
+            "duplicate_rows": max(1, min(12, request.args.get("duplicate_rows", type=int) or 6)),
+        }
+        results: list[dict] = []
+        state = {"checkpoint": True, "search": False, "metadata": False, "duplicates": False}
+        search_text = "waiting for dry run"
+        metadata_text = "no normalized films yet"
+        duplicate_text = "no duplicate-title probe yet"
+        if request.args.get("run") == "1":
+            dry_run = _run_ingestor_dry_run(
+                settings,
+                query=form_data["query"],
+                start_page=form_data["page"],
+                limit=form_data["limit"],
+                rows=form_data["rows"],
+                duplicate_rows=form_data["duplicate_rows"],
+            )
+            results = dry_run["results"]
+            state = {
+                "checkpoint": True,
+                "search": dry_run["docs_seen"] > 0,
+                "metadata": bool(results),
+                "duplicates": any(item["duplicate_hits"] for item in results),
+            }
+            search_text = (
+                f"query={dry_run['query']}\n"
+                f"start_page={dry_run['start_page']}\n"
+                f"pages_hit={dry_run['pages_hit']}\n"
+                f"films_seen={dry_run['docs_seen']}"
+            )
+            metadata_text = (
+                f"normalized_films={len(results)}\n"
+                f"blocked={sum(1 for item in results if item['score']['blocked'])}"
+            )
+            duplicate_text = (
+                f"films_with_siblings={sum(1 for item in results if item['duplicate_hits'])}\n"
+                f"total_sibling_hits={sum(len(item['duplicate_hits']) for item in results)}"
+            )
+        checkpoint_text = (
+            f"query={default_query}\n"
+            f"next_page={checkpoint['next_page']}\n"
+            f"fetched_count={checkpoint['fetched_count']}\n"
+            f"status={checkpoint['status']}"
+            if checkpoint
+            else f"query={default_query}\nno checkpoint yet"
+        )
+        return render_template_string(
+            INGESTOR_TEMPLATE,
+            form_data=form_data,
+            checkpoint_text=checkpoint_text,
+            search_text=search_text,
+            metadata_text=metadata_text,
+            duplicate_text=duplicate_text,
+            state=state,
+            results=results,
+        )
 
     @app.post("/what-is-a-kiss/<int:clip_id>/load-frames")
     def what_is_a_kiss_load_frames(clip_id: int):
@@ -2326,11 +2567,8 @@ def create_app() -> Flask:
 
     @app.get("/source")
     def source_archive():
-        path = Path("/home/bot/ia-kissing-pipeline-code.zip")
-        if not path.exists():
-            abort(404)
         return send_file(
-            path,
+            _build_source_archive_bytes(),
             mimetype="application/zip",
             as_attachment=True,
             download_name="ia-kissing-pipeline-code.zip",
@@ -3637,6 +3875,414 @@ def _hydrate_clip_rows(rows, clips_dir: Path) -> list[dict]:
         item["kind"] = kind
         clips.append(item)
     return clips
+
+
+def _load_ingest_checkpoint(conn, query: str) -> dict | None:
+    checkpoint_key = make_checkpoint_key(query)
+    row = conn.execute(
+        """
+        SELECT checkpoint_key, query_text, next_page, fetched_count, max_items, status, last_error, updated_at
+        FROM ingest_checkpoints
+        WHERE checkpoint_key = ?
+        """,
+        (checkpoint_key,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _code_archive_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _should_exclude_from_code_archive(root: Path, path: Path) -> bool:
+    rel = path.relative_to(root)
+    parts = rel.parts
+    if not parts:
+        return True
+    if parts[0] in CODE_ARCHIVE_EXCLUDED_TOP_LEVEL:
+        return True
+    if any(part == "__pycache__" for part in parts):
+        return True
+    name = path.name
+    if name in CODE_ARCHIVE_EXCLUDED_FILE_NAMES:
+        return True
+    if name.startswith(".env."):
+        return True
+    if path.suffix.lower() in CODE_ARCHIVE_EXCLUDED_SUFFIXES:
+        return True
+    return False
+
+
+def _build_source_archive_bytes() -> io.BytesIO:
+    root = _code_archive_root()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            if _should_exclude_from_code_archive(root, path):
+                continue
+            archive.write(path, arcname=str(path.relative_to(root)))
+    buffer.seek(0)
+    return buffer
+
+
+INGESTOR_VARIANT_FLAGS = {
+    "restored": ("restored", "restoration variant"),
+    "colorized": ("colorized", "colorized variant"),
+    "colourized": ("colourized", "colorized variant"),
+    "dubbed": ("dubbed", "dubbed/overdubbed variant"),
+    "remastered": ("remastered", "remaster variant"),
+    "spanish": ("spanish", "language-specific variant"),
+    "french": ("french", "language-specific variant"),
+    "german": ("german", "language-specific variant"),
+    "italian": ("italian", "language-specific variant"),
+    "turkish": ("turkish", "language-specific variant"),
+}
+
+
+def _detect_ingestor_variant_flags(*parts: str | None) -> list[dict[str, str]]:
+    haystack = " ".join(part or "" for part in parts).lower()
+    flags: list[dict[str, str]] = []
+    for token, meaning in INGESTOR_VARIANT_FLAGS.values():
+        if token in haystack:
+            flags.append({"signal": token, "decision": meaning})
+    return flags
+
+
+def _call_codex_ingestor_title_canonicalizer(original_title: str, cleaned_title: str) -> dict[str, object]:
+    if os.getenv("IA_KISSING_USE_CODEX_TITLE_CANONICALIZER", "1") != "1":
+        return {"status": "disabled", "title": None}
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        return {"status": "missing_codex", "title": None}
+
+    model = os.getenv("IA_KISSING_CODEX_MODEL", "gpt-5.4-mini")
+    timeout_seconds = float(os.getenv("IA_KISSING_CODEX_TIMEOUT_SECONDS", "20"))
+    workdir = Path(os.getenv("IA_KISSING_CODEX_WORKDIR", "/tmp/codex-text-gate"))
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    prompt = "\n".join(
+        [
+            "Normalize this film title for archival duplicate search.",
+            "Return only the most likely canonical original-language title as a single line.",
+            "Do not add commentary, quotes, punctuation fixes beyond the title itself, or multiple options.",
+            "If uncertain, return the cleaned candidate unchanged.",
+            f"Original title: {original_title}",
+            f"Cleaned candidate: {cleaned_title}",
+        ]
+    )
+
+    with tempfile.NamedTemporaryFile(prefix="codex-title-canonicalizer-", suffix=".txt", delete=False) as tmp_file:
+        output_path = Path(tmp_file.name)
+
+    try:
+        completed = subprocess.run(
+            [
+                codex_bin,
+                "exec",
+                "-C",
+                str(workdir),
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--ephemeral",
+                "-c",
+                'web_search="disabled"',
+                "--model",
+                model,
+                "--output-last-message",
+                str(output_path),
+                "-",
+            ],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=True,
+            timeout=timeout_seconds,
+        )
+        answer = output_path.read_text().strip()
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "status": "timeout",
+            "title": None,
+            "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else None,
+        }
+    except subprocess.CalledProcessError as exc:
+        return {
+            "status": "error",
+            "title": None,
+            "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else None,
+            "returncode": exc.returncode,
+        }
+    except OSError as exc:
+        return {"status": "oserror", "title": None, "error": str(exc)}
+    finally:
+        output_path.unlink(missing_ok=True)
+
+    if not answer:
+        return {
+            "status": "empty_output",
+            "title": None,
+            "stderr": (completed.stderr or "").strip() if completed.stderr else None,
+            "returncode": completed.returncode,
+        }
+    answer = re.sub(r"\s+", " ", answer).strip(" \"'")
+    if not answer:
+        return {
+            "status": "empty_output",
+            "title": None,
+            "stderr": (completed.stderr or "").strip() if completed.stderr else None,
+            "returncode": completed.returncode,
+        }
+    return {
+        "status": "ok",
+        "title": answer,
+        "stderr": (completed.stderr or "").strip() if completed.stderr else None,
+        "returncode": completed.returncode,
+        "model": model,
+    }
+
+
+def _canonicalize_ingestor_title(title: str) -> dict[str, object]:
+    original = (title or "").strip()
+    cleaned = re.sub(r"\s*[\(\[].*?[\)\]]\s*$", "", original)
+    cleaned = re.sub(r"\s*[\(\[].*?[\)\]]", "", cleaned)
+    cleaned = re.sub(r"\s*[-:|]\s*(?:restored|colorized|colourized|remastered|dubbed)\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|")
+    if not cleaned:
+        cleaned = original
+    decisions = []
+    if cleaned != original:
+        decisions.append(
+            {
+                "heuristic": "title cleanup",
+                "decision": f"canonicalized sibling-search title from {original!r} to {cleaned!r}",
+            }
+        )
+    else:
+        decisions.append(
+            {
+                "heuristic": "title cleanup",
+                "decision": "kept original title for sibling search",
+            }
+        )
+    codex_result = _call_codex_ingestor_title_canonicalizer(original, cleaned)
+    codex_title = codex_result.get("title")
+    if codex_result.get("status") == "ok" and codex_title and codex_title != cleaned:
+        decisions.append(
+            {
+                "heuristic": "codex title canonicalizer",
+                "decision": f"refined sibling-search title from {cleaned!r} to {codex_title!r}",
+            }
+        )
+        cleaned = codex_title
+    elif codex_result.get("status") == "ok" and codex_title:
+        decisions.append(
+            {
+                "heuristic": "codex title canonicalizer",
+                "decision": f"confirmed cleaned sibling-search title as {cleaned!r}",
+            }
+        )
+    else:
+        status = codex_result.get("status")
+        if status == "disabled":
+            detail = "disabled by environment flag"
+        elif status == "missing_codex":
+            detail = "codex binary not found on PATH"
+        elif status == "timeout":
+            detail = "timed out before returning a title"
+        elif status == "empty_output":
+            detail = "returned no final title"
+        elif status == "error":
+            detail = f"failed with exit code {codex_result.get('returncode')}"
+        elif status == "oserror":
+            detail = codex_result.get("error") or "OS error"
+        else:
+            detail = "no usable result"
+        stderr = codex_result.get("stderr")
+        if stderr:
+            detail = f"{detail}; stderr={stderr[:240]}"
+        decisions.append(
+            {
+                "heuristic": "codex title canonicalizer",
+                "decision": detail,
+            }
+        )
+    return {"canonical_title": cleaned, "decisions": decisions}
+
+
+def _same_title_query(title: str) -> str:
+    escaped = (title or "").replace('"', '\\"').strip()
+    return f'title:"{escaped}"'
+
+
+def _build_duplicate_hits(client: IAClient, title: str, archive_identifier: str, rows: int) -> dict[str, object]:
+    clean_title = (title or "").strip()
+    if not clean_title:
+        return {"query_title": clean_title, "hits": [], "decisions": []}
+    payload = client.fetch_search_page(_same_title_query(clean_title), page=1, rows=rows + 1)
+    hits = []
+    decisions = []
+    for doc in payload.get("response", {}).get("docs", []):
+        if doc.get("identifier") == archive_identifier:
+            continue
+        title_value = doc.get("title") or doc.get("identifier")
+        language_value = doc.get("language")
+        collection_value = doc.get("collection")
+        metadata_payload = client.fetch_metadata(doc["identifier"])
+        normalized = normalize_item(doc, metadata_payload)
+        metadata_score = score_metadata(
+            normalized["title"],
+            normalized["description"],
+            normalized["subjects"],
+            normalized["collection"],
+        )
+        has_video_source = any(file_info.get("is_video") for file_info in normalized.get("files", []))
+        flags = _detect_ingestor_variant_flags(
+            title_value,
+            normalized["description"],
+            str(language_value) if language_value is not None else "",
+            str(collection_value) if collection_value is not None else "",
+        )
+        rejected_as_variant = any(flag["signal"] in ("restored", "colorized", "colourized", "remastered") for flag in flags)
+        rejected_as_non_film = metadata_score.blocked or not has_video_source
+        accepted = not rejected_as_variant and not rejected_as_non_film
+        if rejected_as_variant:
+            decision = "reject as obvious derivative variant"
+        elif not has_video_source:
+            decision = "reject as non-film sibling"
+        elif rejected_as_non_film:
+            decision = "reject as non-film sibling"
+        else:
+            decision = "keep as sibling candidate"
+        hits.append(
+            {
+                "archive_identifier": doc.get("identifier"),
+                "title": normalized["title"],
+                "year": normalized["year"],
+                "language": normalized["language"],
+                "collection": normalized["collection"],
+                "item_url": normalized["item_url"],
+                "variant_flags": flags,
+                "has_video_source": has_video_source,
+                "media_gate_reason": None if has_video_source else "no video files on the Internet Archive item",
+                "metadata_blocked": metadata_score.blocked,
+                "metadata_block_reasons": [item["reason"] for item in metadata_score.reasons["hard_block_signals"]],
+                "accepted": accepted,
+                "decision": decision,
+            }
+        )
+        why = [flag["decision"] for flag in flags]
+        if not has_video_source:
+            why.append("no video files on the Internet Archive item")
+        if metadata_score.blocked:
+            why.extend(item["reason"] for item in metadata_score.reasons["hard_block_signals"])
+        decisions.append(
+            {
+                "identifier": doc.get("identifier"),
+                "decision": "accepted" if accepted else "rejected",
+                "why": why or ["same-title sibling candidate"],
+            }
+        )
+        if len(hits) >= rows:
+            break
+    return {"query_title": clean_title, "hits": hits, "decisions": decisions}
+
+
+def _run_ingestor_dry_run(settings, query: str, start_page: int, limit: int, rows: int, duplicate_rows: int) -> dict:
+    client = IAClient(settings.cache_dir, settings.user_agent, throttle_seconds=0.2)
+    page = max(1, start_page)
+    remaining = max(1, limit)
+    docs_seen = 0
+    pages_hit = 0
+    results: list[dict] = []
+
+    while remaining > 0:
+        page_rows = min(rows, remaining)
+        payload = client.fetch_search_page(query, page=page, rows=page_rows)
+        docs = payload.get("response", {}).get("docs", [])
+        pages_hit += 1
+        if not docs:
+            break
+        for doc in docs:
+            metadata_payload = client.fetch_metadata(doc["identifier"])
+            normalized = normalize_item(doc, metadata_payload)
+            score = score_metadata(
+                normalized["title"],
+                normalized["description"],
+                normalized["subjects"],
+                normalized["collection"],
+            )
+            score_payload = {"normalized_score": score.score, **score.reasons}
+            title_analysis = _canonicalize_ingestor_title(normalized["title"])
+            variant_flags = _detect_ingestor_variant_flags(
+                normalized["title"],
+                normalized["description"],
+                normalized["language"],
+                normalized["collection"],
+            )
+            duplicate_probe = _build_duplicate_hits(
+                client,
+                title_analysis["canonical_title"],
+                normalized["archive_identifier"],
+                duplicate_rows,
+            )
+            heuristics = [
+                {
+                    "heuristic": "metadata status",
+                    "decision": "excluded_metadata" if score.reasons["blocked"] else "metadata_scored",
+                },
+                *title_analysis["decisions"],
+                {
+                    "heuristic": "variant flags on candidate",
+                    "decision": ", ".join(flag["decision"] for flag in variant_flags) if variant_flags else "no obvious restored/colorized/dubbed markers",
+                },
+                {
+                    "heuristic": "positive metadata signals",
+                    "decision": ", ".join(
+                        f"{item['signal']} ({item['weight']:+.1f})" for item in score.reasons["positive_signals"]
+                    ) or "none",
+                },
+                {
+                    "heuristic": "negative metadata signals",
+                    "decision": ", ".join(
+                        f"{item['signal']} ({item['weight']:+.1f})" for item in score.reasons["negative_signals"]
+                    ) or "none",
+                },
+                {
+                    "heuristic": "hard blocks",
+                    "decision": ", ".join(item["reason"] for item in score.reasons["hard_block_signals"]) or "none",
+                },
+                {
+                    "heuristic": "duplicate-title search",
+                    "decision": f"searched Internet Archive for {duplicate_probe['query_title']!r} and found {len(duplicate_probe['hits'])} sibling hit(s)",
+                },
+            ]
+            results.append(
+                {
+                    "metadata": normalized,
+                    "title_analysis": title_analysis,
+                    "variant_flags": variant_flags,
+                    "score": score_payload,
+                    "heuristics": heuristics,
+                    "duplicate_hits": duplicate_probe["hits"],
+                    "duplicate_decisions": duplicate_probe["decisions"],
+                }
+            )
+            docs_seen += 1
+            remaining -= 1
+            if remaining <= 0:
+                break
+        page += 1
+
+    return {
+        "query": query,
+        "start_page": start_page,
+        "pages_hit": pages_hit,
+        "docs_seen": docs_seen,
+        "results": results,
+    }
 
 
 def _load_kiss_reference_rows(conn, settings) -> list[dict]:

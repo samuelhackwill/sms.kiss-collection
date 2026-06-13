@@ -156,7 +156,7 @@ def _call_codex_text_gate(
     if not codex_bin:
         return None
 
-    model = os.getenv("IA_KISSING_CODEX_MODEL", "gpt-5.1-codex-mini")
+    model = os.getenv("IA_KISSING_CODEX_MODEL", "gpt-5.4-mini")
     timeout_seconds = float(os.getenv("IA_KISSING_CODEX_TIMEOUT_SECONDS", "45"))
     workdir = Path(os.getenv("IA_KISSING_CODEX_WORKDIR", "/tmp/codex-text-gate"))
     workdir.mkdir(parents=True, exist_ok=True)

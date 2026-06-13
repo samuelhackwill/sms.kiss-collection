@@ -89,7 +89,7 @@ Configuration is environment-variable based. Defaults are relative to the curren
 | `IA_KISSING_SKIM_TIMEOUT_SECONDS` | `180` | Per-film skim build timeout in `scripts/getmorevids.py` |
 | `IA_KISSING_DISABLE_QUEUE_FILL` | unset | Test/dev switch to disable legacy queue fill behavior |
 | `IA_KISSING_USE_CODEX_TEXT_GATE` | `1` | Enables optional Codex text gate when that path is used |
-| `IA_KISSING_CODEX_MODEL` | `gpt-5.1-codex-mini` | Optional Codex model for text gating |
+| `IA_KISSING_CODEX_MODEL` | `gpt-5.4-mini` | Optional Codex model for text gating and title canonicalization |
 | `IA_KISSING_CODEX_TIMEOUT_SECONDS` | `45` | Optional Codex text gate timeout |
 | `IA_KISSING_CODEX_WORKDIR` | `/tmp/codex-text-gate` | Optional Codex text gate workdir |
 | `IA_KISSING_WEB_HOST` | `127.0.0.1` | Flask bind host |

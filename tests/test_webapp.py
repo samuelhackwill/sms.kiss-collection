@@ -14,6 +14,8 @@ from ia_kissing_pipeline.main import run_metadata_scoring
 from ia_kissing_pipeline.webapp import (
     _find_first_workflow_image,
     _build_manual_clip_now,
+    _canonicalize_ingestor_title,
+    _call_codex_ingestor_title_canonicalizer,
     _cleanup_nonpending_local_artifacts,
     _run_kiss_detector_now,
     _start_get_more_vids,
@@ -70,6 +72,251 @@ def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     assert clips_response.status_code == 200
     assert admin_response.status_code == 200
     assert b"Run Get More Films" in admin_response.data
+
+
+def test_ingestor_page_runs_dry_metadata_probe(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+
+    def fake_fetch_search_page(self, query: str, page: int, rows: int) -> dict:
+        if query.startswith('title:"Blind Alley"'):
+            return {
+                "response": {
+                    "docs": [
+                        {
+                            "identifier": "blind-alley_202407",
+                            "title": "Blind Alley",
+                            "year": 1939,
+                            "language": "eng",
+                            "collection": "feature_films_unsorted",
+                        },
+                        {
+                            "identifier": "blind-alley-colorized",
+                            "title": "Blind Alley (restored, colorized)",
+                            "year": 1939,
+                            "language": "eng",
+                            "collection": "feature_films_unsorted",
+                        },
+                        {
+                            "identifier": "blind-alley-es-dub",
+                            "title": "Blind Alley",
+                            "year": 1939,
+                            "language": "spa",
+                            "collection": "feature_films_unsorted",
+                        },
+                        {
+                            "identifier": "blind-alley-travelogue",
+                            "title": "Blind Alley Travelogue",
+                            "year": 1939,
+                            "language": "eng",
+                            "collection": "feature_films_unsorted",
+                        },
+                        {
+                            "identifier": "blind-alley-audio",
+                            "title": "Blind Alley OST",
+                            "year": 1939,
+                            "language": "eng",
+                            "collection": "opensource_audio",
+                        },
+                    ]
+                }
+            }
+        return {
+            "response": {
+                "docs": [
+                    {
+                        "identifier": "blind-alley_202407",
+                        "title": "Blind Alley",
+                        "year": 1939,
+                        "description": "Crime drama.",
+                        "subject": ["Crime", "Drama"],
+                        "creator": None,
+                        "collection": "feature_films_unsorted",
+                        "language": "eng",
+                        "runtime": None,
+                        "licenseurl": None,
+                    }
+                ]
+            }
+        }
+
+    def fake_fetch_metadata(self, identifier: str) -> dict:
+        if identifier == "blind-alley_202407":
+            return {
+                "metadata": {
+                    "title": "Blind Alley",
+                    "description": "Gangster Hal Wilson takes psychiatrist Dr. Shelby hostage.",
+                    "subject": ["Crime", "Drama"],
+                    "collection": "feature_films_unsorted",
+                    "language": "eng",
+                    "year": "1939",
+                },
+                "files": [],
+            }
+        if identifier == "blind-alley-colorized":
+            return {
+                "metadata": {
+                    "title": "Blind Alley (restored, colorized)",
+                    "description": "Restored edition of Blind Alley.",
+                    "subject": ["Crime", "Drama"],
+                    "collection": "feature_films_unsorted",
+                    "language": "eng",
+                    "year": "1939",
+                },
+                "files": [],
+            }
+        if identifier == "blind-alley-es-dub":
+            return {
+                "metadata": {
+                    "title": "Blind Alley",
+                    "description": "Spanish dub release.",
+                    "subject": ["Crime", "Drama"],
+                    "collection": "feature_films_unsorted",
+                    "language": "spa",
+                    "year": "1939",
+                },
+                "files": [],
+            }
+        if identifier == "blind-alley-travelogue":
+            return {
+                "metadata": {
+                    "title": "Blind Alley Travelogue",
+                    "description": "A travelogue documentary through urban backstreets.",
+                    "subject": ["travelogue", "documentary"],
+                    "collection": "feature_films_unsorted",
+                    "language": "eng",
+                    "year": "1939",
+                },
+                "files": [],
+            }
+        if identifier == "blind-alley-audio":
+            return {
+                "metadata": {
+                    "title": "Blind Alley OST",
+                    "description": "Audio soundtrack release.",
+                    "subject": ["soundtrack"],
+                    "collection": "opensource_audio",
+                    "language": "eng",
+                    "year": "1939",
+                },
+                "files": [
+                    {
+                        "name": "blind-alley.flac",
+                        "format": "FLAC",
+                        "size": "12345",
+                    }
+                ],
+            }
+        raise AssertionError(identifier)
+
+    monkeypatch.setattr("ia_kissing_pipeline.ingest.ia_client.IAClient.fetch_search_page", fake_fetch_search_page)
+    monkeypatch.setattr("ia_kissing_pipeline.ingest.ia_client.IAClient.fetch_metadata", fake_fetch_metadata)
+
+    app = create_app()
+    client = app.test_client()
+    response = client.get("/ingestor?run=1&limit=1&rows=1&duplicate_rows=5")
+
+    assert response.status_code == 200
+    assert b"Ingestor" in response.data
+    assert b"1. Checkpoint" in response.data
+    assert b"2. IA Search" in response.data
+    assert b"3. Metadata Debug" in response.data
+    assert b"4. Duplicate Probe" in response.data
+    assert b"Blind Alley" in response.data
+    assert b"title cleanup" in response.data
+    assert b"variant flags on candidate" in response.data
+    assert b"reject as obvious derivative variant" in response.data
+    assert b"reject as non-film sibling" in response.data
+    assert b"travelogue material" in response.data
+    assert b"no video files on the Internet Archive item" in response.data
+    assert b"restoration variant" in response.data
+    assert b"blind-alley-es-dub" in response.data
+
+
+def test_canonicalize_ingestor_title_strips_parenthetical_suffixes() -> None:
+    result = _canonicalize_ingestor_title("Never Take Candy From A Stranger (restored, colorized)")
+    assert result["canonical_title"] == "Never Take Candy From A Stranger"
+    assert "canonicalized sibling-search title" in result["decisions"][0]["decision"]
+
+    result = _canonicalize_ingestor_title("Film Title [Spanish Dub]")
+    assert result["canonical_title"] == "Film Title"
+
+
+def test_canonicalize_ingestor_title_uses_codex_refinement(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._call_codex_ingestor_title_canonicalizer",
+        lambda original, cleaned: {"status": "ok", "title": "Never Take Candy from a Stranger"},
+    )
+    result = _canonicalize_ingestor_title("Never Take Candy From A Stranger (restored, colorized)")
+    assert result["canonical_title"] == "Never Take Candy from a Stranger"
+    assert any(item["heuristic"] == "codex title canonicalizer" for item in result["decisions"])
+
+
+def test_source_archive_excludes_env_and_data(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+
+    archive_root = tmp_path / "fake-root"
+    (archive_root / "src").mkdir(parents=True)
+    (archive_root / "data").mkdir(parents=True)
+    (archive_root / "src" / "app.py").write_text("print('ok')\n")
+    (archive_root / ".env").write_text("SECRET=123\n")
+    (archive_root / "data" / "pipeline.db").write_text("db")
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._code_archive_root", lambda: archive_root)
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+
+    app = create_app()
+    client = app.test_client()
+    response = client.get("/source")
+
+    assert response.status_code == 200
+    archive = zipfile.ZipFile(io.BytesIO(response.data))
+    names = set(archive.namelist())
+    assert "src/app.py" in names
+    assert ".env" not in names
+    assert "data/pipeline.db" not in names
+
+
+def test_call_codex_ingestor_title_canonicalizer_uses_stdin_prompt(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TITLE_CANONICALIZER", "1")
+    monkeypatch.setenv("IA_KISSING_CODEX_WORKDIR", str(tmp_path / "codex-workdir"))
+    monkeypatch.setattr("ia_kissing_pipeline.webapp.shutil.which", lambda _: "/usr/bin/codex")
+
+    def fake_run(args, **kwargs):
+        output_index = args.index("--output-last-message") + 1
+        Path(args[output_index]).write_text("Canonical Title")
+        assert args[-1] == "-"
+        assert "Original title: Noisy Title" in kwargs["input"]
+        assert "Cleaned candidate: Clean Title" in kwargs["input"]
+        class Completed:
+            returncode = 0
+            stderr = ""
+        return Completed()
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp.subprocess.run", fake_run)
+    result = _call_codex_ingestor_title_canonicalizer("Noisy Title", "Clean Title")
+    assert result["status"] == "ok"
+    assert result["title"] == "Canonical Title"
 
 
 def test_cleanup_nonpending_local_artifacts_keeps_db_rows(tmp_path: Path, monkeypatch) -> None:
