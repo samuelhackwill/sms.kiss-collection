@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import gc
 import json
 import pickle
 import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Callable
 
 from ia_kissing_pipeline.video.extract_clips import extract_clip
+from ia_kissing_pipeline.video.probe import probe_media
 
 
 ZIAI_FRAME_SECONDS = 0.96
@@ -48,6 +52,42 @@ def _candidate_indices(predictions: list[int], min_frames: int, threshold: float
     return [list(range(start_index, end_index + 1)) for start_index, end_index in merged]
 
 
+def _chunk_windows(duration_seconds: float, chunk_seconds: float) -> list[tuple[float, float]]:
+    windows = []
+    start_seconds = 0.0
+    while start_seconds < duration_seconds:
+        windows.append((start_seconds, min(chunk_seconds, duration_seconds - start_seconds)))
+        start_seconds += chunk_seconds
+    return windows
+
+
+def _extract_chunk(source_path: Path, output_path: Path, start_seconds: float, duration_seconds: float) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start_seconds),
+            "-i",
+            str(source_path),
+            "-t",
+            str(duration_seconds),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(output_path),
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
 def run_ziai_pipeline(
     source_path: Path,
     output_dir: Path,
@@ -55,6 +95,8 @@ def run_ziai_pipeline(
     min_frames: int = 10,
     threshold: float = 0.7,
     clip_padding_seconds: float = 2.0,
+    chunk_seconds: float = 300.0,
+    inference_batch_size: int = 8,
     progress_callback: ZiaiProgressCallback | None = None,
 ) -> dict:
     detector_root = _detector_root()
@@ -81,64 +123,132 @@ def run_ziai_pipeline(
     frames_dir.mkdir(parents=True, exist_ok=True)
     candidates_dir.mkdir(parents=True, exist_ok=True)
 
+    duration_seconds = float(probe_media(source_path)["duration_seconds"] or 0.0)
+    if duration_seconds <= 0:
+        raise RuntimeError(f"Could not determine video duration for {source_path}")
+    chunk_windows = _chunk_windows(duration_seconds, max(30.0, chunk_seconds))
+
+    _emit(
+        progress_callback,
+        "loading_model",
+        phase="loading_model",
+        progress=0.02,
+        message="Loading the ZIAI classifier",
+    )
+    with model_path.open("rb") as model_file:
+        model = pickle.load(model_file)
+    model.eval()
+    _emit(
+        progress_callback,
+        "model_loaded",
+        phase="loading_model",
+        progress=0.04,
+        message="Loaded the ZIAI classifier",
+    )
+
+    predictions: list[int] = []
+    confidences: list[float] = []
+    manifest_frames: list[dict[str, object]] = []
+    processed_seconds = 0.0
     _emit(
         progress_callback,
         "extracting_frames",
         phase="extracting_frames",
         progress=0.05,
-        message=f"Extracting roughly one-second audio and video frames from {source_path.name}",
+        message=f"Starting {len(chunk_windows)} bounded extraction chunk(s) for {source_path.name}",
+        chunk_count=len(chunk_windows),
+        duration_seconds=duration_seconds,
     )
-    audio, images = BuildDataset.one_video_extract_audio_and_stills(str(source_path))
-    frame_count = len(images)
-    _emit(
-        progress_callback,
-        "frames_extracted",
-        phase="classifying_frames",
-        progress=0.25,
-        message=f"Extracted {frame_count} synchronized 0.96-second frames",
-        frame_count=frame_count,
-    )
-
-    with model_path.open("rb") as model_file:
-        model = pickle.load(model_file)
-    model.eval()
-
-    predictions: list[int] = []
-    confidences: list[float] = []
-    manifest_frames: list[dict[str, object]] = []
-    report_every = max(1, frame_count // 50)
-    for index, (audio_frame, image_frame) in enumerate(zip(audio, images)):
-        with torch.inference_mode():
-            logits = model(audio_frame.unsqueeze(0), image_frame.unsqueeze(0))
-            probabilities = torch.softmax(logits, dim=1)[0]
-            prediction = int(torch.argmax(probabilities).item())
-            confidence = float(probabilities[prediction].item())
-        frame_path = frames_dir / f"frame_{index + 1:06d}.jpg"
-        BuildDataset.transform_reverse(image_frame).save(frame_path, format="JPEG", quality=86)
-        predictions.append(prediction)
-        confidences.append(confidence)
-        manifest_frames.append(
-            {
-                "index": index,
-                "timestamp_seconds": round((index + 1) * ZIAI_FRAME_SECONDS, 3),
-                "prediction": prediction,
-                "confidence": round(confidence, 6),
-                "frame_path": str(frame_path),
-            }
-        )
-        if index == 0 or (index + 1) % report_every == 0 or index + 1 == frame_count:
-            progress = 0.25 + (0.5 * (index + 1) / max(1, frame_count))
+    with tempfile.TemporaryDirectory(prefix="ziai-chunks-") as temp_dir_value:
+        temp_dir = Path(temp_dir_value)
+        for chunk_index, (chunk_start, chunk_duration) in enumerate(chunk_windows, start=1):
+            chunk_path = temp_dir / f"chunk_{chunk_index:04d}.mkv"
+            chunk_base_progress = 0.05 + (0.7 * processed_seconds / duration_seconds)
             _emit(
                 progress_callback,
-                "frame_classified",
+                "chunk_started",
+                phase="extracting_frames",
+                progress=chunk_base_progress,
+                message=f"Extracting chunk {chunk_index} of {len(chunk_windows)}",
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_windows),
+                chunk_start_seconds=chunk_start,
+                chunk_duration_seconds=chunk_duration,
+            )
+            _extract_chunk(source_path, chunk_path, chunk_start, chunk_duration)
+            audio, images = BuildDataset.one_video_extract_audio_and_stills(str(chunk_path))
+            chunk_frame_count = len(images)
+            _emit(
+                progress_callback,
+                "chunk_extracted",
                 phase="classifying_frames",
-                progress=progress,
-                message=f"Classified frame {index + 1} of {frame_count}",
-                frame_index=index + 1,
-                frame_count=frame_count,
+                progress=chunk_base_progress,
+                message=f"Extracted {chunk_frame_count} frames from chunk {chunk_index} of {len(chunk_windows)}",
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_windows),
+                chunk_frame_count=chunk_frame_count,
+            )
+
+            for batch_start in range(0, chunk_frame_count, max(1, inference_batch_size)):
+                batch_end = min(chunk_frame_count, batch_start + max(1, inference_batch_size))
+                audio_batch = torch.stack(audio[batch_start:batch_end])
+                image_batch = torch.stack(images[batch_start:batch_end])
+                with torch.inference_mode():
+                    probabilities_batch = torch.softmax(model(audio_batch, image_batch), dim=1)
+                for batch_offset, probabilities in enumerate(probabilities_batch):
+                    local_index = batch_start + batch_offset
+                    global_index = len(predictions)
+                    prediction = int(torch.argmax(probabilities).item())
+                    confidence = float(probabilities[prediction].item())
+                    frame_path = frames_dir / f"frame_{global_index + 1:06d}.jpg"
+                    BuildDataset.transform_reverse(images[local_index]).save(frame_path, format="JPEG", quality=86)
+                    predictions.append(prediction)
+                    confidences.append(confidence)
+                    manifest_frames.append(
+                        {
+                            "index": global_index,
+                            "timestamp_seconds": round(chunk_start + ((local_index + 1) * ZIAI_FRAME_SECONDS), 3),
+                            "prediction": prediction,
+                            "confidence": round(confidence, 6),
+                            "frame_path": str(frame_path),
+                        }
+                    )
+                chunk_fraction = batch_end / max(1, chunk_frame_count)
+                progress = 0.05 + (0.7 * (processed_seconds + (chunk_duration * chunk_fraction)) / duration_seconds)
+                _emit(
+                    progress_callback,
+                    "frames_classified",
+                    phase="classifying_frames",
+                    progress=progress,
+                    message=(
+                        f"Classified {batch_end} of {chunk_frame_count} frames "
+                        f"in chunk {chunk_index} of {len(chunk_windows)}"
+                    ),
+                    chunk_index=chunk_index,
+                    chunk_count=len(chunk_windows),
+                    chunk_frame_index=batch_end,
+                    chunk_frame_count=chunk_frame_count,
+                    frame_count=len(predictions),
+                    positive_count=sum(predictions),
+                )
+                del audio_batch, image_batch, probabilities_batch
+            processed_seconds += chunk_duration
+            chunk_path.unlink(missing_ok=True)
+            del audio, images
+            gc.collect()
+            _emit(
+                progress_callback,
+                "chunk_complete",
+                phase="extracting_frames",
+                progress=0.05 + (0.7 * processed_seconds / duration_seconds),
+                message=f"Completed chunk {chunk_index} of {len(chunk_windows)}",
+                chunk_index=chunk_index,
+                chunk_count=len(chunk_windows),
+                frame_count=len(predictions),
                 positive_count=sum(predictions),
             )
 
+    frame_count = len(predictions)
     segments = _candidate_indices(predictions, min_frames, threshold)
     _emit(
         progress_callback,
@@ -150,8 +260,11 @@ def run_ziai_pipeline(
     )
     candidates: list[dict[str, object]] = []
     for candidate_index, indices in enumerate(segments, start=1):
-        start_seconds = max(0.0, indices[0] * ZIAI_FRAME_SECONDS - clip_padding_seconds)
-        end_seconds = (indices[-1] + 1) * ZIAI_FRAME_SECONDS + clip_padding_seconds
+        start_seconds = max(
+            0.0,
+            float(manifest_frames[indices[0]]["timestamp_seconds"]) - ZIAI_FRAME_SECONDS - clip_padding_seconds,
+        )
+        end_seconds = float(manifest_frames[indices[-1]]["timestamp_seconds"]) + clip_padding_seconds
         clip_path = candidates_dir / f"candidate_{candidate_index:03d}.mp4"
         extract_clip(source_path, clip_path, start_seconds, end_seconds - start_seconds)
         positive_confidences = [
@@ -190,6 +303,8 @@ def run_ziai_pipeline(
         "min_frames": min_frames,
         "threshold": threshold,
         "clip_padding_seconds": clip_padding_seconds,
+        "chunk_seconds": chunk_seconds,
+        "inference_batch_size": inference_batch_size,
         "frames": manifest_frames,
         "candidates": candidates,
     }

@@ -14,6 +14,7 @@ import tempfile
 import time
 import re
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
 from urllib import request as urllib_request
@@ -756,7 +757,7 @@ ZIAI_TEMPLATE = """
     const eventSource = new EventSource("{{ event_stream_url }}");
     const activityLog = document.getElementById("activity-log");
     const terminal = new Set(["done", "error"]);
-    ["queued", "job_started", "film_started", "extracting_frames", "frames_extracted", "frame_classified", "candidates_found", "candidate_clip_built", "film_complete", "film_error", "done", "error"].forEach((eventType) => {
+    ["queued", "job_started", "film_started", "source_ready", "loading_model", "model_loaded", "extracting_frames", "chunk_started", "chunk_extracted", "frames_classified", "chunk_complete", "candidates_found", "candidate_clip_built", "film_complete", "film_error", "done", "error"].forEach((eventType) => {
       eventSource.addEventListener(eventType, (event) => {
         const payload = JSON.parse(event.data);
         const item = document.createElement("div");
@@ -2437,6 +2438,7 @@ def create_app() -> Flask:
     def ziai_index():
         requested_job_id = request.args.get("job_id", type=int)
         with get_connection(settings.db_path) as conn:
+            _reconcile_stale_ziai_jobs(conn)
             job = _load_ziai_job(conn, requested_job_id)
             recent_events = list_recent_job_events(conn, int(job["id"]), limit=100) if job else []
             films = _load_ziai_films(conn)
@@ -5401,6 +5403,44 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
     env.setdefault("LOG_DIR", str(settings.log_dir))
     project_root = Path(__file__).resolve().parents[2]
     log_path = settings.log_dir / "webapp-jobs.log"
+    runtime_dir = Path(f"/run/user/{os.getuid()}")
+    systemd_run = shutil.which("systemd-run")
+    independent_job = any(item in {"ziai-film-job", "ziai-batch-job"} for item in command)
+    if independent_job and systemd_run and (runtime_dir / "bus").exists():
+        unit_name = f"ia-kissing-job-{time.time_ns()}"
+        systemd_env = {
+            **env,
+            "XDG_RUNTIME_DIR": str(runtime_dir),
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir / 'bus'}",
+        }
+        try:
+            subprocess.run(
+                [
+                    systemd_run,
+                    "--user",
+                    f"--unit={unit_name}",
+                    "--collect",
+                    "--quiet",
+                    "--property=Type=exec",
+                    f"--property=WorkingDirectory={project_root}",
+                    f"--property=StandardOutput=append:{log_path}",
+                    f"--property=StandardError=append:{log_path}",
+                    *[f"--setenv={key}={value}" for key, value in env.items() if key in {
+                        "DB_PATH", "CACHE_DIR", "DOWNLOAD_DIR", "FRAME_DIR", "PREVIEW_DIR", "CLIPS_DIR", "LOG_DIR", "PATH"
+                    }],
+                    "--",
+                    *command,
+                ],
+                cwd=project_root,
+                env=systemd_env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            return
+        except (OSError, subprocess.CalledProcessError) as exc:
+            with log_path.open("a") as log_file:
+                log_file.write(f"systemd-run failed, falling back to detached process: {exc}\n")
     with log_path.open("a") as log_file:
         subprocess.Popen(command, cwd=project_root, env=env, stdout=log_file, stderr=log_file, start_new_session=True)
 
@@ -5461,7 +5501,13 @@ def _queue_ingestor_dry_run(settings, payload: dict[str, object]) -> int:
 
 def _queue_ziai_film(settings, film_id: int) -> int:
     now = utc_now_iso()
-    payload = {"min_frames": 10, "threshold": 0.7, "clip_padding_seconds": 2.0}
+    payload = {
+        "min_frames": 10,
+        "threshold": 0.7,
+        "clip_padding_seconds": 2.0,
+        "chunk_seconds": 300.0,
+        "inference_batch_size": 8,
+    }
     with get_connection(settings.db_path) as conn:
         film = conn.execute(
             """
@@ -5898,6 +5944,17 @@ def _run_ziai_film_now(
         with get_connection(settings.db_path) as conn:
             _, _, source_path = _resolve_source_video(conn, settings, film_id)
         output_dir = settings.preview_dir / film["archive_identifier"] / "ziai"
+        _record_ziai_event(
+            settings,
+            job_id,
+            "source_ready",
+            {
+                "phase": "source_ready",
+                "progress": 0.01,
+                "message": f"Source video is ready for {film['title']}",
+                "film_id": film_id,
+            },
+        )
 
         def progress_callback(event_type: str, event_payload: dict[str, object]) -> None:
             payload = {**event_payload, "film_id": film_id, "film_title": film["title"]}
@@ -5924,6 +5981,8 @@ def _run_ziai_film_now(
             min_frames=int(payload.get("min_frames", 10)),
             threshold=float(payload.get("threshold", 0.7)),
             clip_padding_seconds=float(payload.get("clip_padding_seconds", 2.0)),
+            chunk_seconds=float(payload.get("chunk_seconds", 300.0)),
+            inference_batch_size=int(payload.get("inference_batch_size", 8)),
             progress_callback=progress_callback,
         )
         summary = {key: value for key, value in result.items() if key != "frames"}
@@ -6042,7 +6101,14 @@ def _run_ziai_batch_now(job_id: int) -> int:
         failed = 0
         for index, film in enumerate(films):
             now = utc_now_iso()
-            child_payload = {"min_frames": 10, "threshold": 0.7, "clip_padding_seconds": 2.0, "batch_job_id": job_id}
+            child_payload = {
+                "min_frames": 10,
+                "threshold": 0.7,
+                "clip_padding_seconds": 2.0,
+                "chunk_seconds": 300.0,
+                "inference_batch_size": 8,
+                "batch_job_id": job_id,
+            }
             with get_connection(settings.db_path) as conn:
                 conn.execute(
                     """
@@ -6601,6 +6667,57 @@ def _reconcile_stale_skim_job(conn, film_id: int) -> None:
         """,
         (json.dumps({"phase": "error", "progress": 1.0}, sort_keys=True), utc_now_iso(), row["id"]),
     )
+
+
+def _reconcile_stale_ziai_jobs(conn) -> None:
+    rows = conn.execute(
+        """
+        SELECT id, job_type, payload_json, updated_at
+        FROM analysis_jobs
+        WHERE job_type IN ('ziai_film', 'ziai_batch')
+          AND status IN ('queued', 'running')
+        ORDER BY id
+        """
+    ).fetchall()
+    if not rows:
+        return
+    result = subprocess.run(["ps", "-eo", "cmd"], text=True, capture_output=True, check=True)
+    commands = result.stdout.splitlines()
+    now = datetime.now(UTC)
+    for row in rows:
+        try:
+            updated_at = datetime.fromisoformat(row["updated_at"])
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=UTC)
+            if (now - updated_at).total_seconds() < 60:
+                continue
+        except (TypeError, ValueError):
+            continue
+        payload = json.loads(row["payload_json"] or "{}")
+        worker_job_id = int(payload.get("batch_job_id") or row["id"])
+        worker_command = "ziai-batch-job" if payload.get("batch_job_id") else row["job_type"].replace("_", "-") + "-job"
+        pattern = re.compile(rf"{re.escape(worker_command)} .*--job-id {worker_job_id}(?:\s|$)")
+        if any(pattern.search(command) for command in commands):
+            continue
+        error_payload = {
+            "phase": "error",
+            "progress": 1.0,
+            "message": "ZIAI worker stopped without completing. Run the film again.",
+        }
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'error', result_json = ?, error_text = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(error_payload, sort_keys=True),
+                error_payload["message"],
+                utc_now_iso(),
+                row["id"],
+            ),
+        )
+        append_job_event(conn, int(row["id"]), "error", error_payload)
 
 
 def _skim_worker_active(film_id: int) -> bool:

@@ -21,9 +21,11 @@ from ia_kissing_pipeline.webapp import (
     _run_kiss_detector_now,
     _run_ziai_batch_now,
     _run_ziai_film_now,
+    _reconcile_stale_ziai_jobs,
     _start_get_more_vids,
     create_app,
 )
+from ia_kissing_pipeline.ziai import _chunk_windows
 
 
 def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
@@ -464,6 +466,40 @@ def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypa
         batch = conn.execute("SELECT status, result_json FROM analysis_jobs WHERE id = ?", (batch_job["id"],)).fetchone()
     assert batch["status"] == "done"
     assert json.loads(batch["result_json"])["completed"] == 1
+
+
+def test_ziai_chunk_windows_bound_memory_work(tmp_path: Path) -> None:
+    assert _chunk_windows(6198.5, 300.0)[0] == (0.0, 300.0)
+    assert _chunk_windows(6198.5, 300.0)[-1] == (6000.0, 198.5)
+    assert len(_chunk_windows(6198.5, 300.0)) == 21
+
+
+def test_ziai_reconciles_worker_that_stopped(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES ('ziai_batch', 'running', '{}', '{}', '2026-06-14T20:00:00+00:00', '2026-06-14T20:00:00+00:00')
+            """
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+    class ProcessResult:
+        stdout = "CMD\n"
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp.subprocess.run", lambda *args, **kwargs: ProcessResult())
+    with get_connection(settings.db_path) as conn:
+        _reconcile_stale_ziai_jobs(conn)
+    with get_connection(settings.db_path) as conn:
+        job = conn.execute("SELECT status, error_text FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+        event = conn.execute("SELECT event_type FROM job_events WHERE job_id = ?", (job_id,)).fetchone()
+    assert job["status"] == "error"
+    assert "stopped without completing" in job["error_text"]
+    assert event["event_type"] == "error"
 
 
 def test_canonicalize_ingestor_title_strips_parenthetical_suffixes(monkeypatch) -> None:
