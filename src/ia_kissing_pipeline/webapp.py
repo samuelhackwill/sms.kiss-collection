@@ -4429,9 +4429,9 @@ def _load_ziai_candidates(conn, preview_dir: Path) -> list[dict]:
     candidates = []
     for row in rows:
         item = dict(row)
-        path = Path(item["clip_path"])
+        path = Path(item["clip_path"]).resolve()
         try:
-            item["relpath"] = str(path.relative_to(preview_dir)) if path.exists() else None
+            item["relpath"] = str(path.relative_to(preview_dir.resolve())) if path.exists() else None
         except ValueError:
             item["relpath"] = None
         candidates.append(item)
@@ -5943,7 +5943,8 @@ def _run_ziai_film_now(
 
         with get_connection(settings.db_path) as conn:
             _, _, source_path = _resolve_source_video(conn, settings, film_id)
-        output_dir = settings.preview_dir / film["archive_identifier"] / "ziai"
+        source_path = source_path.resolve()
+        output_dir = (settings.preview_dir / film["archive_identifier"] / "ziai").resolve()
         _record_ziai_event(
             settings,
             job_id,
