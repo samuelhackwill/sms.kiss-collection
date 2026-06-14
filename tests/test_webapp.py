@@ -19,6 +19,8 @@ from ia_kissing_pipeline.webapp import (
     _cleanup_nonpending_local_artifacts,
     _run_ingestor_dry_run_now,
     _run_kiss_detector_now,
+    _run_ziai_batch_now,
+    _run_ziai_film_now,
     _start_get_more_vids,
     create_app,
 )
@@ -312,6 +314,156 @@ def test_ingestor_page_runs_dry_metadata_probe(tmp_path: Path, monkeypatch) -> N
     assert json.loads(completed_job["result_json"])["docs_seen"] == 1
     assert "metadata_started" in event_types
     assert "film_complete" in event_types
+
+
+def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute(
+            "INSERT INTO film_reviews (film_id, review_status, reviewed_at) VALUES (1, 'has_kiss', '2026-06-14T00:00:00Z')"
+        )
+
+    spawned_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._spawn_pipeline_command",
+        lambda settings, command: spawned_commands.append(command),
+    )
+    app = create_app()
+    client = app.test_client()
+
+    page = client.get("/ziai")
+    queued = client.post("/ziai/jobs", data={"film_id": "1"}, follow_redirects=False)
+
+    assert page.status_code == 200
+    assert b"ZIAI Pipeline" in page.data
+    assert b"Kiss in Spring" in page.data
+    assert b"Ants of Industry" not in page.data
+    assert queued.status_code == 302
+    assert "ziai-film-job" in spawned_commands[0]
+
+    with get_connection(settings.db_path) as conn:
+        job = conn.execute(
+            "SELECT id, status FROM analysis_jobs WHERE film_id = 1 AND job_type = 'ziai_film'"
+        ).fetchone()
+        film = dict(conn.execute("SELECT * FROM films WHERE id = 1").fetchone())
+
+    source_path = settings.download_dir / "kiss_in_spring_1932" / "source.mp4"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text("source")
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._resolve_source_video",
+        lambda conn, settings, film_id: (film, "https://example.test/source.mp4", source_path),
+    )
+
+    def fake_run_ziai(source_path, output_dir, **kwargs):
+        kwargs["progress_callback"](
+            "frames_extracted",
+            {"phase": "classifying_frames", "progress": 0.25, "message": "Extracted 12 frames"},
+        )
+        clip_path = output_dir / "candidates" / "candidate_001.mp4"
+        clip_path.parent.mkdir(parents=True)
+        clip_path.write_text("clip")
+        return {
+            "source_path": str(source_path),
+            "output_dir": str(output_dir),
+            "frame_count": 12,
+            "positive_frame_count": 10,
+            "candidate_count": 1,
+            "frames": [],
+            "candidates": [
+                {
+                    "candidate_index": 1,
+                    "start_seconds": 4.0,
+                    "end_seconds": 18.0,
+                    "confidence": 0.91,
+                    "clip_path": str(clip_path),
+                }
+            ],
+        }
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp.run_ziai_pipeline", fake_run_ziai)
+    assert _run_ziai_film_now(job["id"], 1) == 0
+
+    completed_page = client.get(f"/ziai?job_id={job['id']}")
+    events = client.get(f"/ziai/jobs/{job['id']}/events")
+    assert completed_page.status_code == 200
+    assert b"Human Review Candidates" in completed_page.data
+    assert b"confidence 0.91" in completed_page.data
+    assert b"candidate_001.mp4" in completed_page.data
+    assert events.mimetype == "text/event-stream"
+    assert b"event: frames_extracted" in events.data
+    assert b"event: done" in events.data
+    with get_connection(settings.db_path) as conn:
+        completed_job = conn.execute("SELECT status FROM analysis_jobs WHERE id = ?", (job["id"],)).fetchone()
+        candidate = conn.execute("SELECT review_status FROM ziai_candidates WHERE film_id = 1").fetchone()
+    assert completed_job["status"] == "done"
+    assert candidate["review_status"] == "pending"
+
+
+def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute("INSERT INTO film_reviews (film_id, review_status) VALUES (1, 'has_kiss')")
+        conn.execute("INSERT INTO film_reviews (film_id, review_status) VALUES (2, 'has_kiss')")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, created_at, updated_at)
+            VALUES (1, 'ziai_film', 'done', '2026-06-14T00:00:00Z', '2026-06-14T00:00:00Z')
+            """
+        )
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._spawn_pipeline_command", lambda settings, command: None)
+    app = create_app()
+    client = app.test_client()
+    queued = client.post("/ziai/jobs", follow_redirects=False)
+    assert queued.status_code == 302
+    with get_connection(settings.db_path) as conn:
+        batch_job = conn.execute(
+            "SELECT id FROM analysis_jobs WHERE job_type = 'ziai_batch' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    processed: list[int] = []
+
+    def fake_run_child(job_id, film_id, **kwargs):
+        processed.append(film_id)
+        with get_connection(settings.db_path) as conn:
+            conn.execute("UPDATE analysis_jobs SET status = 'done' WHERE id = ?", (job_id,))
+        return 0
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._run_ziai_film_now", fake_run_child)
+    assert _run_ziai_batch_now(batch_job["id"]) == 0
+    assert processed == [2]
+    with get_connection(settings.db_path) as conn:
+        batch = conn.execute("SELECT status, result_json FROM analysis_jobs WHERE id = ?", (batch_job["id"],)).fetchone()
+    assert batch["status"] == "done"
+    assert json.loads(batch["result_json"])["completed"] == 1
 
 
 def test_canonicalize_ingestor_title_strips_parenthetical_suffixes(monkeypatch) -> None:

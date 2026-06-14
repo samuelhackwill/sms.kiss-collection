@@ -173,6 +173,22 @@ CREATE TABLE IF NOT EXISTS film_reviews (
     cleanup_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS ziai_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES analysis_jobs(id) ON DELETE CASCADE,
+    film_id INTEGER NOT NULL REFERENCES films(id) ON DELETE CASCADE,
+    candidate_index INTEGER NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    clip_path TEXT NOT NULL,
+    review_status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    UNIQUE (job_id, candidate_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ziai_candidates_film_id ON ziai_candidates(film_id);
+
 CREATE TABLE IF NOT EXISTS queue_runtime (
     queue_name TEXT PRIMARY KEY,
     state TEXT NOT NULL DEFAULT 'idle',

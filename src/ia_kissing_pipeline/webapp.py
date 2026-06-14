@@ -30,6 +30,7 @@ from ia_kissing_pipeline.jobs.events import append_job_event, list_job_events, l
 from ia_kissing_pipeline.main import run_metadata_scoring
 from ia_kissing_pipeline.scoring.metadata_rules import score_metadata
 from ia_kissing_pipeline.utils.time import utc_now_iso
+from ia_kissing_pipeline.ziai import run_ziai_pipeline
 
 
 READY_TARGET = 20
@@ -92,7 +93,7 @@ EMPTY_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div class="panel">
     <h1>No Ready Film Yet</h1>
     <p>The review queue is being filled in the background.</p>
@@ -165,7 +166,7 @@ FILMS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a> | <a href="{{ url_for('what_is_a_kiss_page') }}">What Is A Kiss</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a> | <a href="{{ url_for('what_is_a_kiss_page') }}">What Is A Kiss</a></p>
   <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
     <h1 style="margin:0;">Film Database</h1>
     {% for stat in tag_stats %}
@@ -397,7 +398,7 @@ ADMIN_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div class="panel">
     <h1 style="margin-top:0;">Admin</h1>
     <p class="muted">Launch the get more films batch from the web UI. This queues the same download-batch flow used by the Python tooling.</p>
@@ -478,7 +479,7 @@ INGESTOR_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div class="panel">
     <h1 style="margin-top:0;">Ingestor</h1>
     <p class="muted">Dry-run only. Runs in a background worker and streams Internet Archive search, metadata normalization, Codex title checks, and duplicate-title probing live.</p>
@@ -654,6 +655,133 @@ metadata_block={{ item['metadata_block_reasons']|join(', ') if item['metadata_bl
 </html>
 """
 
+ZIAI_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ZIAI Pipeline</title>
+  <style>
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #0f141b; --border: #263244; --text: #edf3ff; --muted: #94a4bd; --link: #7cc7ff; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    .panel { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 18px; padding: 18px; margin-bottom: 18px; }
+    .stats, .clips { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .stat, .clip { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: #0b1016; }
+    .stat strong { display: block; font-size: 28px; }
+    .muted { color: var(--muted); }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid var(--border); padding: 10px; text-align: left; vertical-align: top; }
+    button { padding: 9px 13px; border-radius: 10px; border: 1px solid #3b495d; background: #2a3442; color: #d9e5f7; cursor: pointer; }
+    .primary { background: #174d35; border-color: #28764f; color: #a7f3c4; }
+    .progress-shell { height: 10px; margin-top: 12px; border-radius: 999px; overflow: hidden; background: #0b1016; border: 1px solid var(--border); }
+    .progress-bar { height: 100%; width: {{ job_progress_percent }}%; background: linear-gradient(90deg, #26714a, #87f0ae); transition: width 180ms ease; }
+    .activity-log { max-height: 320px; overflow: auto; display: grid; gap: 7px; margin-top: 12px; }
+    .activity-item { border-left: 3px solid #314056; padding: 7px 10px; background: #0b1016; font: 12px/1.45 monospace; }
+    .activity-item.done { border-color: #2d7f55; }
+    .activity-item.error { border-color: #b64d5f; color: #ffd3db; }
+    video { width: 100%; background: #000; border-radius: 10px; margin: 8px 0; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    @media (max-width: 800px) { table { font-size: 13px; } }
+  </style>
+</head>
+<body>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <strong>ZIAI</strong> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <div class="panel">
+    <h1 style="margin-top:0;">ZIAI Pipeline</h1>
+    <p class="muted">Extract synchronized 0.96-second frames, classify them, group likely kissing sequences, and build clips for human review.</p>
+    <div class="stats">
+      <div class="stat"><strong>{{ stats['confirmed'] }}</strong><span class="muted">confirmed kiss films</span></div>
+      <div class="stat"><strong>{{ stats['completed'] }}</strong><span class="muted">completed</span></div>
+      <div class="stat"><strong>{{ stats['remaining'] }}</strong><span class="muted">remaining</span></div>
+      <div class="stat"><strong>{{ stats['candidates'] }}</strong><span class="muted">candidate clips</span></div>
+    </div>
+    <form method="post" action="{{ url_for('ziai_start_job') }}" style="margin-top:16px;">
+      <button class="primary" type="submit" {% if stats['remaining'] == 0 %}disabled{% endif %}>Run All Remaining Confirmed Films</button>
+    </form>
+    {% if job %}
+      <p id="job-meta" class="muted">job={{ job['id'] }} | status=<span id="job-status">{{ job['status'] }}</span> | phase=<span id="job-phase">{{ job['phase'] }}</span> | <span id="job-progress">{{ job_progress_percent }}%</span></p>
+      <div class="progress-shell"><div class="progress-bar" id="progress-bar"></div></div>
+      <div class="activity-log" id="activity-log">
+        {% for event in recent_events %}
+          <div class="activity-item {{ event['event_type'] }}">{{ event['created_at'] }} | {{ event['payload'].get('message', event['event_type']) }}</div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+  <div class="panel">
+    <h2 style="margin-top:0;">Confirmed Films</h2>
+    <table>
+      <thead><tr><th>Film</th><th>ZIAI status</th><th>Candidates</th><th>Action</th></tr></thead>
+      <tbody>
+      {% for film in films %}
+        <tr>
+          <td><a href="{{ url_for('film_detail', film_id=film['id']) }}">{{ film['title'] }}</a><br><span class="muted">{{ film['archive_identifier'] }}</span></td>
+          <td>{{ film['latest_status'] or 'not run' }}{% if film['has_done'] %} / completed{% endif %}</td>
+          <td>{{ film['candidate_count'] }}</td>
+          <td>
+            <form method="post" action="{{ url_for('ziai_start_job') }}">
+              <input type="hidden" name="film_id" value="{{ film['id'] }}">
+              <button type="submit">{{ 'Run Again' if film['has_done'] else 'Run Video' }}</button>
+            </form>
+            {% if film['latest_job_id'] %}<a href="{{ url_for('ziai_index', job_id=film['latest_job_id']) }}">monitor</a>{% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="muted">No films have been confirmed as containing kisses yet.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <h2 style="margin-top:0;">Human Review Candidates</h2>
+    <div class="clips">
+      {% for candidate in candidates %}
+        <div class="clip">
+          <strong>{{ candidate['title'] }}</strong>
+          <div class="muted">candidate {{ candidate['candidate_index'] }} | {{ '%.1f'|format(candidate['start_seconds']) }}s-{{ '%.1f'|format(candidate['end_seconds']) }}s | confidence {{ '%.2f'|format(candidate['confidence']) }}</div>
+          {% if candidate['media_url'] %}<video controls preload="metadata" src="{{ candidate['media_url'] }}"></video>{% endif %}
+          <div class="row">
+            <span>{{ candidate['review_status'] }}</span>
+            <form method="post" action="{{ url_for('ziai_review_candidate', candidate_id=candidate['id']) }}"><button name="review_status" value="accepted">Accept</button><button name="review_status" value="rejected">Reject</button></form>
+          </div>
+        </div>
+      {% else %}
+        <p class="muted">No ZIAI candidate clips yet.</p>
+      {% endfor %}
+    </div>
+  </div>
+  {% if job_active %}
+  <script>
+    const eventSource = new EventSource("{{ event_stream_url }}");
+    const activityLog = document.getElementById("activity-log");
+    const terminal = new Set(["done", "error"]);
+    ["queued", "job_started", "film_started", "extracting_frames", "frames_extracted", "frame_classified", "candidates_found", "candidate_clip_built", "film_complete", "film_error", "done", "error"].forEach((eventType) => {
+      eventSource.addEventListener(eventType, (event) => {
+        const payload = JSON.parse(event.data);
+        const item = document.createElement("div");
+        item.className = `activity-item ${eventType}`;
+        item.textContent = `${new Date().toLocaleTimeString()} | ${payload.message || eventType}`;
+        activityLog.appendChild(item);
+        activityLog.scrollTop = activityLog.scrollHeight;
+        const progress = Math.max(0, Math.min(1, Number(payload.progress || 0)));
+        const percent = Math.round(progress * 100);
+        document.getElementById("progress-bar").style.width = `${percent}%`;
+        document.getElementById("job-progress").textContent = `${percent}%`;
+        document.getElementById("job-status").textContent = payload.status || "running";
+        document.getElementById("job-phase").textContent = payload.phase || eventType;
+        if (terminal.has(eventType)) {
+          eventSource.close();
+          window.setTimeout(() => window.location.reload(), 500);
+        }
+      });
+    });
+  </script>
+  {% endif %}
+</body>
+</html>
+"""
+
 
 FILM_TEMPLATE = """
 <!doctype html>
@@ -730,7 +858,7 @@ FILM_TEMPLATE = """
 </head>
 <body class="debug-off">
   <div class="topbar">
-    <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+    <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
     <button type="button" id="debug-toggle" class="debug-toggle">Debug: Off</button>
   </div>
   <h1 class="debug-only">{{ film["title"] }}</h1>
@@ -1637,7 +1765,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <h1>What Is A Kiss</h1>
   {% if rows %}
     <div class="page">
@@ -1804,7 +1932,7 @@ REVIEW_DATA_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <h1>Review Data</h1>
   {% for section in sections %}
     <details class="section" {% if section["open"] %}open{% endif %}>
@@ -2304,6 +2432,114 @@ def create_app() -> Flask:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    @app.get("/ziai")
+    def ziai_index():
+        requested_job_id = request.args.get("job_id", type=int)
+        with get_connection(settings.db_path) as conn:
+            job = _load_ziai_job(conn, requested_job_id)
+            recent_events = list_recent_job_events(conn, int(job["id"]), limit=100) if job else []
+            films = _load_ziai_films(conn)
+            candidates = _load_ziai_candidates(conn, settings.preview_dir)
+        stats = {
+            "confirmed": len(films),
+            "completed": sum(1 for film in films if film["has_done"]),
+            "remaining": sum(1 for film in films if not film["has_done"]),
+            "candidates": len(candidates),
+        }
+        for candidate in candidates:
+            candidate["media_url"] = (
+                url_for("media_file", kind="preview", relpath=candidate["relpath"])
+                if candidate["relpath"]
+                else None
+            )
+        return render_template_string(
+            ZIAI_TEMPLATE,
+            films=films,
+            candidates=candidates,
+            stats=stats,
+            job=job,
+            job_active=bool(job and job["status"] in {"queued", "running"}),
+            job_progress_percent=int(round(float(job["progress"]) * 100)) if job else 0,
+            recent_events=recent_events,
+            event_stream_url=(
+                url_for(
+                    "ziai_job_events",
+                    job_id=job["id"],
+                    after=recent_events[-1]["id"] if recent_events else 0,
+                )
+                if job
+                else None
+            ),
+        )
+
+    @app.post("/ziai/jobs")
+    def ziai_start_job():
+        film_id = request.form.get("film_id", type=int)
+        try:
+            job_id = _queue_ziai_film(settings, film_id) if film_id else _queue_ziai_batch(settings)
+        except ValueError as exc:
+            abort(400, str(exc))
+        return redirect(url_for("ziai_index", job_id=job_id))
+
+    @app.get("/ziai/jobs/<int:job_id>/events")
+    def ziai_job_events(job_id: int):
+        with get_connection(settings.db_path) as conn:
+            job = _load_ziai_job(conn, job_id)
+        if not job:
+            abort(404)
+        try:
+            after_id = int(request.headers.get("Last-Event-ID") or request.args.get("after", 0))
+        except ValueError:
+            after_id = 0
+
+        @stream_with_context
+        def generate():
+            nonlocal after_id
+            yield "retry: 1000\n\n"
+            idle_polls = 0
+            while True:
+                with get_connection(settings.db_path) as conn:
+                    events = list_job_events(conn, job_id, after_id=after_id, limit=100)
+                    current_job = _load_ziai_job(conn, job_id)
+                for event in events:
+                    after_id = event["id"]
+                    payload = {
+                        **event["payload"],
+                        "created_at": event["created_at"],
+                        "status": current_job["status"] if current_job else "error",
+                    }
+                    yield (
+                        f"id: {event['id']}\n"
+                        f"event: {event['event_type']}\n"
+                        f"data: {json.dumps(payload, sort_keys=True)}\n\n"
+                    )
+                if current_job is None or current_job["status"] in {"done", "error"}:
+                    return
+                idle_polls += 1
+                if idle_polls % 20 == 0:
+                    yield ": keepalive\n\n"
+                time.sleep(0.5)
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/ziai/candidates/<int:candidate_id>/review")
+    def ziai_review_candidate(candidate_id: int):
+        review_status = request.form.get("review_status", "").strip()
+        if review_status not in {"pending", "accepted", "rejected"}:
+            abort(400)
+        with get_connection(settings.db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE ziai_candidates SET review_status = ? WHERE id = ?",
+                (review_status, candidate_id),
+            )
+            if cursor.rowcount == 0:
+                abort(404)
+        return redirect(url_for("ziai_index"))
 
     @app.post("/what-is-a-kiss/<int:clip_id>/load-frames")
     def what_is_a_kiss_load_frames(clip_id: int):
@@ -4115,6 +4351,91 @@ def _load_ingestor_job(conn, job_id: int | None = None) -> dict | None:
     }
 
 
+def _load_ziai_job(conn, job_id: int | None = None) -> dict | None:
+    if job_id is None:
+        row = conn.execute(
+            """
+            SELECT id, film_id, job_type, status, payload_json, result_json, error_text, created_at, updated_at
+            FROM analysis_jobs
+            WHERE job_type IN ('ziai_film', 'ziai_batch')
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id, film_id, job_type, status, payload_json, result_json, error_text, created_at, updated_at
+            FROM analysis_jobs
+            WHERE id = ? AND job_type IN ('ziai_film', 'ziai_batch')
+            """,
+            (job_id,),
+        ).fetchone()
+    if not row:
+        return None
+    result = json.loads(row["result_json"] or "{}")
+    return {
+        **dict(row),
+        "payload": json.loads(row["payload_json"] or "{}"),
+        "result": result,
+        "phase": result.get("phase", row["status"]),
+        "progress": float(result.get("progress", 0.0)),
+    }
+
+
+def _load_ziai_films(conn) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT
+            f.id,
+            f.title,
+            f.archive_identifier,
+            (
+                SELECT j.id FROM analysis_jobs j
+                WHERE j.film_id = f.id AND j.job_type = 'ziai_film'
+                ORDER BY j.id DESC LIMIT 1
+            ) AS latest_job_id,
+            (
+                SELECT j.status FROM analysis_jobs j
+                WHERE j.film_id = f.id AND j.job_type = 'ziai_film'
+                ORDER BY j.id DESC LIMIT 1
+            ) AS latest_status,
+            EXISTS (
+                SELECT 1 FROM analysis_jobs j
+                WHERE j.film_id = f.id AND j.job_type = 'ziai_film' AND j.status = 'done'
+            ) AS has_done,
+            (
+                SELECT COUNT(*) FROM ziai_candidates zc WHERE zc.film_id = f.id
+            ) AS candidate_count
+        FROM films f
+        JOIN film_reviews fr ON fr.film_id = f.id AND fr.review_status = 'has_kiss'
+        ORDER BY f.title COLLATE NOCASE
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _load_ziai_candidates(conn, preview_dir: Path) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT zc.*, f.title, f.archive_identifier
+        FROM ziai_candidates zc
+        JOIN films f ON f.id = zc.film_id
+        ORDER BY zc.id DESC
+        """
+    ).fetchall()
+    candidates = []
+    for row in rows:
+        item = dict(row)
+        path = Path(item["clip_path"])
+        try:
+            item["relpath"] = str(path.relative_to(preview_dir)) if path.exists() else None
+        except ValueError:
+            item["relpath"] = None
+        candidates.append(item)
+    return candidates
+
+
 def _code_archive_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -5138,6 +5459,121 @@ def _queue_ingestor_dry_run(settings, payload: dict[str, object]) -> int:
     return job_id
 
 
+def _queue_ziai_film(settings, film_id: int) -> int:
+    now = utc_now_iso()
+    payload = {"min_frames": 10, "threshold": 0.7, "clip_padding_seconds": 2.0}
+    with get_connection(settings.db_path) as conn:
+        film = conn.execute(
+            """
+            SELECT f.id, f.title
+            FROM films f
+            JOIN film_reviews fr ON fr.film_id = f.id
+            WHERE f.id = ? AND fr.review_status = 'has_kiss'
+            """,
+            (film_id,),
+        ).fetchone()
+        if not film:
+            raise ValueError(f"Film {film_id} is not confirmed as containing a kiss")
+        active = conn.execute(
+            """
+            SELECT id FROM analysis_jobs
+            WHERE film_id = ? AND job_type = 'ziai_film' AND status IN ('queued', 'running')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (film_id,),
+        ).fetchone()
+        if active:
+            return int(active["id"])
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (?, 'ziai_film', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                film_id,
+                json.dumps(payload, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.0}, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        append_job_event(
+            conn,
+            job_id,
+            "queued",
+            {
+                "phase": "queued",
+                "progress": 0.0,
+                "message": f"Queued ZIAI pipeline for {film['title']}",
+                "film_id": film_id,
+            },
+        )
+    _spawn_pipeline_command(
+        settings,
+        [sys.executable, "-m", "ia_kissing_pipeline.webapp", "ziai-film-job", "--job-id", str(job_id), "--film-id", str(film_id)],
+    )
+    return job_id
+
+
+def _queue_ziai_batch(settings) -> int:
+    now = utc_now_iso()
+    with get_connection(settings.db_path) as conn:
+        active = conn.execute(
+            """
+            SELECT id FROM analysis_jobs
+            WHERE film_id IS NULL AND job_type = 'ziai_batch' AND status IN ('queued', 'running')
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        if active:
+            return int(active["id"])
+        remaining = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM films f
+            JOIN film_reviews fr ON fr.film_id = f.id AND fr.review_status = 'has_kiss'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM analysis_jobs j
+                WHERE j.film_id = f.id
+                  AND j.job_type = 'ziai_film'
+                  AND j.status IN ('queued', 'running', 'done')
+            )
+            """
+        ).fetchone()["count"]
+        if remaining == 0:
+            raise ValueError("No remaining confirmed-kiss films need a ZIAI run")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (NULL, 'ziai_batch', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps({"remaining_at_queue_time": remaining}, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.0}, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        append_job_event(
+            conn,
+            job_id,
+            "queued",
+            {
+                "phase": "queued",
+                "progress": 0.0,
+                "message": f"Queued ZIAI loop for {remaining} remaining confirmed film(s)",
+                "film_count": remaining,
+            },
+        )
+    _spawn_pipeline_command(
+        settings,
+        [sys.executable, "-m", "ia_kissing_pipeline.webapp", "ziai-batch-job", "--job-id", str(job_id)],
+    )
+    return job_id
+
+
 def _queue_kiss_detector(settings, film_id: int, *, use_workflow_cache: bool = True) -> int:
     with get_connection(settings.db_path) as conn:
         film = conn.execute("SELECT id FROM films WHERE id = ?", (film_id,)).fetchone()
@@ -5392,6 +5828,312 @@ def _run_ingestor_dry_run_now(job_id: int) -> int:
             append_job_event(conn, job_id, "error", error_payload)
         return 1
     return 0
+
+
+def _record_ziai_event(
+    settings,
+    job_id: int,
+    event_type: str,
+    payload: dict[str, object],
+    *,
+    status: str = "running",
+) -> None:
+    result = {
+        "phase": payload.get("phase", event_type),
+        "progress": float(payload.get("progress", 0.0)),
+        "message": payload.get("message"),
+    }
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = ?, result_json = ?, error_text = NULL, updated_at = ?
+            WHERE id = ? AND job_type IN ('ziai_film', 'ziai_batch')
+            """,
+            (status, json.dumps(result, sort_keys=True), utc_now_iso(), job_id),
+        )
+        append_job_event(conn, job_id, event_type, payload)
+
+
+def _run_ziai_film_now(
+    job_id: int,
+    film_id: int,
+    *,
+    batch_job_id: int | None = None,
+    batch_index: int = 0,
+    batch_total: int = 1,
+) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    try:
+        with get_connection(settings.db_path) as conn:
+            job = _load_ziai_job(conn, job_id)
+            film_row = conn.execute(
+                """
+                SELECT f.*
+                FROM films f
+                JOIN film_reviews fr ON fr.film_id = f.id
+                WHERE f.id = ? AND fr.review_status = 'has_kiss'
+                """,
+                (film_id,),
+            ).fetchone()
+        if not job or job["job_type"] != "ziai_film":
+            raise ValueError(f"ZIAI film job {job_id} not found")
+        if not film_row:
+            raise ValueError(f"Film {film_id} is not confirmed as containing a kiss")
+        film = dict(film_row)
+        _record_ziai_event(
+            settings,
+            job_id,
+            "job_started",
+            {
+                "phase": "resolving_source",
+                "progress": 0.01,
+                "message": f"Started ZIAI pipeline for {film['title']}",
+                "film_id": film_id,
+            },
+        )
+
+        with get_connection(settings.db_path) as conn:
+            _, _, source_path = _resolve_source_video(conn, settings, film_id)
+        output_dir = settings.preview_dir / film["archive_identifier"] / "ziai"
+
+        def progress_callback(event_type: str, event_payload: dict[str, object]) -> None:
+            payload = {**event_payload, "film_id": film_id, "film_title": film["title"]}
+            _record_ziai_event(settings, job_id, event_type, payload)
+            if batch_job_id is not None:
+                child_progress = float(payload.get("progress", 0.0))
+                batch_progress = (batch_index + child_progress) / max(1, batch_total)
+                _record_ziai_event(
+                    settings,
+                    batch_job_id,
+                    event_type,
+                    {
+                        **payload,
+                        "progress": batch_progress,
+                        "batch_index": batch_index + 1,
+                        "batch_total": batch_total,
+                    },
+                )
+
+        payload = job["payload"]
+        result = run_ziai_pipeline(
+            source_path,
+            output_dir,
+            min_frames=int(payload.get("min_frames", 10)),
+            threshold=float(payload.get("threshold", 0.7)),
+            clip_padding_seconds=float(payload.get("clip_padding_seconds", 2.0)),
+            progress_callback=progress_callback,
+        )
+        summary = {key: value for key, value in result.items() if key != "frames"}
+        summary.update({"phase": "done", "progress": 1.0})
+        with get_connection(settings.db_path) as conn:
+            conn.execute("DELETE FROM ziai_candidates WHERE film_id = ?", (film_id,))
+            for candidate in result["candidates"]:
+                conn.execute(
+                    """
+                    INSERT INTO ziai_candidates (
+                        job_id, film_id, candidate_index, start_seconds, end_seconds,
+                        confidence, clip_path, review_status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        job_id,
+                        film_id,
+                        candidate["candidate_index"],
+                        candidate["start_seconds"],
+                        candidate["end_seconds"],
+                        candidate["confidence"],
+                        candidate["clip_path"],
+                        utc_now_iso(),
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, error_text = NULL, updated_at = ?
+                WHERE id = ? AND job_type = 'ziai_film'
+                """,
+                (json.dumps(summary, sort_keys=True), utc_now_iso(), job_id),
+            )
+            append_job_event(
+                conn,
+                job_id,
+                "done",
+                {
+                    "phase": "done",
+                    "progress": 1.0,
+                    "message": f"ZIAI complete for {film['title']}: {result['candidate_count']} candidate(s)",
+                    "film_id": film_id,
+                    "candidate_count": result["candidate_count"],
+                },
+            )
+        return 0
+    except BaseException as exc:
+        error_payload = {
+            "phase": "error",
+            "progress": 1.0,
+            "message": f"ZIAI failed for film {film_id}: {exc}",
+            "film_id": film_id,
+            "error": str(exc),
+        }
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'error', result_json = ?, error_text = ?, updated_at = ?
+                WHERE id = ? AND job_type = 'ziai_film'
+                """,
+                (json.dumps(error_payload, sort_keys=True), str(exc), utc_now_iso(), job_id),
+            )
+            append_job_event(conn, job_id, "error", error_payload)
+        if batch_job_id is not None:
+            _record_ziai_event(
+                settings,
+                batch_job_id,
+                "film_error",
+                {
+                    **error_payload,
+                    "progress": (batch_index + 1) / max(1, batch_total),
+                    "batch_index": batch_index + 1,
+                    "batch_total": batch_total,
+                },
+            )
+        return 1
+
+
+def _run_ziai_batch_now(job_id: int) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    try:
+        with get_connection(settings.db_path) as conn:
+            job = _load_ziai_job(conn, job_id)
+            films = conn.execute(
+                """
+                SELECT f.id, f.title
+                FROM films f
+                JOIN film_reviews fr ON fr.film_id = f.id AND fr.review_status = 'has_kiss'
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM analysis_jobs j
+                    WHERE j.film_id = f.id
+                      AND j.job_type = 'ziai_film'
+                      AND j.status IN ('queued', 'running', 'done')
+                )
+                ORDER BY f.id
+                """
+            ).fetchall()
+        if not job or job["job_type"] != "ziai_batch":
+            raise ValueError(f"ZIAI batch job {job_id} not found")
+        total = len(films)
+        _record_ziai_event(
+            settings,
+            job_id,
+            "job_started",
+            {
+                "phase": "running_films",
+                "progress": 0.0,
+                "message": f"Started ZIAI loop for {total} confirmed film(s)",
+                "film_count": total,
+            },
+        )
+        completed = 0
+        failed = 0
+        for index, film in enumerate(films):
+            now = utc_now_iso()
+            child_payload = {"min_frames": 10, "threshold": 0.7, "clip_padding_seconds": 2.0, "batch_job_id": job_id}
+            with get_connection(settings.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+                    VALUES (?, 'ziai_film', 'queued', ?, ?, ?, ?)
+                    """,
+                    (
+                        film["id"],
+                        json.dumps(child_payload, sort_keys=True),
+                        json.dumps({"phase": "queued", "progress": 0.0}, sort_keys=True),
+                        now,
+                        now,
+                    ),
+                )
+                child_job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+                append_job_event(
+                    conn,
+                    child_job_id,
+                    "queued",
+                    {"phase": "queued", "progress": 0.0, "message": f"Queued ZIAI pipeline for {film['title']}"},
+                )
+            _record_ziai_event(
+                settings,
+                job_id,
+                "film_started",
+                {
+                    "phase": "running_films",
+                    "progress": index / max(1, total),
+                    "message": f"Starting film {index + 1} of {total}: {film['title']}",
+                    "film_id": film["id"],
+                    "child_job_id": child_job_id,
+                    "batch_index": index + 1,
+                    "batch_total": total,
+                },
+            )
+            result = _run_ziai_film_now(
+                child_job_id,
+                int(film["id"]),
+                batch_job_id=job_id,
+                batch_index=index,
+                batch_total=total,
+            )
+            if result == 0:
+                completed += 1
+                _record_ziai_event(
+                    settings,
+                    job_id,
+                    "film_complete",
+                    {
+                        "phase": "running_films",
+                        "progress": (index + 1) / max(1, total),
+                        "message": f"Completed film {index + 1} of {total}: {film['title']}",
+                        "film_id": film["id"],
+                        "child_job_id": child_job_id,
+                    },
+                )
+            else:
+                failed += 1
+        result = {"phase": "done", "progress": 1.0, "film_count": total, "completed": completed, "failed": failed}
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, error_text = NULL, updated_at = ?
+                WHERE id = ? AND job_type = 'ziai_batch'
+                """,
+                (json.dumps(result, sort_keys=True), utc_now_iso(), job_id),
+            )
+            append_job_event(
+                conn,
+                job_id,
+                "done",
+                {
+                    **result,
+                    "message": f"ZIAI loop complete: {completed} succeeded, {failed} failed",
+                },
+            )
+        return 0
+    except BaseException as exc:
+        error_payload = {"phase": "error", "progress": 1.0, "message": f"ZIAI batch failed: {exc}", "error": str(exc)}
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'error', result_json = ?, error_text = ?, updated_at = ?
+                WHERE id = ? AND job_type = 'ziai_batch'
+                """,
+                (json.dumps(error_payload, sort_keys=True), str(exc), utc_now_iso(), job_id),
+            )
+            append_job_event(conn, job_id, "error", error_payload)
+        return 1
 
 
 def _build_manual_clip_now(job_id: int, film_id: int, mark_id: int, pre_seconds: float, post_seconds: float) -> int:
@@ -6181,6 +6923,23 @@ def main() -> int:
         parser.add_argument("--job-id", type=int, required=True)
         args = parser.parse_args()
         return _run_ingestor_dry_run_now(args.job_id)
+    if len(sys.argv) > 1 and sys.argv[1] == "ziai-film-job":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("ziai-film-job")
+        parser.add_argument("--job-id", type=int, required=True)
+        parser.add_argument("--film-id", type=int, required=True)
+        args = parser.parse_args()
+        return _run_ziai_film_now(args.job_id, args.film_id)
+    if len(sys.argv) > 1 and sys.argv[1] == "ziai-batch-job":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("ziai-batch-job")
+        parser.add_argument("--job-id", type=int, required=True)
+        args = parser.parse_args()
+        return _run_ziai_batch_now(args.job_id)
     if len(sys.argv) > 1 and sys.argv[1] == "build-manual-clip":
         import argparse
 

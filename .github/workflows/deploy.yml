@@ -48,6 +48,8 @@ jobs:
             --exclude 'data/' \
             --exclude '.env' \
             --exclude '.env.*' \
+            --exclude 'ziai_kissing_detector/model.pkl' \
+            --exclude 'ziai_kissing_detector/vggish-pretrained.pth' \
             ./ "${DEPLOY_USER}@${DEPLOY_HOST}:/home/bot/ia-kissing-pipeline/"
 
       - name: Deploy on VPS
