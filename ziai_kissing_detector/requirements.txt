@@ -1,0 +1,15 @@
+# Verified with Python 3.12. torch 2.2.2 does not provide Python 3.13+ wheels.
+torch==2.2.2
+torchvision==0.17.2
+resampy
+soundfile
+Pillow
+numpy<2
+moviepy<2
+opencv-python<4.12
+joblib
+pandas
+matplotlib
+pytube
+scipy
+numba==0.61.2
