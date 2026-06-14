@@ -5402,7 +5402,7 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
     env.setdefault("CLIPS_DIR", str(settings.clips_dir))
     env.setdefault("LOG_DIR", str(settings.log_dir))
     project_root = Path(__file__).resolve().parents[2]
-    log_path = settings.log_dir / "webapp-jobs.log"
+    log_path = (settings.log_dir / "webapp-jobs.log").resolve()
     runtime_dir = Path(f"/run/user/{os.getuid()}")
     systemd_run = shutil.which("systemd-run")
     independent_job = any(item in {"ziai-film-job", "ziai-batch-job"} for item in command)
