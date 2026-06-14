@@ -116,6 +116,7 @@ The schema is created in `src/ia_kissing_pipeline/db.py`. Important tables inclu
 - `films`: Internet Archive film metadata and pipeline status.
 - `film_files`: source files listed by Internet Archive.
 - `analysis_jobs`: durable job records for skim builds, clips, and batch runs.
+- `job_events`: ordered structured progress events used by live job monitoring.
 - `manual_marks`: reviewer marks on skim previews.
 - `manual_clips`: extracted clips, tag, ignore state, crop data, and metadata JSON.
 - `film_reviews`: per-film review status.
@@ -142,6 +143,7 @@ Useful routes:
 - `/films/<id>`: film review page.
 - `/clips`: bare clip gallery.
 - `/review_data`: local video artifact explorer.
+- `/ingestor`: queues dry-run ingest/title-check jobs and streams their progress live with server-sent events.
 - `/api/random-clips`: clip API for another frontend.
 - `/media/<kind>/<path>`: media file serving for downloads, previews, and clips.
 

@@ -17,6 +17,7 @@ from ia_kissing_pipeline.webapp import (
     _canonicalize_ingestor_title,
     _call_codex_ingestor_title_canonicalizer,
     _cleanup_nonpending_local_artifacts,
+    _run_ingestor_dry_run_now,
     _run_kiss_detector_now,
     _start_get_more_vids,
     create_app,
@@ -83,6 +84,7 @@ def test_ingestor_page_runs_dry_metadata_probe(tmp_path: Path, monkeypatch) -> N
     monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
     monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TITLE_CANONICALIZER", "0")
 
     settings = load_settings()
     settings.ensure_directories()
@@ -221,12 +223,63 @@ def test_ingestor_page_runs_dry_metadata_probe(tmp_path: Path, monkeypatch) -> N
 
     monkeypatch.setattr("ia_kissing_pipeline.ingest.ia_client.IAClient.fetch_search_page", fake_fetch_search_page)
     monkeypatch.setattr("ia_kissing_pipeline.ingest.ia_client.IAClient.fetch_metadata", fake_fetch_metadata)
+    spawned_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._spawn_pipeline_command",
+        lambda settings, command: spawned_commands.append(command),
+    )
 
     app = create_app()
     client = app.test_client()
-    response = client.get("/ingestor?run=1&limit=1&rows=1&duplicate_rows=5")
+    queued_response = client.post(
+        "/ingestor/jobs",
+        data={
+            "query": "collection:feature_films",
+            "page": "1",
+            "limit": "1",
+            "rows": "1",
+            "duplicate_rows": "5",
+        },
+        follow_redirects=False,
+    )
+
+    assert queued_response.status_code == 302
+    assert spawned_commands
+    assert "ingestor-dry-run-job" in spawned_commands[0]
+    with get_connection(settings.db_path) as conn:
+        job = conn.execute(
+            """
+            SELECT id, status
+            FROM analysis_jobs
+            WHERE job_type = 'ingestor_dry_run'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        queued_events = conn.execute(
+            "SELECT event_type FROM job_events WHERE job_id = ? ORDER BY id",
+            (job["id"],),
+        ).fetchall()
+    assert job["status"] == "queued"
+    assert [row["event_type"] for row in queued_events] == ["queued"]
+
+    live_response = client.get(f"/ingestor?job_id={job['id']}")
+    assert live_response.status_code == 200
+    assert b"new EventSource" in live_response.data
+    assert b"Live Activity" in live_response.data
+
+    assert _run_ingestor_dry_run_now(job["id"]) == 0
+
+    response = client.get(f"/ingestor?job_id={job['id']}")
+    events_response = client.get(f"/ingestor/jobs/{job['id']}/events")
 
     assert response.status_code == 200
+    assert events_response.status_code == 200
+    assert events_response.mimetype == "text/event-stream"
+    assert b"event: codex_title_started" in events_response.data
+    assert b"event: codex_title_complete" in events_response.data
+    assert b"event: duplicate_candidate_complete" in events_response.data
+    assert b"event: done" in events_response.data
     assert b"Ingestor" in response.data
     assert b"1. Checkpoint" in response.data
     assert b"2. IA Search" in response.data
@@ -241,9 +294,28 @@ def test_ingestor_page_runs_dry_metadata_probe(tmp_path: Path, monkeypatch) -> N
     assert b"no video files on the Internet Archive item" in response.data
     assert b"restoration variant" in response.data
     assert b"blind-alley-es-dub" in response.data
+    assert b"new EventSource" not in response.data
+
+    with get_connection(settings.db_path) as conn:
+        completed_job = conn.execute(
+            "SELECT status, result_json FROM analysis_jobs WHERE id = ?",
+            (job["id"],),
+        ).fetchone()
+        event_types = [
+            row["event_type"]
+            for row in conn.execute(
+                "SELECT event_type FROM job_events WHERE job_id = ? ORDER BY id",
+                (job["id"],),
+            ).fetchall()
+        ]
+    assert completed_job["status"] == "done"
+    assert json.loads(completed_job["result_json"])["docs_seen"] == 1
+    assert "metadata_started" in event_types
+    assert "film_complete" in event_types
 
 
-def test_canonicalize_ingestor_title_strips_parenthetical_suffixes() -> None:
+def test_canonicalize_ingestor_title_strips_parenthetical_suffixes(monkeypatch) -> None:
+    monkeypatch.setenv("IA_KISSING_USE_CODEX_TITLE_CANONICALIZER", "0")
     result = _canonicalize_ingestor_title("Never Take Candy From A Stranger (restored, colorized)")
     assert result["canonical_title"] == "Never Take Candy From A Stranger"
     assert "canonicalized sibling-search title" in result["decisions"][0]["decision"]

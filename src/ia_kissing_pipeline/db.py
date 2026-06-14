@@ -61,6 +61,16 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS job_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES analysis_jobs(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_events_job_id_id ON job_events(job_id, id);
+
 CREATE TABLE IF NOT EXISTS shots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     film_id INTEGER NOT NULL REFERENCES films(id) ON DELETE CASCADE,

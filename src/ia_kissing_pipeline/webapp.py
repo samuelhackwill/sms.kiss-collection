@@ -15,9 +15,10 @@ import time
 import re
 import zipfile
 from pathlib import Path
+from typing import Callable
 from urllib import request as urllib_request
 
-from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, send_file, stream_with_context, url_for
 from PIL import Image, ImageDraw, UnidentifiedImageError
 
 from ia_kissing_pipeline.config import load_settings
@@ -25,6 +26,7 @@ from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.main import _resolve_source_video
 from ia_kissing_pipeline.ingest.ia_client import IAClient
 from ia_kissing_pipeline.ingest.ia_ingest import ingest_from_ia, make_checkpoint_key, normalize_item
+from ia_kissing_pipeline.jobs.events import append_job_event, list_job_events, list_recent_job_events
 from ia_kissing_pipeline.main import run_metadata_scoring
 from ia_kissing_pipeline.scoring.metadata_rules import score_metadata
 from ia_kissing_pipeline.utils.time import utc_now_iso
@@ -461,6 +463,14 @@ INGESTOR_TEMPLATE = """
     .dup-item { border: 1px solid #314056; border-radius: 12px; padding: 10px; background: #0b1016; }
     .dup-title { font-weight: 700; margin-bottom: 4px; }
     .dup-meta { color: var(--muted); font-size: 12px; }
+    .progress-shell { height: 10px; margin-top: 14px; border-radius: 999px; overflow: hidden; background: #0b1016; border: 1px solid var(--border); }
+    .progress-bar { height: 100%; width: {{ job_progress_percent }}%; background: linear-gradient(90deg, #26714a, #87f0ae); transition: width 180ms ease; }
+    .activity-log { max-height: 300px; overflow: auto; display: grid; gap: 8px; margin-top: 12px; }
+    .activity-item { border-left: 3px solid #314056; padding: 7px 10px; background: #0b1016; font: 12px/1.45 monospace; color: #d7e5f7; }
+    .activity-item.codex { border-color: #8a64d6; }
+    .activity-item.done { border-color: #2d7f55; }
+    .activity-item.error { border-color: #b64d5f; color: #ffd3db; }
+    .job-meta { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 12px; color: var(--muted); font: 12px/1.4 monospace; }
     @media (max-width: 1050px) {
       form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .machine, .film-grid { grid-template-columns: 1fr; }
@@ -471,34 +481,55 @@ INGESTOR_TEMPLATE = """
   <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
   <div class="panel">
     <h1 style="margin-top:0;">Ingestor</h1>
-    <p class="muted">Dry-run only. This page mirrors the current ingestor state machine: checkpoint, Internet Archive search, metadata normalization, then duplicate-title search across Archive metadata.</p>
-    <form method="get" action="{{ url_for('ingestor_index') }}">
+    <p class="muted">Dry-run only. Runs in a background worker and streams Internet Archive search, metadata normalization, Codex title checks, and duplicate-title probing live.</p>
+    <form method="post" action="{{ url_for('ingestor_start_job') }}">
       <label>Query <input type="text" name="query" value="{{ form_data['query'] }}"></label>
       <label>Start page <input type="number" min="1" name="page" value="{{ form_data['page'] }}"></label>
       <label>Limit <input type="number" min="1" max="20" name="limit" value="{{ form_data['limit'] }}"></label>
       <label>Rows per IA hit <input type="number" min="1" max="20" name="rows" value="{{ form_data['rows'] }}"></label>
       <label>Duplicate hits <input type="number" min="1" max="12" name="duplicate_rows" value="{{ form_data['duplicate_rows'] }}"></label>
-      <button type="submit" name="run" value="1">Run Dry Ingest</button>
+      <button type="submit">Queue Dry Ingest</button>
     </form>
+    {% if job %}
+      <div class="job-meta">
+        <span>job={{ job['id'] }}</span>
+        <span id="job-status">status={{ job['status'] }}</span>
+        <span id="job-phase">phase={{ job['phase'] }}</span>
+        <span id="job-progress">{{ job_progress_percent }}%</span>
+      </div>
+      <div class="progress-shell"><div class="progress-bar" id="progress-bar"></div></div>
+    {% endif %}
     <div class="machine">
-      <div class="state {{ 'active' if state['checkpoint'] else '' }}">
+      <div class="state {{ 'active' if state['checkpoint'] else '' }}" data-phase-card="checkpoint">
         <div class="state-title">1. Checkpoint</div>
-        <div class="state-value">{{ checkpoint_text }}</div>
+        <div class="state-value" id="checkpoint-text">{{ checkpoint_text }}</div>
       </div>
-      <div class="state {{ 'active' if state['search'] else '' }}">
+      <div class="state {{ 'active' if state['search'] else '' }}" data-phase-card="searching">
         <div class="state-title">2. IA Search</div>
-        <div class="state-value">{{ search_text }}</div>
+        <div class="state-value" id="search-text">{{ search_text }}</div>
       </div>
-      <div class="state {{ 'active' if state['metadata'] else '' }}">
+      <div class="state {{ 'active' if state['metadata'] else '' }}" data-phase-card="loading_metadata">
         <div class="state-title">3. Metadata Debug</div>
-        <div class="state-value">{{ metadata_text }}</div>
+        <div class="state-value" id="metadata-text">{{ metadata_text }}</div>
       </div>
-      <div class="state {{ 'active' if state['duplicates'] else '' }}">
+      <div class="state {{ 'active' if state['duplicates'] else '' }}" data-phase-card="probing_duplicates">
         <div class="state-title">4. Duplicate Probe</div>
-        <div class="state-value">{{ duplicate_text }}</div>
+        <div class="state-value" id="duplicate-text">{{ duplicate_text }}</div>
       </div>
     </div>
   </div>
+  {% if job %}
+    <div class="panel">
+      <h2 style="margin-top:0;">Live Activity</h2>
+      <div class="activity-log" id="activity-log">
+        {% for event in recent_events %}
+          <div class="activity-item {{ 'codex' if event['event_type'].startswith('codex_') else event['event_type'] }}">
+            {{ event['created_at'] }} | {{ event['payload'].get('message', event['event_type']) }}
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+  {% endif %}
   {% for film in results %}
     <div class="film-card">
       <div class="film-head">
@@ -556,6 +587,69 @@ metadata_block={{ item['metadata_block_reasons']|join(', ') if item['metadata_bl
       </div>
     </div>
   {% endfor %}
+  {% if job_active %}
+  <script>
+    const jobId = {{ job['id'] }};
+    const eventSource = new EventSource("{{ event_stream_url }}");
+    const activityLog = document.getElementById("activity-log");
+    const progressBar = document.getElementById("progress-bar");
+    const progressText = document.getElementById("job-progress");
+    const statusText = document.getElementById("job-status");
+    const phaseText = document.getElementById("job-phase");
+
+    const activatePhase = (phase) => {
+      const phaseMap = {
+        queued: "checkpoint",
+        searching: "searching",
+        loading_metadata: "loading_metadata",
+        checking_title: "loading_metadata",
+        probing_duplicates: "probing_duplicates",
+      };
+      document.querySelectorAll("[data-phase-card]").forEach((card) => card.classList.remove("active"));
+      const card = document.querySelector(`[data-phase-card="${phaseMap[phase] || phase}"]`);
+      if (card) card.classList.add("active");
+    };
+
+    const appendActivity = (eventType, payload) => {
+      if (!activityLog) return;
+      const item = document.createElement("div");
+      item.className = `activity-item ${eventType.startsWith("codex_") ? "codex" : eventType}`;
+      item.textContent = `${new Date().toLocaleTimeString()} | ${payload.message || eventType}`;
+      activityLog.appendChild(item);
+      activityLog.scrollTop = activityLog.scrollHeight;
+    };
+
+    const applyProgress = (payload) => {
+      const progress = Math.max(0, Math.min(1, Number(payload.progress || 0)));
+      const percent = Math.round(progress * 100);
+      if (progressBar) progressBar.style.width = `${percent}%`;
+      if (progressText) progressText.textContent = `${percent}%`;
+      if (phaseText && payload.phase) phaseText.textContent = `phase=${payload.phase}`;
+      if (statusText) statusText.textContent = `status=${payload.status || "running"}`;
+      if (payload.phase) activatePhase(payload.phase);
+    };
+
+    const eventTypes = [
+      "queued", "job_started", "search_page_started", "search_page_complete",
+      "metadata_started", "codex_title_started", "codex_title_complete",
+      "duplicate_probe_started", "duplicate_candidate_complete",
+      "duplicate_probe_complete", "film_complete", "done", "error",
+    ];
+    eventTypes.forEach((eventType) => {
+      eventSource.addEventListener(eventType, (event) => {
+        const payload = JSON.parse(event.data);
+        appendActivity(eventType, payload);
+        applyProgress(payload);
+        if (eventType === "done" || eventType === "error") {
+          eventSource.close();
+          window.setTimeout(() => {
+            window.location.href = `{{ url_for('ingestor_index') }}?job_id=${jobId}`;
+          }, 500);
+        }
+      });
+    });
+  </script>
+  {% endif %}
 </body>
 </html>
 """
@@ -2064,43 +2158,46 @@ def create_app() -> Flask:
 
     @app.get("/ingestor")
     def ingestor_index():
-        default_query = request.args.get("query", type=str) or QUEUE_INGEST_QUERY
+        requested_job_id = request.args.get("job_id", type=int)
         with get_connection(settings.db_path) as conn:
+            job = _load_ingestor_job(conn, requested_job_id)
+            job_payload = job["payload"] if job else {}
+            default_query = request.args.get("query", type=str) or job_payload.get("query") or QUEUE_INGEST_QUERY
             checkpoint = _load_ingest_checkpoint(conn, default_query)
-        default_page = int(request.args.get("page", type=int) or (checkpoint["next_page"] if checkpoint else 1))
+            recent_events = list_recent_job_events(conn, int(job["id"]), limit=100) if job else []
+        default_page = int(
+            request.args.get("page", type=int)
+            or job_payload.get("start_page")
+            or (checkpoint["next_page"] if checkpoint else 1)
+        )
         form_data = {
             "query": default_query,
             "page": max(1, default_page),
-            "limit": max(1, min(20, request.args.get("limit", type=int) or QUEUE_INGEST_LIMIT)),
-            "rows": max(1, min(20, request.args.get("rows", type=int) or QUEUE_INGEST_ROWS)),
-            "duplicate_rows": max(1, min(12, request.args.get("duplicate_rows", type=int) or 6)),
+            "limit": max(1, min(20, request.args.get("limit", type=int) or job_payload.get("limit") or QUEUE_INGEST_LIMIT)),
+            "rows": max(1, min(20, request.args.get("rows", type=int) or job_payload.get("rows") or QUEUE_INGEST_ROWS)),
+            "duplicate_rows": max(
+                1,
+                min(12, request.args.get("duplicate_rows", type=int) or job_payload.get("duplicate_rows") or 6),
+            ),
         }
-        results: list[dict] = []
+        dry_run = job["result"] if job and job["status"] == "done" else {}
+        results = dry_run.get("results", [])
         state = {"checkpoint": True, "search": False, "metadata": False, "duplicates": False}
         search_text = "waiting for dry run"
         metadata_text = "no normalized films yet"
         duplicate_text = "no duplicate-title probe yet"
-        if request.args.get("run") == "1":
-            dry_run = _run_ingestor_dry_run(
-                settings,
-                query=form_data["query"],
-                start_page=form_data["page"],
-                limit=form_data["limit"],
-                rows=form_data["rows"],
-                duplicate_rows=form_data["duplicate_rows"],
-            )
-            results = dry_run["results"]
+        if dry_run:
             state = {
                 "checkpoint": True,
-                "search": dry_run["docs_seen"] > 0,
+                "search": dry_run.get("docs_seen", 0) > 0,
                 "metadata": bool(results),
                 "duplicates": any(item["duplicate_hits"] for item in results),
             }
             search_text = (
-                f"query={dry_run['query']}\n"
-                f"start_page={dry_run['start_page']}\n"
-                f"pages_hit={dry_run['pages_hit']}\n"
-                f"films_seen={dry_run['docs_seen']}"
+                f"query={dry_run.get('query', form_data['query'])}\n"
+                f"start_page={dry_run.get('start_page', form_data['page'])}\n"
+                f"pages_hit={dry_run.get('pages_hit', 0)}\n"
+                f"films_seen={dry_run.get('docs_seen', 0)}"
             )
             metadata_text = (
                 f"normalized_films={len(results)}\n"
@@ -2110,6 +2207,12 @@ def create_app() -> Flask:
                 f"films_with_siblings={sum(1 for item in results if item['duplicate_hits'])}\n"
                 f"total_sibling_hits={sum(len(item['duplicate_hits']) for item in results)}"
             )
+        elif job:
+            phase = job["phase"]
+            state["search"] = phase in {"searching", "loading_metadata", "checking_title", "probing_duplicates", "done"}
+            state["metadata"] = phase in {"loading_metadata", "checking_title", "probing_duplicates", "done"}
+            state["duplicates"] = phase in {"probing_duplicates", "done"}
+            search_text = job["message"] or f"job {job['id']} is {job['status']}"
         checkpoint_text = (
             f"query={default_query}\n"
             f"next_page={checkpoint['next_page']}\n"
@@ -2127,6 +2230,79 @@ def create_app() -> Flask:
             duplicate_text=duplicate_text,
             state=state,
             results=results,
+            job=job,
+            job_active=bool(job and job["status"] in {"queued", "running"}),
+            job_progress_percent=int(round(float(job["progress"]) * 100)) if job else 0,
+            recent_events=recent_events,
+            event_stream_url=(
+                url_for(
+                    "ingestor_job_events",
+                    job_id=job["id"],
+                    after=recent_events[-1]["id"] if recent_events else 0,
+                )
+                if job
+                else None
+            ),
+        )
+
+    @app.post("/ingestor/jobs")
+    def ingestor_start_job():
+        payload = {
+            "query": request.form.get("query", type=str) or QUEUE_INGEST_QUERY,
+            "start_page": max(1, request.form.get("page", type=int) or 1),
+            "limit": max(1, min(20, request.form.get("limit", type=int) or QUEUE_INGEST_LIMIT)),
+            "rows": max(1, min(20, request.form.get("rows", type=int) or QUEUE_INGEST_ROWS)),
+            "duplicate_rows": max(1, min(12, request.form.get("duplicate_rows", type=int) or 6)),
+        }
+        job_id = _queue_ingestor_dry_run(settings, payload)
+        return redirect(url_for("ingestor_index", job_id=job_id))
+
+    @app.get("/ingestor/jobs/<int:job_id>/events")
+    def ingestor_job_events(job_id: int):
+        with get_connection(settings.db_path) as conn:
+            job = _load_ingestor_job(conn, job_id)
+        if not job:
+            abort(404)
+        try:
+            after_id = int(request.headers.get("Last-Event-ID") or request.args.get("after", 0))
+        except ValueError:
+            after_id = 0
+
+        @stream_with_context
+        def generate():
+            nonlocal after_id
+            yield "retry: 1000\n\n"
+            idle_polls = 0
+            while True:
+                with get_connection(settings.db_path) as conn:
+                    events = list_job_events(conn, job_id, after_id=after_id, limit=100)
+                    current_job = _load_ingestor_job(conn, job_id)
+                for event in events:
+                    after_id = event["id"]
+                    payload = {
+                        **event["payload"],
+                        "created_at": event["created_at"],
+                        "status": current_job["status"] if current_job else "error",
+                    }
+                    yield (
+                        f"id: {event['id']}\n"
+                        f"event: {event['event_type']}\n"
+                        f"data: {json.dumps(payload, sort_keys=True)}\n\n"
+                    )
+                if current_job is None or current_job["status"] in {"done", "error"}:
+                    return
+                idle_polls += 1
+                if idle_polls % 20 == 0:
+                    yield ": keepalive\n\n"
+                time.sleep(0.5)
+
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.post("/what-is-a-kiss/<int:clip_id>/load-frames")
@@ -3890,6 +4066,55 @@ def _load_ingest_checkpoint(conn, query: str) -> dict | None:
     return dict(row) if row else None
 
 
+def _load_ingestor_job(conn, job_id: int | None = None) -> dict | None:
+    if job_id is None:
+        row = conn.execute(
+            """
+            SELECT id, status, payload_json, result_json, error_text, created_at, updated_at
+            FROM analysis_jobs
+            WHERE film_id IS NULL AND job_type = 'ingestor_dry_run'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id, status, payload_json, result_json, error_text, created_at, updated_at
+            FROM analysis_jobs
+            WHERE id = ? AND film_id IS NULL AND job_type = 'ingestor_dry_run'
+            """,
+            (job_id,),
+        ).fetchone()
+    if not row:
+        return None
+    payload = json.loads(row["payload_json"] or "{}")
+    result = json.loads(row["result_json"] or "{}")
+    latest_event = conn.execute(
+        """
+        SELECT payload_json
+        FROM job_events
+        WHERE job_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (row["id"],),
+    ).fetchone()
+    latest_event_payload = json.loads(latest_event["payload_json"] or "{}") if latest_event else {}
+    return {
+        "id": int(row["id"]),
+        "status": row["status"],
+        "payload": payload,
+        "result": result,
+        "phase": result.get("phase", row["status"]),
+        "progress": float(result.get("progress", 0.0)),
+        "message": latest_event_payload.get("message"),
+        "error_text": row["error_text"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _code_archive_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -3939,6 +4164,8 @@ INGESTOR_VARIANT_FLAGS = {
     "italian": ("italian", "language-specific variant"),
     "turkish": ("turkish", "language-specific variant"),
 }
+
+IngestorProgressCallback = Callable[[str, dict[str, object]], None]
 
 
 def _detect_ingestor_variant_flags(*parts: str | None) -> list[dict[str, str]]:
@@ -4044,7 +4271,10 @@ def _call_codex_ingestor_title_canonicalizer(original_title: str, cleaned_title:
     }
 
 
-def _canonicalize_ingestor_title(title: str) -> dict[str, object]:
+def _canonicalize_ingestor_title(
+    title: str,
+    progress_callback: IngestorProgressCallback | None = None,
+) -> dict[str, object]:
     original = (title or "").strip()
     cleaned = re.sub(r"\s*[\(\[].*?[\)\]]\s*$", "", original)
     cleaned = re.sub(r"\s*[\(\[].*?[\)\]]", "", cleaned)
@@ -4066,6 +4296,16 @@ def _canonicalize_ingestor_title(title: str) -> dict[str, object]:
                 "heuristic": "title cleanup",
                 "decision": "kept original title for sibling search",
             }
+        )
+    if progress_callback:
+        progress_callback(
+            "codex_title_started",
+            {
+                "phase": "checking_title",
+                "message": f"Codex is checking the canonical title for {original!r}",
+                "original_title": original,
+                "cleaned_title": cleaned,
+            },
         )
     codex_result = _call_codex_ingestor_title_canonicalizer(original, cleaned)
     codex_title = codex_result.get("title")
@@ -4109,6 +4349,21 @@ def _canonicalize_ingestor_title(title: str) -> dict[str, object]:
                 "decision": detail,
             }
         )
+    if progress_callback:
+        progress_callback(
+            "codex_title_complete",
+            {
+                "phase": "checking_title",
+                "message": (
+                    f"Codex title check for {original!r}: "
+                    f"{codex_result.get('status')} -> {cleaned!r}"
+                ),
+                "original_title": original,
+                "canonical_title": cleaned,
+                "codex_status": codex_result.get("status"),
+                "model": codex_result.get("model"),
+            },
+        )
     return {"canonical_title": cleaned, "decisions": decisions}
 
 
@@ -4117,10 +4372,25 @@ def _same_title_query(title: str) -> str:
     return f'title:"{escaped}"'
 
 
-def _build_duplicate_hits(client: IAClient, title: str, archive_identifier: str, rows: int) -> dict[str, object]:
+def _build_duplicate_hits(
+    client: IAClient,
+    title: str,
+    archive_identifier: str,
+    rows: int,
+    progress_callback: IngestorProgressCallback | None = None,
+) -> dict[str, object]:
     clean_title = (title or "").strip()
     if not clean_title:
         return {"query_title": clean_title, "hits": [], "decisions": []}
+    if progress_callback:
+        progress_callback(
+            "duplicate_probe_started",
+            {
+                "phase": "probing_duplicates",
+                "message": f"Searching Internet Archive siblings for {clean_title!r}",
+                "query_title": clean_title,
+            },
+        )
     payload = client.fetch_search_page(_same_title_query(clean_title), page=1, rows=rows + 1)
     hits = []
     decisions = []
@@ -4185,27 +4455,100 @@ def _build_duplicate_hits(client: IAClient, title: str, archive_identifier: str,
                 "why": why or ["same-title sibling candidate"],
             }
         )
+        if progress_callback:
+            progress_callback(
+                "duplicate_candidate_complete",
+                {
+                    "phase": "probing_duplicates",
+                    "message": f"{decision}: {normalized['title']!r} ({doc.get('identifier')})",
+                    "query_title": clean_title,
+                    "archive_identifier": doc.get("identifier"),
+                    "title": normalized["title"],
+                    "decision": decision,
+                },
+            )
         if len(hits) >= rows:
             break
+    if progress_callback:
+        progress_callback(
+            "duplicate_probe_complete",
+            {
+                "phase": "probing_duplicates",
+                "message": f"Duplicate probe for {clean_title!r} found {len(hits)} sibling hit(s)",
+                "query_title": clean_title,
+                "hit_count": len(hits),
+            },
+        )
     return {"query_title": clean_title, "hits": hits, "decisions": decisions}
 
 
-def _run_ingestor_dry_run(settings, query: str, start_page: int, limit: int, rows: int, duplicate_rows: int) -> dict:
+def _run_ingestor_dry_run(
+    settings,
+    query: str,
+    start_page: int,
+    limit: int,
+    rows: int,
+    duplicate_rows: int,
+    progress_callback: IngestorProgressCallback | None = None,
+) -> dict:
     client = IAClient(settings.cache_dir, settings.user_agent, throttle_seconds=0.2)
     page = max(1, start_page)
     remaining = max(1, limit)
+    total = remaining
     docs_seen = 0
     pages_hit = 0
     results: list[dict] = []
 
     while remaining > 0:
         page_rows = min(rows, remaining)
+        if progress_callback:
+            progress_callback(
+                "search_page_started",
+                {
+                    "phase": "searching",
+                    "progress": 0.05 + 0.9 * docs_seen / total,
+                    "message": f"Searching Internet Archive page {page} for {query!r}",
+                    "query": query,
+                    "page": page,
+                    "rows": page_rows,
+                },
+            )
         payload = client.fetch_search_page(query, page=page, rows=page_rows)
         docs = payload.get("response", {}).get("docs", [])
         pages_hit += 1
+        if progress_callback:
+            progress_callback(
+                "search_page_complete",
+                {
+                    "phase": "searching",
+                    "progress": 0.05 + 0.9 * docs_seen / total,
+                    "message": f"Internet Archive page {page} returned {len(docs)} film candidate(s)",
+                    "query": query,
+                    "page": page,
+                    "doc_count": len(docs),
+                },
+            )
         if not docs:
             break
         for doc in docs:
+            current = docs_seen + 1
+            film_base_progress = 0.05 + 0.9 * docs_seen / total
+            film_span = 0.9 / total
+            identifier = doc["identifier"]
+            title = doc.get("title") or identifier
+            if progress_callback:
+                progress_callback(
+                    "metadata_started",
+                    {
+                        "phase": "loading_metadata",
+                        "progress": film_base_progress + film_span * 0.1,
+                        "message": f"Loading metadata for {title!r} ({identifier})",
+                        "archive_identifier": identifier,
+                        "title": title,
+                        "current": current,
+                        "total": total,
+                    },
+                )
             metadata_payload = client.fetch_metadata(doc["identifier"])
             normalized = normalize_item(doc, metadata_payload)
             score = score_metadata(
@@ -4215,7 +4558,30 @@ def _run_ingestor_dry_run(settings, query: str, start_page: int, limit: int, row
                 normalized["collection"],
             )
             score_payload = {"normalized_score": score.score, **score.reasons}
-            title_analysis = _canonicalize_ingestor_title(normalized["title"])
+
+            def film_progress(event_type: str, event_payload: dict[str, object]) -> None:
+                if not progress_callback:
+                    return
+                phase_fraction = {
+                    "codex_title_started": 0.3,
+                    "codex_title_complete": 0.45,
+                    "duplicate_probe_started": 0.55,
+                    "duplicate_candidate_complete": 0.75,
+                    "duplicate_probe_complete": 0.9,
+                }.get(event_type, 0.5)
+                progress_callback(
+                    event_type,
+                    {
+                        "progress": film_base_progress + film_span * phase_fraction,
+                        "archive_identifier": normalized["archive_identifier"],
+                        "title": normalized["title"],
+                        "current": current,
+                        "total": total,
+                        **event_payload,
+                    },
+                )
+
+            title_analysis = _canonicalize_ingestor_title(normalized["title"], film_progress)
             variant_flags = _detect_ingestor_variant_flags(
                 normalized["title"],
                 normalized["description"],
@@ -4227,6 +4593,7 @@ def _run_ingestor_dry_run(settings, query: str, start_page: int, limit: int, row
                 title_analysis["canonical_title"],
                 normalized["archive_identifier"],
                 duplicate_rows,
+                film_progress,
             )
             heuristics = [
                 {
@@ -4272,6 +4639,26 @@ def _run_ingestor_dry_run(settings, query: str, start_page: int, limit: int, row
             )
             docs_seen += 1
             remaining -= 1
+            if progress_callback:
+                progress_callback(
+                    "film_complete",
+                    {
+                        "phase": "probing_duplicates",
+                        "progress": 0.05 + 0.9 * docs_seen / total,
+                        "message": (
+                            f"Completed {normalized['title']!r}: "
+                            f"canonical={title_analysis['canonical_title']!r}, "
+                            f"siblings={len(duplicate_probe['hits'])}"
+                        ),
+                        "archive_identifier": normalized["archive_identifier"],
+                        "title": normalized["title"],
+                        "canonical_title": title_analysis["canonical_title"],
+                        "duplicate_count": len(duplicate_probe["hits"]),
+                        "blocked": bool(score.reasons["blocked"]),
+                        "current": docs_seen,
+                        "total": total,
+                    },
+                )
             if remaining <= 0:
                 break
         page += 1
@@ -4697,6 +5084,60 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
         subprocess.Popen(command, cwd=project_root, env=env, stdout=log_file, stderr=log_file, start_new_session=True)
 
 
+def _queue_ingestor_dry_run(settings, payload: dict[str, object]) -> int:
+    now = utc_now_iso()
+    with get_connection(settings.db_path) as conn:
+        active_job = conn.execute(
+            """
+            SELECT id
+            FROM analysis_jobs
+            WHERE film_id IS NULL
+              AND job_type = 'ingestor_dry_run'
+              AND status IN ('queued', 'running')
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if active_job:
+            return int(active_job["id"])
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (NULL, 'ingestor_dry_run', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                json.dumps(payload, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.0}, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        append_job_event(
+            conn,
+            job_id,
+            "queued",
+            {
+                "phase": "queued",
+                "progress": 0.0,
+                "message": f"Queued dry ingest for {payload['query']!r}",
+                **payload,
+            },
+        )
+    _spawn_pipeline_command(
+        settings,
+        [
+            sys.executable,
+            "-m",
+            "ia_kissing_pipeline.webapp",
+            "ingestor-dry-run-job",
+            "--job-id",
+            str(job_id),
+        ],
+    )
+    return job_id
+
+
 def _queue_kiss_detector(settings, film_id: int, *, use_workflow_cache: bool = True) -> int:
     with get_connection(settings.db_path) as conn:
         film = conn.execute("SELECT id FROM films WHERE id = ?", (film_id,)).fetchone()
@@ -4850,6 +5291,107 @@ def _prepare_film_for_requeue(settings, film_id: int) -> bool:
             (film_id,),
         )
     return True
+
+
+def _record_ingestor_job_event(
+    settings,
+    job_id: int,
+    event_type: str,
+    payload: dict[str, object],
+    *,
+    status: str = "running",
+) -> None:
+    progress_payload = {
+        "phase": payload.get("phase", "running"),
+        "progress": float(payload.get("progress", 0.0)),
+        "message": payload.get("message"),
+    }
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = ?, result_json = ?, error_text = NULL, updated_at = ?
+            WHERE id = ? AND job_type = 'ingestor_dry_run'
+            """,
+            (status, json.dumps(progress_payload, sort_keys=True), utc_now_iso(), job_id),
+        )
+        append_job_event(conn, job_id, event_type, payload)
+
+
+def _run_ingestor_dry_run_now(job_id: int) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    try:
+        with get_connection(settings.db_path) as conn:
+            job = _load_ingestor_job(conn, job_id)
+        if not job:
+            raise ValueError(f"Ingestor dry-run job {job_id} not found")
+        payload = job["payload"]
+        _record_ingestor_job_event(
+            settings,
+            job_id,
+            "job_started",
+            {
+                "phase": "searching",
+                "progress": 0.02,
+                "message": f"Started dry ingest for {payload['query']!r}",
+                **payload,
+            },
+        )
+
+        def progress_callback(event_type: str, event_payload: dict[str, object]) -> None:
+            _record_ingestor_job_event(settings, job_id, event_type, event_payload)
+
+        dry_run = _run_ingestor_dry_run(
+            settings,
+            query=str(payload["query"]),
+            start_page=int(payload["start_page"]),
+            limit=int(payload["limit"]),
+            rows=int(payload["rows"]),
+            duplicate_rows=int(payload["duplicate_rows"]),
+            progress_callback=progress_callback,
+        )
+        result = {**dry_run, "phase": "done", "progress": 1.0}
+        done_payload = {
+            "phase": "done",
+            "progress": 1.0,
+            "message": (
+                f"Dry ingest complete: {dry_run['docs_seen']} film(s), "
+                f"{dry_run['pages_hit']} search page(s)"
+            ),
+            "docs_seen": dry_run["docs_seen"],
+            "pages_hit": dry_run["pages_hit"],
+        }
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, error_text = NULL, updated_at = ?
+                WHERE id = ? AND job_type = 'ingestor_dry_run'
+                """,
+                (json.dumps(result, sort_keys=True), utc_now_iso(), job_id),
+            )
+            append_job_event(conn, job_id, "done", done_payload)
+    except BaseException as exc:
+        error_payload = {
+            "phase": "error",
+            "progress": 1.0,
+            "message": f"Dry ingest failed: {exc}",
+            "error": str(exc),
+        }
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'error', result_json = ?, error_text = ?, updated_at = ?
+                WHERE id = ? AND job_type = 'ingestor_dry_run'
+                """,
+                (json.dumps(error_payload, sort_keys=True), str(exc), utc_now_iso(), job_id),
+            )
+            append_job_event(conn, job_id, "error", error_payload)
+        return 1
+    return 0
 
 
 def _build_manual_clip_now(job_id: int, film_id: int, mark_id: int, pre_seconds: float, post_seconds: float) -> int:
@@ -5631,6 +6173,14 @@ def _update_job(conn, job_id: int, status: str, phase: str, progress: float, err
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "ingestor-dry-run-job":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("ingestor-dry-run-job")
+        parser.add_argument("--job-id", type=int, required=True)
+        args = parser.parse_args()
+        return _run_ingestor_dry_run_now(args.job_id)
     if len(sys.argv) > 1 and sys.argv[1] == "build-manual-clip":
         import argparse
 
