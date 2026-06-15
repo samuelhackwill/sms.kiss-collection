@@ -189,6 +189,22 @@ CREATE TABLE IF NOT EXISTS ziai_candidates (
 
 CREATE INDEX IF NOT EXISTS idx_ziai_candidates_film_id ON ziai_candidates(film_id);
 
+CREATE TABLE IF NOT EXISTS ziai_frame_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    film_id INTEGER NOT NULL REFERENCES films(id) ON DELETE CASCADE,
+    frame_index INTEGER NOT NULL,
+    timestamp_seconds REAL NOT NULL,
+    frame_path TEXT NOT NULL,
+    classifier_prediction INTEGER NOT NULL,
+    classifier_confidence REAL NOT NULL DEFAULT 0,
+    review_label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (film_id, frame_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ziai_frame_reviews_film_id ON ziai_frame_reviews(film_id);
+
 CREATE TABLE IF NOT EXISTS queue_runtime (
     queue_name TEXT PRIMARY KEY,
     state TEXT NOT NULL DEFAULT 'idle',

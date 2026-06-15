@@ -840,10 +840,13 @@ FILM_TEMPLATE = """
     .ziai-frame-card.candidate-pending { border: 3px solid #e8a33c; box-shadow: 0 0 16px rgba(232,163,60,0.28); }
     .ziai-frame-card.candidate-accepted { border: 3px solid #46b978; box-shadow: 0 0 16px rgba(70,185,120,0.3); }
     .ziai-frame-card.candidate-rejected { border: 3px solid #c64d62; opacity: 0.72; }
+    .ziai-frame-card.missed-kiss { border: 3px solid #62b9ff; box-shadow: 0 0 16px rgba(98,185,255,0.35); }
     .ziai-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; color: var(--muted); font-size: 12px; }
     .ziai-legend span { display: inline-flex; align-items: center; gap: 6px; }
     .ziai-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
     .ziai-filter.active { outline: 2px solid #87f0ae; color: #d8ffe7; }
+    .ziai-missed-button { padding: 4px 7px; border-radius: 7px; font-size: 11px; }
+    .ziai-missed-button:disabled { cursor: default; opacity: 0.75; }
     .kiss-detector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; }
     .action-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
     .button-link { display: inline-flex; align-items: center; padding: 8px 12px; background: linear-gradient(180deg, #2666b8 0%, var(--accent-2) 100%); color: white; border: 1px solid #3a78c4; border-radius: 12px; cursor: pointer; text-decoration: none; }
@@ -971,6 +974,7 @@ FILM_TEMPLATE = """
                 <span><i class="ziai-dot" style="background:#e8a33c;"></i>pending candidate</span>
                 <span><i class="ziai-dot" style="background:#46b978;"></i>accepted candidate</span>
                 <span><i class="ziai-dot" style="background:#c64d62;"></i>rejected candidate</span>
+                <span><i class="ziai-dot" style="background:#62b9ff;"></i>marked missed kiss</span>
               </div>
               <div id="ziai-frame-status" class="skim-overview-status">Collapsed.</div>
               <div id="ziai-frame-grid" class="skim-overview-grid"></div>
@@ -1687,7 +1691,9 @@ FILM_TEMPLATE = """
   const renderZiaiFrame = (frame) => {
     const card = document.createElement("div");
     card.className = "skim-frame-card ziai-frame-card";
-    if (frame.candidate_review_status) {
+    if (frame.missed_kiss) {
+      card.classList.add("missed-kiss");
+    } else if (frame.candidate_review_status) {
       card.classList.add(`candidate-${frame.candidate_review_status}`);
     } else if (frame.prediction === 1) {
       card.classList.add("classifier-positive");
@@ -1741,6 +1747,28 @@ FILM_TEMPLATE = """
       reviewLink.textContent = "accept / reject";
       actions.appendChild(reviewLink);
     }
+
+    const missedButton = document.createElement("button");
+    missedButton.type = "button";
+    missedButton.className = "ghost ziai-missed-button";
+    missedButton.textContent = frame.missed_kiss ? "missed kiss saved" : "mark missed kiss";
+    missedButton.disabled = Boolean(frame.missed_kiss);
+    missedButton.addEventListener("click", async () => {
+      missedButton.disabled = true;
+      missedButton.textContent = "saving...";
+      try {
+        const response = await fetch(frame.missed_kiss_url, { method: "POST" });
+        if (!response.ok) throw new Error(`Missed kiss request failed: ${response.status}`);
+        frame.missed_kiss = true;
+        card.classList.remove("classifier-positive", "candidate-pending", "candidate-accepted", "candidate-rejected");
+        card.classList.add("missed-kiss");
+        missedButton.textContent = "missed kiss saved";
+      } catch (_error) {
+        missedButton.disabled = false;
+        missedButton.textContent = "mark missed kiss";
+      }
+    });
+    actions.appendChild(missedButton);
 
     card.appendChild(image);
     card.appendChild(meta);
@@ -2979,6 +3007,51 @@ def create_app() -> Flask:
                 limit=limit,
             )
         return jsonify(payload)
+
+    @app.post("/films/<int:film_id>/ziai-frames/<int:frame_index>/missed-kiss")
+    def ziai_mark_missed_kiss(film_id: int, frame_index: int):
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            result_path = settings.preview_dir / film["archive_identifier"] / "ziai" / "result.json"
+            if not result_path.exists():
+                abort(404)
+            result = json.loads(result_path.read_text())
+            frame = next(
+                (item for item in result.get("frames", []) if int(item.get("index", -1)) == frame_index),
+                None,
+            )
+            if frame is None:
+                abort(404)
+            now = utc_now_iso()
+            conn.execute(
+                """
+                INSERT INTO ziai_frame_reviews (
+                    film_id, frame_index, timestamp_seconds, frame_path,
+                    classifier_prediction, classifier_confidence, review_label,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'missed_kiss', ?, ?)
+                ON CONFLICT(film_id, frame_index) DO UPDATE SET
+                    timestamp_seconds = excluded.timestamp_seconds,
+                    frame_path = excluded.frame_path,
+                    classifier_prediction = excluded.classifier_prediction,
+                    classifier_confidence = excluded.classifier_confidence,
+                    review_label = excluded.review_label,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    film_id,
+                    frame_index,
+                    float(frame.get("timestamp_seconds", 0.0)),
+                    str(frame["frame_path"]),
+                    int(frame.get("prediction", 0)),
+                    float(frame.get("confidence", 0.0)),
+                    now,
+                    now,
+                ),
+            )
+        return jsonify({"saved": True, "frame_index": frame_index, "review_label": "missed_kiss"})
 
     @app.get("/films/<int:film_id>/kiss-detector")
     def kiss_detector_payload(film_id: int):
@@ -4668,6 +4741,17 @@ def _load_ziai_frame_page(
             pass
         candidates.append(candidate)
 
+    missed_kiss_indices = {
+        int(row["frame_index"])
+        for row in conn.execute(
+            """
+            SELECT frame_index
+            FROM ziai_frame_reviews
+            WHERE film_id = ? AND review_label = 'missed_kiss'
+            """,
+            (film_id,),
+        ).fetchall()
+    }
     counts = {"all": 0, "positive": 0, "candidate": 0}
     visible_frames = []
     filtered_count = 0
@@ -4700,13 +4784,21 @@ def _load_ziai_frame_page(
         if not include:
             continue
         if offset <= filtered_count < offset + limit:
+            result_index = int(raw_frame.get("index", filtered_count))
             visible_frames.append(
                 {
-                    "index": int(raw_frame.get("index", filtered_count)) + 1,
+                    "index": result_index + 1,
+                    "result_index": result_index,
                     "timestamp_seconds": round(timestamp_seconds, 3),
                     "prediction": prediction,
                     "confidence": float(raw_frame.get("confidence", 0.0)),
                     "media_url": url_for("media_file", kind="preview", relpath=relpath),
+                    "missed_kiss": result_index in missed_kiss_indices,
+                    "missed_kiss_url": url_for(
+                        "ziai_mark_missed_kiss",
+                        film_id=film_id,
+                        frame_index=result_index,
+                    ),
                     "candidate_id": int(candidate["id"]) if candidate else None,
                     "candidate_index": int(candidate["candidate_index"]) if candidate else None,
                     "candidate_review_status": candidate["review_status"] if candidate else None,

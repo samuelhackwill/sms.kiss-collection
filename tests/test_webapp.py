@@ -503,6 +503,7 @@ def test_film_detail_lists_paginated_ziai_classifier_frames(tmp_path: Path, monk
     assert b"ZIAI Classifier Frames" in page.data
     assert b"Classifier Kisses" in page.data
     assert b"candidate-pending" in page.data
+    assert b"mark missed kiss" in page.data
 
     candidate_payload = candidate_response.get_json()
     assert candidate_payload["counts"] == {"all": 3, "candidate": 1, "positive": 2}
@@ -520,6 +521,28 @@ def test_film_detail_lists_paginated_ziai_classifier_frames(tmp_path: Path, monk
     assert page_payload["frames"][0]["index"] == 2
     assert page_payload["next_offset"] == 2
     assert page_payload["has_more"] is True
+
+    marked_response = client.post("/films/1/ziai-frames/1/missed-kiss")
+    marked_payload = client.get("/films/1/ziai-frames?filter=positive").get_json()
+    assert marked_response.status_code == 200
+    assert marked_response.get_json()["review_label"] == "missed_kiss"
+    assert marked_payload["frames"][0]["missed_kiss"] is True
+    assert marked_payload["frames"][0]["missed_kiss_url"].endswith("/ziai-frames/1/missed-kiss")
+    with get_connection(settings.db_path) as conn:
+        review = conn.execute(
+            """
+            SELECT frame_index, timestamp_seconds, classifier_prediction, classifier_confidence, review_label
+            FROM ziai_frame_reviews
+            WHERE film_id = 1
+            """
+        ).fetchone()
+    assert dict(review) == {
+        "frame_index": 1,
+        "timestamp_seconds": 5.0,
+        "classifier_prediction": 1,
+        "classifier_confidence": 0.8,
+        "review_label": "missed_kiss",
+    }
 
 
 def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypatch) -> None:
