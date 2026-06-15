@@ -738,7 +738,7 @@ ZIAI_TEMPLATE = """
     <h2 style="margin-top:0;">Human Review Candidates</h2>
     <div class="clips">
       {% for candidate in candidates %}
-        <div class="clip">
+        <div class="clip" id="ziai-candidate-{{ candidate['id'] }}">
           <strong>{{ candidate['title'] }}</strong>
           <div class="muted">candidate {{ candidate['candidate_index'] }} | {{ '%.1f'|format(candidate['start_seconds']) }}s-{{ '%.1f'|format(candidate['end_seconds']) }}s | confidence {{ '%.2f'|format(candidate['confidence']) }}</div>
           {% if candidate['media_url'] %}<video controls preload="metadata" src="{{ candidate['media_url'] }}"></video>{% endif %}
@@ -834,6 +834,16 @@ FILM_TEMPLATE = """
     .skim-frame-actions a { font-size: 11px; color: var(--muted); text-decoration: none; }
     .skim-frame-actions a:hover { color: var(--link); text-decoration: underline; }
     .skim-overview-status { margin-top: 14px; color: var(--muted); font-size: 13px; }
+    .ziai-overview { margin-top: 24px; padding-top: 18px; border-top: 1px solid rgba(49, 64, 86, 0.65); }
+    .ziai-overview h3 { margin: 0 0 8px; }
+    .ziai-frame-card.classifier-positive { border: 3px solid #d75c9a; box-shadow: 0 0 0 1px rgba(215,92,154,0.2); }
+    .ziai-frame-card.candidate-pending { border: 3px solid #e8a33c; box-shadow: 0 0 16px rgba(232,163,60,0.28); }
+    .ziai-frame-card.candidate-accepted { border: 3px solid #46b978; box-shadow: 0 0 16px rgba(70,185,120,0.3); }
+    .ziai-frame-card.candidate-rejected { border: 3px solid #c64d62; opacity: 0.72; }
+    .ziai-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; color: var(--muted); font-size: 12px; }
+    .ziai-legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .ziai-dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+    .ziai-filter.active { outline: 2px solid #87f0ae; color: #d8ffe7; }
     .kiss-detector-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-top: 14px; }
     .action-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
     .button-link { display: inline-flex; align-items: center; padding: 8px 12px; background: linear-gradient(180deg, #2666b8 0%, var(--accent-2) 100%); color: white; border: 1px solid #3a78c4; border-radius: 12px; cursor: pointer; text-decoration: none; }
@@ -947,6 +957,30 @@ FILM_TEMPLATE = """
           {% else %}
             <p class="small">No skim preview built yet.</p>
           {% endif %}
+          <div class="ziai-overview">
+            <h3>ZIAI Classifier Frames</h3>
+            {% if ziai_available %}
+              <p class="small">The roughly one-second frames passed to the trained audio/video classifier. Candidate frames are highlighted for review.</p>
+              <div class="action-row">
+                <button type="button" class="ghost ziai-filter" data-ziai-filter="all">All Frames</button>
+                <button type="button" class="ghost ziai-filter" data-ziai-filter="positive">Classifier Kisses</button>
+                <button type="button" class="ghost ziai-filter active" data-ziai-filter="candidate">Candidate Sequences</button>
+              </div>
+              <div class="ziai-legend">
+                <span><i class="ziai-dot" style="background:#d75c9a;"></i>classifier kiss</span>
+                <span><i class="ziai-dot" style="background:#e8a33c;"></i>pending candidate</span>
+                <span><i class="ziai-dot" style="background:#46b978;"></i>accepted candidate</span>
+                <span><i class="ziai-dot" style="background:#c64d62;"></i>rejected candidate</span>
+              </div>
+              <div id="ziai-frame-status" class="skim-overview-status">Collapsed.</div>
+              <div id="ziai-frame-grid" class="skim-overview-grid"></div>
+              <button type="button" id="ziai-load-more" class="ghost" style="display:none; margin-top:14px;">Load More Frames</button>
+            {% elif ziai_job and ziai_job["status"] in ("queued", "running") %}
+              <p class="small">ZIAI is currently processing this film: {{ ziai_job["status_text"] }}.</p>
+            {% else %}
+              <p class="small">No completed ZIAI classifier frames for this film yet.</p>
+            {% endif %}
+          </div>
         </div>
       </details>
     </div>
@@ -1635,6 +1669,130 @@ FILM_TEMPLATE = """
   });
 </script>
 {% endif %}
+{% if ziai_available %}
+<script>
+  const ziaiOverviewDetails = document.getElementById("skim-overview-details");
+  const ziaiFrameGrid = document.getElementById("ziai-frame-grid");
+  const ziaiFrameStatus = document.getElementById("ziai-frame-status");
+  const ziaiLoadMore = document.getElementById("ziai-load-more");
+  const ziaiFilterButtons = Array.from(document.querySelectorAll("[data-ziai-filter]"));
+  const ziaiSkimVideo = document.getElementById("skim-video");
+  const ziaiSampleEvery = {{ skim.sample_every_seconds if skim else 4 }};
+  const ziaiOutputFps = {{ skim.output_fps if skim else 12 }};
+  let ziaiFilter = "candidate";
+  let ziaiNextOffset = 0;
+  let ziaiLoading = false;
+  let ziaiLoaded = false;
+
+  const renderZiaiFrame = (frame) => {
+    const card = document.createElement("div");
+    card.className = "skim-frame-card ziai-frame-card";
+    if (frame.candidate_review_status) {
+      card.classList.add(`candidate-${frame.candidate_review_status}`);
+    } else if (frame.prediction === 1) {
+      card.classList.add("classifier-positive");
+    }
+
+    const image = document.createElement("img");
+    image.src = frame.media_url;
+    image.alt = `ZIAI classifier frame ${frame.index}`;
+    image.loading = "lazy";
+    if (ziaiSkimVideo) {
+      image.title = "Click to seek the skim review video to this source time";
+      image.style.cursor = "pointer";
+      image.addEventListener("click", () => {
+        ziaiSkimVideo.currentTime = (Number(frame.timestamp_seconds) / ziaiSampleEvery) / ziaiOutputFps;
+        ziaiSkimVideo.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "skim-frame-meta";
+    const confidence = Number(frame.confidence || 0).toFixed(3);
+    const decision = frame.prediction === 1 ? "kiss" : "not kiss";
+    const candidateText = frame.candidate_index
+      ? ` | candidate ${frame.candidate_index} (${frame.candidate_review_status})`
+      : "";
+    meta.textContent = `source ${Number(frame.timestamp_seconds).toFixed(2)}s | ${decision} ${confidence}${candidateText}`;
+
+    const actions = document.createElement("div");
+    actions.className = "skim-frame-actions";
+    actions.style.gap = "12px";
+
+    const frameLink = document.createElement("a");
+    frameLink.href = frame.media_url;
+    frameLink.target = "_blank";
+    frameLink.rel = "noreferrer";
+    frameLink.textContent = "open frame";
+    actions.appendChild(frameLink);
+
+    if (frame.candidate_media_url) {
+      const clipLink = document.createElement("a");
+      clipLink.href = frame.candidate_media_url;
+      clipLink.target = "_blank";
+      clipLink.rel = "noreferrer";
+      clipLink.textContent = "open clip";
+      actions.appendChild(clipLink);
+    }
+
+    if (frame.candidate_review_url) {
+      const reviewLink = document.createElement("a");
+      reviewLink.href = frame.candidate_review_url;
+      reviewLink.textContent = "accept / reject";
+      actions.appendChild(reviewLink);
+    }
+
+    card.appendChild(image);
+    card.appendChild(meta);
+    card.appendChild(actions);
+    ziaiFrameGrid.appendChild(card);
+  };
+
+  const loadZiaiFrames = async (reset = false) => {
+    if (ziaiLoading || !ziaiFrameGrid || !ziaiFrameStatus) return;
+    ziaiLoading = true;
+    if (reset) {
+      ziaiNextOffset = 0;
+      ziaiFrameGrid.innerHTML = "";
+    }
+    ziaiFrameStatus.textContent = "Loading ZIAI classifier frames...";
+    try {
+      const params = new URLSearchParams({
+        filter: ziaiFilter,
+        offset: String(ziaiNextOffset),
+        limit: "200",
+      });
+      const response = await fetch(`{{ url_for('ziai_frames_payload', film_id=film['id']) }}?${params}`);
+      if (!response.ok) throw new Error(`ZIAI frame request failed: ${response.status}`);
+      const payload = await response.json();
+      payload.frames.forEach(renderZiaiFrame);
+      ziaiNextOffset = payload.next_offset;
+      ziaiLoaded = true;
+      ziaiLoadMore.style.display = payload.has_more ? "inline-flex" : "none";
+      ziaiFrameStatus.textContent = (
+        `Showing ${ziaiNextOffset} of ${payload.filtered_count} ${ziaiFilter} frames | ` +
+        `${payload.counts.positive} classifier kisses | ${payload.counts.candidate} candidate frames`
+      );
+    } catch (_error) {
+      ziaiFrameStatus.textContent = "Could not load ZIAI classifier frames.";
+    } finally {
+      ziaiLoading = false;
+    }
+  };
+
+  ziaiFilterButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      ziaiFilter = button.dataset.ziaiFilter;
+      ziaiFilterButtons.forEach((item) => item.classList.toggle("active", item === button));
+      loadZiaiFrames(true);
+    });
+  });
+  ziaiLoadMore.addEventListener("click", () => loadZiaiFrames(false));
+  ziaiOverviewDetails.addEventListener("toggle", () => {
+    if (ziaiOverviewDetails.open && !ziaiLoaded) loadZiaiFrames(true);
+  });
+</script>
+{% endif %}
 {% if skim_job and skim_job["status"] in ("queued", "running") %}
 <script>
   const pollSkim = async () => {
@@ -2117,8 +2275,10 @@ def create_app() -> Flask:
             skim_job = _load_latest_job(conn, film_id, "build_skim_preview")
             clip_job = _load_latest_job(conn, film_id, "build_manual_clip")
             kiss_detector_job = _load_latest_job(conn, film_id, "kiss_detector")
+            ziai_job = _load_latest_job(conn, film_id, "ziai_film")
             review = _get_review_state(conn, film_id)
             source_cached = _source_cached(settings, film["archive_identifier"])
+            ziai_available = (settings.preview_dir / film["archive_identifier"] / "ziai" / "result.json").exists()
         return render_template_string(
             FILM_TEMPLATE,
             film=film,
@@ -2128,6 +2288,8 @@ def create_app() -> Flask:
             skim_job=skim_job,
             clip_job=clip_job,
             kiss_detector_job=kiss_detector_job,
+            ziai_job=ziai_job,
+            ziai_available=ziai_available,
             pipeline_status=_display_pipeline_status(dict(film), skim_job, review, source_cached),
         )
 
@@ -2795,6 +2957,28 @@ def create_app() -> Flask:
             abort(404)
         frames = _ensure_skim_overview(settings, film["archive_identifier"], skim)
         return jsonify({"frames": frames})
+
+    @app.get("/films/<int:film_id>/ziai-frames")
+    def ziai_frames_payload(film_id: int):
+        filter_mode = request.args.get("filter", "candidate")
+        if filter_mode not in {"all", "positive", "candidate"}:
+            abort(400)
+        offset = max(0, request.args.get("offset", 0, type=int))
+        limit = max(1, min(250, request.args.get("limit", 200, type=int)))
+        with get_connection(settings.db_path) as conn:
+            film = conn.execute("SELECT archive_identifier FROM films WHERE id = ?", (film_id,)).fetchone()
+            if not film:
+                abort(404)
+            payload = _load_ziai_frame_page(
+                conn,
+                settings,
+                film_id,
+                film["archive_identifier"],
+                filter_mode=filter_mode,
+                offset=offset,
+                limit=limit,
+            )
+        return jsonify(payload)
 
     @app.get("/films/<int:film_id>/kiss-detector")
     def kiss_detector_payload(film_id: int):
@@ -4436,6 +4620,115 @@ def _load_ziai_candidates(conn, preview_dir: Path) -> list[dict]:
             item["relpath"] = None
         candidates.append(item)
     return candidates
+
+
+def _load_ziai_frame_page(
+    conn,
+    settings,
+    film_id: int,
+    archive_identifier: str,
+    *,
+    filter_mode: str,
+    offset: int,
+    limit: int,
+) -> dict[str, object]:
+    result_path = settings.preview_dir / archive_identifier / "ziai" / "result.json"
+    if not result_path.exists():
+        return {
+            "available": False,
+            "frames": [],
+            "counts": {"all": 0, "positive": 0, "candidate": 0},
+            "filter": filter_mode,
+            "offset": offset,
+            "next_offset": offset,
+            "has_more": False,
+        }
+
+    result = json.loads(result_path.read_text())
+    preview_root = settings.preview_dir.resolve()
+    candidate_rows = conn.execute(
+        """
+        SELECT id, candidate_index, start_seconds, end_seconds, confidence, clip_path, review_status
+        FROM ziai_candidates
+        WHERE film_id = ?
+        ORDER BY candidate_index
+        """,
+        (film_id,),
+    ).fetchall()
+    candidates = []
+    for row in candidate_rows:
+        candidate = dict(row)
+        candidate["media_url"] = None
+        clip_path = Path(candidate["clip_path"]).resolve()
+        try:
+            relpath = str(clip_path.relative_to(preview_root))
+            if clip_path.exists():
+                candidate["media_url"] = url_for("media_file", kind="preview", relpath=relpath)
+        except ValueError:
+            pass
+        candidates.append(candidate)
+
+    counts = {"all": 0, "positive": 0, "candidate": 0}
+    visible_frames = []
+    filtered_count = 0
+    for raw_frame in result.get("frames", []):
+        frame_path = Path(raw_frame["frame_path"]).resolve()
+        if not frame_path.exists():
+            continue
+        try:
+            relpath = str(frame_path.relative_to(preview_root))
+        except ValueError:
+            continue
+        timestamp_seconds = float(raw_frame.get("timestamp_seconds", 0.0))
+        prediction = int(raw_frame.get("prediction", 0))
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if float(item["start_seconds"]) <= timestamp_seconds <= float(item["end_seconds"])
+            ),
+            None,
+        )
+        counts["all"] += 1
+        counts["positive"] += int(prediction == 1)
+        counts["candidate"] += int(candidate is not None)
+        include = (
+            filter_mode == "all"
+            or (filter_mode == "positive" and prediction == 1)
+            or (filter_mode == "candidate" and candidate is not None)
+        )
+        if not include:
+            continue
+        if offset <= filtered_count < offset + limit:
+            visible_frames.append(
+                {
+                    "index": int(raw_frame.get("index", filtered_count)) + 1,
+                    "timestamp_seconds": round(timestamp_seconds, 3),
+                    "prediction": prediction,
+                    "confidence": float(raw_frame.get("confidence", 0.0)),
+                    "media_url": url_for("media_file", kind="preview", relpath=relpath),
+                    "candidate_id": int(candidate["id"]) if candidate else None,
+                    "candidate_index": int(candidate["candidate_index"]) if candidate else None,
+                    "candidate_review_status": candidate["review_status"] if candidate else None,
+                    "candidate_media_url": candidate["media_url"] if candidate else None,
+                    "candidate_review_url": (
+                        url_for("ziai_index") + f"#ziai-candidate-{candidate['id']}" if candidate else None
+                    ),
+                }
+            )
+        filtered_count += 1
+
+    next_offset = offset + len(visible_frames)
+    return {
+        "available": True,
+        "frames": visible_frames,
+        "counts": counts,
+        "filter": filter_mode,
+        "offset": offset,
+        "next_offset": next_offset,
+        "has_more": next_offset < filtered_count,
+        "filtered_count": filtered_count,
+    }
 
 
 def _code_archive_root() -> Path:

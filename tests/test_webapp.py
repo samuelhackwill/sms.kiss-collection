@@ -416,6 +416,112 @@ def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monk
     assert candidate["review_status"] == "pending"
 
 
+def test_film_detail_lists_paginated_ziai_classifier_frames(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    output_dir = settings.preview_dir / "kiss_in_spring_1932" / "ziai"
+    frame_dir = output_dir / "frames"
+    candidate_dir = output_dir / "candidates"
+    frame_dir.mkdir(parents=True)
+    candidate_dir.mkdir(parents=True)
+    frame_paths = []
+    for index in range(3):
+        frame_path = frame_dir / f"frame_{index:06d}.jpg"
+        frame_path.write_bytes(b"fake-jpeg")
+        frame_paths.append(frame_path)
+    clip_path = candidate_dir / "candidate_001.mp4"
+    clip_path.write_bytes(b"fake-clip")
+    (output_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "index": 0,
+                        "frame_path": str(frame_paths[0]),
+                        "timestamp_seconds": 1.0,
+                        "prediction": 0,
+                        "confidence": 0.1,
+                    },
+                    {
+                        "index": 1,
+                        "frame_path": str(frame_paths[1]),
+                        "timestamp_seconds": 5.0,
+                        "prediction": 1,
+                        "confidence": 0.8,
+                    },
+                    {
+                        "index": 2,
+                        "frame_path": str(frame_paths[2]),
+                        "timestamp_seconds": 8.0,
+                        "prediction": 1,
+                        "confidence": 0.95,
+                    },
+                ]
+            }
+        )
+    )
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, result_json, created_at, updated_at)
+            VALUES (1, 'ziai_film', 'done', '{}', '2026-06-15T00:00:00Z', '2026-06-15T00:00:00Z')
+            """
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO ziai_candidates (
+                job_id, film_id, candidate_index, start_seconds, end_seconds,
+                confidence, clip_path, review_status, created_at
+            ) VALUES (?, 1, 1, 4.0, 6.0, 0.8, ?, 'pending', '2026-06-15T00:00:00Z')
+            """,
+            (job_id, str(clip_path)),
+        )
+
+    app = create_app()
+    client = app.test_client()
+
+    page = client.get("/films/1")
+    candidate_response = client.get("/films/1/ziai-frames?filter=candidate")
+    positive_response = client.get("/films/1/ziai-frames?filter=positive")
+    page_response = client.get("/films/1/ziai-frames?filter=all&offset=1&limit=1")
+
+    assert page.status_code == 200
+    assert b"ZIAI Classifier Frames" in page.data
+    assert b"Classifier Kisses" in page.data
+    assert b"candidate-pending" in page.data
+
+    candidate_payload = candidate_response.get_json()
+    assert candidate_payload["counts"] == {"all": 3, "candidate": 1, "positive": 2}
+    assert candidate_payload["filtered_count"] == 1
+    assert candidate_payload["frames"][0]["candidate_review_status"] == "pending"
+    assert candidate_payload["frames"][0]["candidate_media_url"].endswith("candidate_001.mp4")
+    assert candidate_payload["frames"][0]["candidate_review_url"].startswith("/ziai#ziai-candidate-")
+
+    positive_payload = positive_response.get_json()
+    assert positive_payload["filtered_count"] == 2
+    assert [frame["index"] for frame in positive_payload["frames"]] == [2, 3]
+
+    page_payload = page_response.get_json()
+    assert page_payload["filtered_count"] == 3
+    assert page_payload["frames"][0]["index"] == 2
+    assert page_payload["next_offset"] == 2
+    assert page_payload["has_more"] is True
+
+
 def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)
