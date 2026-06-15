@@ -4,27 +4,38 @@ import subprocess
 from pathlib import Path
 
 
-def extract_clip(video_path: Path, output_path: Path, start_seconds: float, duration_seconds: float) -> Path:
+def extract_clip(
+    video_path: Path,
+    output_path: Path,
+    start_seconds: float,
+    duration_seconds: float,
+    *,
+    preserve_audio: bool = False,
+) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        str(max(0.0, start_seconds)),
+        "-i",
+        str(video_path),
+        "-t",
+        str(max(0.5, duration_seconds)),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+    ]
+    if preserve_audio:
+        command.extend(["-map", "0:v:0", "-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"])
+    else:
+        command.append("-an")
+    command.append(str(output_path))
     subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-ss",
-            str(max(0.0, start_seconds)),
-            "-i",
-            str(video_path),
-            "-t",
-            str(max(0.5, duration_seconds)),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "28",
-            "-an",
-            str(output_path),
-        ],
+        command,
         text=True,
         capture_output=True,
         check=True,

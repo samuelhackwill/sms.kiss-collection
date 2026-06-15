@@ -266,7 +266,7 @@ def run_ziai_pipeline(
         )
         end_seconds = float(manifest_frames[indices[-1]]["timestamp_seconds"]) + clip_padding_seconds
         clip_path = candidates_dir / f"candidate_{candidate_index:03d}.mp4"
-        extract_clip(source_path, clip_path, start_seconds, end_seconds - start_seconds)
+        extract_clip(source_path, clip_path, start_seconds, end_seconds - start_seconds, preserve_audio=True)
         positive_confidences = [
             confidences[index]
             for index in indices

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ia_kissing_pipeline.db import connect, init_db
 from ia_kissing_pipeline.ingest.store import upsert_film_item
+from ia_kissing_pipeline.video.extract_clips import extract_clip
 from ia_kissing_pipeline.video.transcode import choose_preferred_file
 
 
@@ -71,6 +72,22 @@ def test_choose_preferred_file_prefers_marked_source(tmp_path: Path) -> None:
         )
         row = choose_preferred_file(conn, film_id)
     assert row["filename"] == "b.mp4"
+
+
+def test_extract_clip_can_preserve_audio(tmp_path: Path, monkeypatch) -> None:
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.video.extract_clips.subprocess.run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    extract_clip(tmp_path / "source.mp4", tmp_path / "silent.mp4", 1.0, 2.0)
+    extract_clip(tmp_path / "source.mp4", tmp_path / "audio.mp4", 1.0, 2.0, preserve_audio=True)
+
+    assert "-an" in commands[0]
+    assert "-an" not in commands[1]
+    assert ["-c:a", "aac", "-b:a", "128k"] == commands[1][commands[1].index("-c:a") : commands[1].index("-c:a") + 4]
 
 
 def test_video_prepare_and_shot_flow(tmp_path: Path) -> None:
