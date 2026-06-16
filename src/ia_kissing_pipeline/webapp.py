@@ -29,6 +29,16 @@ from ia_kissing_pipeline.ingest.ia_client import IAClient
 from ia_kissing_pipeline.ingest.ia_ingest import ingest_from_ia, make_checkpoint_key, normalize_item
 from ia_kissing_pipeline.jobs.events import append_job_event, list_job_events, list_recent_job_events
 from ia_kissing_pipeline.main import run_metadata_scoring
+from ia_kissing_pipeline.media_storage import (
+    delete_media_file,
+    delete_media_tree,
+    ensure_local_media_file,
+    has_media_reference,
+    media_public_url,
+    media_relpath,
+    upload_media_file,
+    upload_media_tree,
+)
 from ia_kissing_pipeline.scoring.metadata_rules import score_metadata
 from ia_kissing_pipeline.utils.time import utc_now_iso
 from ia_kissing_pipeline.ziai import run_ziai_pipeline
@@ -925,7 +935,7 @@ FILM_TEMPLATE = """
       <p class="small debug-only">Move the mouse horizontally over the video to scrub. Click the video to add a mark. Use left/right arrow keys for frame stepping.</p>
       <div class="skim-shell">
         <div class="skim-viewport">
-          <video id="skim-video" preload="metadata" playsinline src="{{ url_for('media_file', kind='preview', relpath=skim.relpath) }}"></video>
+          <video id="skim-video" preload="metadata" playsinline src="{{ skim.media_url }}"></video>
           <div class="skim-overlay">
             <span id="skim-overlay-left" class="debug-only">skim 0.00s</span>
             <span id="skim-overlay-right" class="debug-only">source 0s</span>
@@ -1052,8 +1062,8 @@ FILM_TEMPLATE = """
             <button class="ghost" type="submit">Delete Mark</button>
           </form>
           {% if mark["clip_relpath"] %}
-            <p><a href="{{ url_for('media_file', kind=mark['clip_kind'], relpath=mark['clip_relpath']) }}">Open clip</a></p>
-            <video id="clip-video-{{ mark['clip_id'] }}" controls preload="metadata" src="{{ url_for('media_file', kind=mark['clip_kind'], relpath=mark['clip_relpath']) }}"></video>
+            <p><a href="{{ mark['clip_media_url'] }}">Open clip</a></p>
+            <video id="clip-video-{{ mark['clip_id'] }}" controls preload="metadata" src="{{ mark['clip_media_url'] }}"></video>
             <form method="post" action="{{ url_for('update_clip_kiss_timing', clip_id=mark['clip_id']) }}" style="margin-top:8px;">
               <input type="hidden" name="return_film_id" value="{{ film['id'] }}">
               <input type="hidden" name="kiss_start_seconds" id="kiss-start-{{ mark['clip_id'] }}" value="{{ mark['kiss_start_seconds'] if mark['kiss_start_seconds'] is not none else '' }}">
@@ -1892,7 +1902,7 @@ CLIPS_TEMPLATE = """
     <div class="grid">
       {% for clip in clips %}
         <div class="tile">
-          <video preload="metadata" playsinline src="{{ url_for('media_file', kind=clip['kind'], relpath=clip['relpath']) }}"></video>
+          <video preload="metadata" playsinline src="{{ clip['media_url'] }}"></video>
         </div>
       {% endfor %}
     </div>
@@ -2286,6 +2296,7 @@ def create_app() -> Flask:
                 "tag": clip.get("clip_tag"),
                 "relpath": clip["relpath"],
                 "kind": clip["kind"],
+                "media_url": clip["media_url"],
             }
             for clip in clips
         ]
@@ -2306,7 +2317,13 @@ def create_app() -> Flask:
             ziai_job = _load_latest_job(conn, film_id, "ziai_film")
             review = _get_review_state(conn, film_id)
             source_cached = _source_cached(settings, film["archive_identifier"])
-            ziai_available = (settings.preview_dir / film["archive_identifier"] / "ziai" / "result.json").exists()
+            ziai_available = has_media_reference(
+                settings,
+                "preview",
+                settings.preview_dir / film["archive_identifier"] / "ziai" / "result.json",
+            )
+            if skim:
+                skim["media_url"] = _media_url(settings, "preview", skim["relpath"])
         return render_template_string(
             FILM_TEMPLATE,
             film=film,
@@ -2641,7 +2658,7 @@ def create_app() -> Flask:
         }
         for candidate in candidates:
             candidate["media_url"] = (
-                url_for("media_file", kind="preview", relpath=candidate["relpath"])
+                _media_url(settings, "preview", candidate["relpath"])
                 if candidate["relpath"]
                 else None
             )
@@ -2815,14 +2832,17 @@ def create_app() -> Flask:
                     for path_value in (clip_item.get("cropped_clip_path"), clip_item.get("clip_path")):
                         if not path_value:
                             continue
-                        clip_path = Path(path_value)
-                        if clip_path.exists():
-                            clip_path.unlink()
+                        delete_media_file(settings, "clip", path_value)
                     conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip_item["id"],))
                 else:
                     resolved_path.unlink()
+                    if kind == "clip":
+                        delete_media_file(settings, "clip", resolved_path)
             else:
-                resolved_path.unlink()
+                if kind == "preview":
+                    delete_media_file(settings, "preview", resolved_path)
+                else:
+                    resolved_path.unlink()
         return redirect(url_for("review_data_index"))
 
     @app.post("/review_data/requeue")
@@ -2879,7 +2899,7 @@ def create_app() -> Flask:
                 "tag": clip.get("clip_tag"),
                 "kind": clip["kind"],
                 "relpath": clip["relpath"],
-                "media_url": url_for("media_file", kind=clip["kind"], relpath=clip["relpath"]),
+                "media_url": clip["media_url"],
                 "start_seconds": clip["start_seconds"],
                 "end_seconds": clip["end_seconds"],
                 "kiss_start_seconds": clip.get("kiss_start_seconds"),
@@ -2901,9 +2921,10 @@ def create_app() -> Flask:
             clip = conn.execute("SELECT * FROM manual_clips WHERE id = ?", (clip_id,)).fetchone()
             if not clip:
                 abort(404)
-            source_path = Path(clip["clip_path"])
+            source_path = ensure_local_media_file(settings, "clip", clip["clip_path"])
             cropped_path = source_path.with_name(f"{source_path.stem}-crop.mp4")
         crop_clip(source_path, cropped_path, crop_x, crop_y, crop_width, crop_height)
+        _upload_clip_file(settings, cropped_path)
         with get_connection(settings.db_path) as conn:
             conn.execute(
                 """
@@ -2924,9 +2945,7 @@ def create_app() -> Flask:
                 abort(404)
             for path_value in (clip["cropped_clip_path"], clip["clip_path"]):
                 if path_value:
-                    path = Path(path_value)
-                    if path.exists():
-                        path.unlink()
+                    delete_media_file(settings, "clip", path_value)
             conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip_id,))
         if return_film_id:
             return redirect(url_for("film_detail", film_id=return_film_id))
@@ -2953,9 +2972,7 @@ def create_app() -> Flask:
             if clip:
                 for path_value in (clip["cropped_clip_path"], clip["clip_path"]):
                     if path_value:
-                        path = Path(path_value)
-                        if path.exists():
-                            path.unlink()
+                        delete_media_file(settings, "clip", path_value)
                 conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip["id"],))
             conn.execute("DELETE FROM manual_marks WHERE id = ?", (mark_id,))
         if return_film_id:
@@ -3015,6 +3032,8 @@ def create_app() -> Flask:
             if not film:
                 abort(404)
             result_path = settings.preview_dir / film["archive_identifier"] / "ziai" / "result.json"
+            if has_media_reference(settings, "preview", result_path):
+                result_path = ensure_local_media_file(settings, "preview", result_path)
             if not result_path.exists():
                 abort(404)
             result = json.loads(result_path.read_text())
@@ -3215,7 +3234,12 @@ def create_app() -> Flask:
         if root is None:
             abort(404)
         path = (root / relpath).resolve()
-        if not str(path).startswith(str(root.resolve())) or not path.exists():
+        if not str(path).startswith(str(root.resolve())):
+            abort(404)
+        if not path.exists():
+            public_url = media_public_url(settings, kind, relpath)
+            if public_url:
+                return redirect(public_url)
             abort(404)
         if kind == "clip":
             with get_connection(settings.db_path) as conn:
@@ -3531,12 +3555,16 @@ def _load_latest_skim(conn, preview_dir: Path, film_id: int) -> dict | None:
     if not row:
         return None
     payload = json.loads(row["result_json"])
+    settings = load_settings()
     path = Path(payload["preview_path"])
-    if not path.exists():
+    if not has_media_reference(settings, "preview", path):
         return None
+    relpath = media_relpath(settings, "preview", path)
+    if relpath is None:
+        relpath = str(path.relative_to(preview_dir))
     return {
         "path": str(path),
-        "relpath": str(path.relative_to(preview_dir)),
+        "relpath": relpath,
         "sample_every_seconds": float(payload.get("sample_every_seconds", 4)),
         "output_fps": int(payload.get("output_fps", 12)),
     }
@@ -3552,7 +3580,7 @@ def _ensure_skim_overview(settings, archive_identifier: str, skim: dict) -> list
             {
                 "index": index,
                 "source_seconds": int(round((index - 1) * sample_every_seconds)),
-                "media_url": url_for("media_file", kind="preview", relpath=relpath),
+                "media_url": _media_url(settings, "preview", relpath),
             }
         )
     return frames
@@ -3562,7 +3590,10 @@ def _ensure_skim_overview_paths(settings, archive_identifier: str, skim: dict) -
     from ia_kissing_pipeline.video.skim import build_skim_overview_frames
 
     overview_dir = settings.preview_dir / archive_identifier / "skim-overview"
-    return build_skim_overview_frames(Path(skim["path"]), overview_dir)
+    skim_path = ensure_local_media_file(settings, "preview", skim["path"])
+    frame_paths = build_skim_overview_frames(skim_path, overview_dir)
+    _upload_preview_tree(settings, overview_dir)
+    return frame_paths
 
 
 def _process_kiss_detector_batch(
@@ -3596,10 +3627,13 @@ def _process_kiss_detector_batch(
             use_workflow_cache=use_workflow_cache,
         )
         _save_workflow_predictions(predictions_payload, predictions_path)
+        _upload_preview_file(settings, predictions_path)
         if rendered_bytes is not None:
             _save_rendered_workflow_image(rendered_bytes, output_path)
+            _upload_preview_file(settings, output_path)
         else:
             skipped_path.write_text("no_predictions")
+            _upload_preview_file(settings, skipped_path)
     frames = _list_kiss_detector_outputs(settings, archive_identifier, skim, output_dir)
     total = len(frame_paths)
     skipped = len(list(output_dir.glob("frame_*.skip")))
@@ -3669,8 +3703,12 @@ def _list_kiss_detector_outputs(settings, archive_identifier: str, skim: dict, o
             {
                 "index": frame_number,
                 "source_seconds": int(round((frame_number - 1) * sample_every_seconds)),
-                "media_url": url_for("media_file", kind="preview", relpath=relpath),
-                "predictions_url": url_for("media_file", kind="preview", relpath=str(predictions_path.relative_to(settings.preview_dir))) if predictions_path.exists() else None,
+                "media_url": _media_url(settings, "preview", relpath),
+                "predictions_url": (
+                    _media_url(settings, "preview", str(predictions_path.relative_to(settings.preview_dir)))
+                    if predictions_path.exists()
+                    else None
+                ),
                 "collision": collision,
                 "kiss_candidate": kiss_candidate,
             }
@@ -4368,6 +4406,22 @@ def _save_workflow_predictions(predictions_payload, output_path: Path) -> None:
     output_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True, default=str))
 
 
+def _media_url(settings, kind: str, relpath: str) -> str:
+    return media_public_url(settings, kind, relpath) or url_for("media_file", kind=kind, relpath=relpath)
+
+
+def _upload_preview_tree(settings, path: Path) -> None:
+    upload_media_tree(settings, "preview", path)
+
+
+def _upload_preview_file(settings, path: Path) -> None:
+    upload_media_file(settings, "preview", path)
+
+
+def _upload_clip_file(settings, path: Path) -> None:
+    upload_media_file(settings, "clip", path)
+
+
 def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:
     if film_id is None:
         row = conn.execute(
@@ -4421,6 +4475,7 @@ def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:
 
 
 def _load_marks(conn, clips_dir: Path, film_id: int) -> list[dict]:
+    settings = load_settings()
     rows = conn.execute(
         """
         SELECT manual_marks.*, manual_clips.id AS clip_id, manual_clips.clip_path, manual_clips.cropped_clip_path, manual_clips.metadata_json, manual_clips.ignored AS clip_ignored
@@ -4436,6 +4491,11 @@ def _load_marks(conn, clips_dir: Path, film_id: int) -> list[dict]:
         item = dict(row)
         clip_path = item.get("cropped_clip_path") or item.get("clip_path")
         item["clip_relpath"], item["clip_kind"] = _resolve_media_relpath(clip_path, clips_dir)
+        item["clip_media_url"] = (
+            _media_url(settings, item["clip_kind"], item["clip_relpath"])
+            if item["clip_relpath"]
+            else None
+        )
         metadata = json.loads(item.get("metadata_json") or "{}")
         item["kiss_start_seconds"] = metadata.get("kiss_start_seconds")
         item["kiss_end_seconds"] = metadata.get("kiss_end_seconds")
@@ -4532,6 +4592,7 @@ def _load_random_clips(conn, clips_dir: Path, limit: int, tag: str | None = None
 
 
 def _hydrate_clip_rows(rows, clips_dir: Path) -> list[dict]:
+    settings = load_settings()
     clips = []
     for row in rows:
         item = dict(row)
@@ -4544,6 +4605,7 @@ def _hydrate_clip_rows(rows, clips_dir: Path) -> list[dict]:
         item["kiss_end_seconds"] = metadata.get("kiss_end_seconds")
         item["relpath"] = relpath
         item["kind"] = kind
+        item["media_url"] = _media_url(settings, kind, relpath)
         clips.append(item)
     return clips
 
@@ -4675,6 +4737,7 @@ def _load_ziai_films(conn) -> list[dict]:
 
 
 def _load_ziai_candidates(conn, preview_dir: Path) -> list[dict]:
+    settings = load_settings()
     rows = conn.execute(
         """
         SELECT zc.*, f.title, f.archive_identifier
@@ -4687,10 +4750,7 @@ def _load_ziai_candidates(conn, preview_dir: Path) -> list[dict]:
     for row in rows:
         item = dict(row)
         path = Path(item["clip_path"]).resolve()
-        try:
-            item["relpath"] = str(path.relative_to(preview_dir.resolve())) if path.exists() else None
-        except ValueError:
-            item["relpath"] = None
+        item["relpath"] = media_relpath(settings, "preview", path) if has_media_reference(settings, "preview", path) else None
         candidates.append(item)
     return candidates
 
@@ -4706,6 +4766,8 @@ def _load_ziai_frame_page(
     limit: int,
 ) -> dict[str, object]:
     result_path = settings.preview_dir / archive_identifier / "ziai" / "result.json"
+    if has_media_reference(settings, "preview", result_path):
+        result_path = ensure_local_media_file(settings, "preview", result_path)
     if not result_path.exists():
         return {
             "available": False,
@@ -4718,7 +4780,6 @@ def _load_ziai_frame_page(
         }
 
     result = json.loads(result_path.read_text())
-    preview_root = settings.preview_dir.resolve()
     candidate_rows = conn.execute(
         """
         SELECT id, candidate_index, start_seconds, end_seconds, confidence, clip_path, review_status
@@ -4733,12 +4794,9 @@ def _load_ziai_frame_page(
         candidate = dict(row)
         candidate["media_url"] = None
         clip_path = Path(candidate["clip_path"]).resolve()
-        try:
-            relpath = str(clip_path.relative_to(preview_root))
-            if clip_path.exists():
-                candidate["media_url"] = url_for("media_file", kind="preview", relpath=relpath)
-        except ValueError:
-            pass
+        relpath = media_relpath(settings, "preview", clip_path)
+        if relpath and has_media_reference(settings, "preview", clip_path):
+            candidate["media_url"] = _media_url(settings, "preview", relpath)
         candidates.append(candidate)
 
     missed_kiss_indices = {
@@ -4757,11 +4815,10 @@ def _load_ziai_frame_page(
     filtered_count = 0
     for raw_frame in result.get("frames", []):
         frame_path = Path(raw_frame["frame_path"]).resolve()
-        if not frame_path.exists():
+        if not has_media_reference(settings, "preview", frame_path):
             continue
-        try:
-            relpath = str(frame_path.relative_to(preview_root))
-        except ValueError:
+        relpath = media_relpath(settings, "preview", frame_path)
+        if relpath is None:
             continue
         timestamp_seconds = float(raw_frame.get("timestamp_seconds", 0.0))
         prediction = int(raw_frame.get("prediction", 0))
@@ -4792,7 +4849,7 @@ def _load_ziai_frame_page(
                     "timestamp_seconds": round(timestamp_seconds, 3),
                     "prediction": prediction,
                     "confidence": float(raw_frame.get("confidence", 0.0)),
-                    "media_url": url_for("media_file", kind="preview", relpath=relpath),
+                    "media_url": _media_url(settings, "preview", relpath),
                     "missed_kiss": result_index in missed_kiss_indices,
                     "missed_kiss_url": url_for(
                         "ziai_mark_missed_kiss",
@@ -5390,7 +5447,7 @@ def _load_kiss_reference_rows(conn, settings) -> list[dict]:
                 "id": clip["id"],
                 "title": clip["title"],
                 "kiss_start_seconds": float(clip["kiss_start_seconds"]),
-                "clip_media_url": url_for("media_file", kind=clip["kind"], relpath=clip["relpath"]),
+                "clip_media_url": clip["media_url"],
                 "kiss_frame_url": frame_assets["kiss_frame_url"],
                 "lead_in_frames": frame_assets["lead_in_frames"],
                 "frames_ready": frame_assets["frames_ready"],
@@ -5427,14 +5484,14 @@ def _what_is_a_kiss_frame_assets(settings, clip: dict) -> dict[str, object]:
     for index, frame_path in enumerate(lead_paths):
         lead_in_frames.append(
             {
-                "media_url": url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+                "media_url": _media_url(settings, "preview", str(frame_path.relative_to(settings.preview_dir))),
                 "is_kiss_frame": index == kiss_frame_index,
             }
         )
     return {
         "frames_ready": kiss_frame_path.exists() and bool(lead_in_frames),
         "kiss_frame_url": (
-            url_for("media_file", kind="preview", relpath=str(kiss_frame_path.relative_to(settings.preview_dir)))
+            _media_url(settings, "preview", str(kiss_frame_path.relative_to(settings.preview_dir)))
             if kiss_frame_path.exists()
             else None
         ),
@@ -5444,7 +5501,7 @@ def _what_is_a_kiss_frame_assets(settings, clip: dict) -> dict[str, object]:
 
 def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     clip_path_value = clip.get("cropped_clip_path") or clip.get("clip_path")
-    clip_path = Path(clip_path_value)
+    clip_path = ensure_local_media_file(settings, clip["kind"], clip_path_value)
     if not clip_path.exists():
         raise FileNotFoundError(f"Clip file not found: {clip_path}")
     clip_dir = settings.preview_dir / "what-is-a-kiss" / f"clip-{int(clip['id']):04d}"
@@ -5453,6 +5510,7 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     kiss_start_seconds = float(clip["kiss_start_seconds"])
     kiss_frame_path = kiss_dir / "kiss.jpg"
     _ensure_video_frame(clip_path, kiss_frame_path, kiss_start_seconds)
+    _upload_preview_file(settings, kiss_frame_path)
 
     _clear_what_is_a_kiss_lead_in_cache(clip_dir)
     lead_in_frames: list[dict[str, object]] = []
@@ -5462,14 +5520,15 @@ def _ensure_what_is_a_kiss_frames(settings, clip: dict) -> dict[str, object]:
     for index, timestamp in enumerate(frame_times, start=1):
         frame_path = lead_dir / f"frame_{index:02d}.jpg"
         _ensure_video_frame(clip_path, frame_path, timestamp)
+        _upload_preview_file(settings, frame_path)
         lead_in_frames.append(
             {
-                "media_url": url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+                "media_url": _media_url(settings, "preview", str(frame_path.relative_to(settings.preview_dir))),
                 "is_kiss_frame": index - 1 == kiss_frame_index,
             }
         )
     return {
-        "kiss_frame_url": url_for("media_file", kind="preview", relpath=str(kiss_frame_path.relative_to(settings.preview_dir))),
+        "kiss_frame_url": _media_url(settings, "preview", str(kiss_frame_path.relative_to(settings.preview_dir))),
         "lead_in_frames": lead_in_frames,
     }
 
@@ -5507,6 +5566,7 @@ def _build_what_is_a_kiss_frames_archive(settings, clip: dict) -> Path:
         zf.write(kiss_frame_path, arcname="kiss.jpg")
         for frame_path in lead_paths:
             zf.write(frame_path, arcname=f"sequence/{frame_path.name}")
+    _upload_preview_file(settings, archive_path)
     return archive_path
 
 
@@ -5533,7 +5593,7 @@ def _ensure_what_is_a_kiss_roboflow_outputs(settings, clip: dict) -> dict[str, o
                 frame_path,
                 roboflow_dir / f"frame_{index:02d}.png",
                 roboflow_dir / f"frame_{index:02d}.json",
-                url_for("media_file", kind="preview", relpath=str(frame_path.relative_to(settings.preview_dir))),
+                _media_url(settings, "preview", str(frame_path.relative_to(settings.preview_dir))),
             )
         )
     annotated_count = sum(1 for frame in [kiss_frame, *lead_in_frames] if frame["annotated_url"])
@@ -5556,12 +5616,14 @@ def _ensure_what_is_a_kiss_roboflow_frame(
     if not annotated_path.exists() and not predictions_path.exists():
         rendered_bytes, predictions_payload = _run_roboflow_kiss_detector(settings, source_path)
         _save_workflow_predictions(predictions_payload, predictions_path)
+        _upload_preview_file(settings, predictions_path)
         if rendered_bytes is not None:
             _save_rendered_workflow_image(rendered_bytes, annotated_path)
+            _upload_preview_file(settings, annotated_path)
     return {
         "media_url": fallback_url,
         "annotated_url": (
-            url_for("media_file", kind="preview", relpath=str(annotated_path.relative_to(settings.preview_dir)))
+            _media_url(settings, "preview", str(annotated_path.relative_to(settings.preview_dir)))
             if annotated_path.exists()
             else None
         ),
@@ -5624,17 +5686,17 @@ def _set_clip_order_cursor(conn, tag: str | None, clip_id: int) -> None:
 def _resolve_media_relpath(path_value: str | None, clips_dir: Path) -> tuple[str | None, str]:
     if not path_value:
         return None, "clip"
+    settings = load_settings()
     path = Path(path_value)
-    if not path.exists():
-        return None, "clip"
-    try:
-        return str(path.relative_to(clips_dir)), "clip"
-    except ValueError:
-        preview_dir = load_settings().preview_dir
-        try:
-            return str(path.relative_to(preview_dir)), "preview"
-        except ValueError:
-            return None, "clip"
+    if has_media_reference(settings, "clip", path):
+        relpath = media_relpath(settings, "clip", path)
+        if relpath:
+            return relpath, "clip"
+    if has_media_reference(settings, "preview", path):
+        relpath = media_relpath(settings, "preview", path)
+        if relpath:
+            return relpath, "preview"
+    return None, "clip"
 
 
 def _load_download_batch_job(conn) -> dict | None:
@@ -5752,7 +5814,7 @@ def _load_review_data_sections(conn, settings) -> list[dict]:
                     "relpath": relpath,
                     "display_path": relpath,
                     "size_text": _format_size(path.stat().st_size),
-                    "media_url": url_for("media_file", kind=kind, relpath=relpath) if playable and not ignored else None,
+                    "media_url": _media_url(settings, kind, relpath) if playable and not ignored else None,
                     "playable": playable and not ignored,
                     "ignored": ignored,
                     "film_id": film_id,
@@ -6059,12 +6121,7 @@ def _remove_kiss_detector_outputs(settings, film_id: int, archive_identifier: st
             """,
             (now, film_id),
         )
-    if not output_dir.exists():
-        return
-    for path in output_dir.glob("frame_*.*"):
-        if path.suffix.lower() in {".png", ".json", ".skip"}:
-            path.unlink()
-    shutil.rmtree(output_dir / "cluster-overlays", ignore_errors=True)
+    delete_media_tree(settings, "preview", output_dir, delete_remote=True)
 
 
 def _stop_kiss_detector_job(settings, film_id: int) -> None:
@@ -6371,6 +6428,7 @@ def _run_ziai_film_now(
             inference_batch_size=int(payload.get("inference_batch_size", 8)),
             progress_callback=progress_callback,
         )
+        _upload_preview_tree(settings, output_dir)
         summary = {key: value for key, value in result.items() if key != "frames"}
         summary.update({"phase": "done", "progress": 1.0})
         with get_connection(settings.db_path) as conn:
@@ -6610,6 +6668,7 @@ def _build_manual_clip_now(job_id: int, film_id: int, mark_id: int, pre_seconds:
         start_seconds = max(0.0, float(mark["source_seconds"]) - pre_seconds)
         end_seconds = float(mark["source_seconds"]) + post_seconds
         extract_clip(source_path, clip_path, start_seconds, end_seconds - start_seconds)
+        _upload_clip_file(settings, clip_path)
         with get_connection(settings.db_path) as conn:
             conn.execute("DELETE FROM manual_clips WHERE manual_mark_id = ?", (mark_id,))
             conn.execute(
@@ -6670,6 +6729,7 @@ def _build_skim_now(job_id: int, film_id: int, sample_every_seconds: float, outp
             max_height=max_height,
             progress_callback=progress_callback,
         )
+        _upload_preview_file(settings, output_path)
         with get_connection(settings.db_path) as conn:
             conn.execute(
                 """
@@ -6734,10 +6794,13 @@ def _run_kiss_detector_now(job_id: int, film_id: int) -> int:
                     use_workflow_cache=use_workflow_cache,
                 )
                 _save_workflow_predictions(predictions_payload, predictions_path)
+                _upload_preview_file(settings, predictions_path)
                 if rendered_bytes is not None:
                     _save_rendered_workflow_image(rendered_bytes, output_path)
+                    _upload_preview_file(settings, output_path)
                 else:
                     skipped_path.write_text("no_predictions")
+                    _upload_preview_file(settings, skipped_path)
             progress = 0.05 + 0.9 * index / max(1, total)
             with get_connection(settings.db_path) as conn:
                 _update_job(conn, job_id, "running", "detecting_frames", progress)
@@ -7284,6 +7347,7 @@ def _preserve_manual_clips(conn, settings, film) -> None:
         if clip_path.exists() and not str(clip_path).startswith(str(settings.clips_dir)):
             target_path = archive_dir / clip_path.name
             shutil.copy2(clip_path, target_path)
+            _upload_clip_file(settings, target_path)
             conn.execute("UPDATE manual_clips SET clip_path = ? WHERE id = ?", (str(target_path), row["id"]))
         cropped_path = row["cropped_clip_path"]
         if cropped_path:
@@ -7291,6 +7355,7 @@ def _preserve_manual_clips(conn, settings, film) -> None:
             if cropped.exists() and not str(cropped).startswith(str(settings.clips_dir)):
                 target_crop = archive_dir / cropped.name
                 shutil.copy2(cropped, target_crop)
+                _upload_clip_file(settings, target_crop)
                 conn.execute("UPDATE manual_clips SET cropped_clip_path = ? WHERE id = ?", (str(target_crop), row["id"]))
 
 
@@ -7298,17 +7363,19 @@ def _cleanup_film_local_artifacts(settings, archive_identifier: str) -> None:
     for root in (settings.download_dir, settings.frame_dir, settings.preview_dir):
         target = root / archive_identifier
         if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
+            kind = "preview" if root == settings.preview_dir else "download"
+            if kind == "preview":
+                delete_media_tree(settings, kind, target, delete_remote=False)
+            else:
+                shutil.rmtree(target, ignore_errors=True)
 
 
-def _delete_clip_files_for_film(conn, film_id: int) -> None:
+def _delete_clip_files_for_film(settings, conn, film_id: int) -> None:
     rows = conn.execute("SELECT clip_path, cropped_clip_path FROM manual_clips WHERE film_id = ?", (film_id,)).fetchall()
     for row in rows:
         for path_value in (row["cropped_clip_path"], row["clip_path"]):
             if path_value:
-                path = Path(path_value)
-                if path.exists():
-                    path.unlink()
+                delete_media_file(settings, "clip", path_value)
 
 
 def _apply_film_review_action(settings, film_id: int, review_status: str, notes: str | None) -> None:
@@ -7324,7 +7391,7 @@ def _apply_film_review_action(settings, film_id: int, review_status: str, notes:
                     _preserve_manual_clips(conn, settings, film)
                 if review_status == "force_excluded":
                     _terminate_film_workers(film_id)
-                    _delete_clip_files_for_film(conn, film_id)
+                    _delete_clip_files_for_film(settings, conn, film_id)
                     conn.execute(
                         """
                         UPDATE analysis_jobs

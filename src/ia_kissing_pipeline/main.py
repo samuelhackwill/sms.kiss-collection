@@ -12,6 +12,7 @@ from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.ingest.ia_client import IAClient
 from ia_kissing_pipeline.ingest.ia_ingest import ingest_from_ia
 from ia_kissing_pipeline.ingest.fixture_ingest import ingest_fixture
+from ia_kissing_pipeline.media_storage import upload_media_file
 from ia_kissing_pipeline.review.batch_formatter import format_review_batch
 from ia_kissing_pipeline.review.commands import parse_review_command
 from ia_kissing_pipeline.scoring.metadata_rules import score_metadata
@@ -481,6 +482,7 @@ def cmd_build_skim_preview(args: argparse.Namespace) -> int:
             output_fps=args.output_fps,
             max_height=args.max_height,
         )
+        upload_media_file(settings, "preview", output_path)
     print(json.dumps({"film_id": args.film_id, "preview_path": str(output_path)}, indent=2, sort_keys=True))
     return 0
 
@@ -892,6 +894,7 @@ def _ensure_batch_previews(settings, conn, batch_id: int, preview_seconds: float
                 max(0.0, float(row["peak_seconds"]) - (preview_seconds / 2)),
                 preview_seconds,
             )
+            upload_media_file(settings, "preview", output_path)
             preview_path = str(output_path)
             conn.execute("UPDATE moments SET preview_path = ? WHERE id = ?", (preview_path, row["moment_id"]))
         row_dict["preview_path"] = preview_path
@@ -911,6 +914,7 @@ def cmd_clip(args: argparse.Namespace) -> int:
             start_seconds = max(0.0, float(row["peak_seconds"]) - args.pre_seconds)
             duration_seconds = args.pre_seconds + args.post_seconds
             extract_clip(analysis_path, output_path, start_seconds, duration_seconds)
+            upload_media_file(settings, "preview", output_path)
             conn.execute(
                 "UPDATE moments SET preview_path = ? WHERE id = ?",
                 (str(output_path), row["moment_id"]),
@@ -936,6 +940,7 @@ def cmd_more(args: argparse.Namespace) -> int:
             start_seconds = max(0.0, float(row["peak_seconds"]) - args.pre_seconds)
             duration_seconds = args.pre_seconds + args.post_seconds
             extract_clip(analysis_path, output_path, start_seconds, duration_seconds)
+            upload_media_file(settings, "preview", output_path)
             generated.append(str(output_path))
     print(json.dumps({"more_previews": generated}, indent=2, sort_keys=True))
     return 0

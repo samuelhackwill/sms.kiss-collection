@@ -545,6 +545,110 @@ def test_film_detail_lists_paginated_ziai_classifier_frames(tmp_path: Path, monk
     }
 
 
+def test_s3_media_backend_serves_previews_and_clips_from_public_bucket(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+    monkeypatch.setenv("MEDIA_STORAGE_BACKEND", "s3")
+    monkeypatch.setenv("MEDIA_S3_BUCKET", "kiss-media")
+    monkeypatch.setenv("MEDIA_S3_ENDPOINT_URL", "https://s3.gra.io.cloud.ovh.net")
+    monkeypatch.setenv("MEDIA_S3_PUBLIC_BASE_URL", "https://media.example.test")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    preview_path = settings.preview_dir / "kiss_in_spring_1932" / "skim-preview.mp4"
+    clip_path = settings.clips_dir / "kiss_in_spring_1932" / "manual-mark-001.mp4"
+    ziai_dir = settings.preview_dir / "kiss_in_spring_1932" / "ziai"
+    ziai_dir.mkdir(parents=True)
+    frame_path = ziai_dir / "frames" / "frame_000001.jpg"
+    candidate_path = ziai_dir / "candidates" / "candidate_001.mp4"
+    (ziai_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {
+                        "index": 0,
+                        "frame_path": str(frame_path),
+                        "timestamp_seconds": 1.0,
+                        "prediction": 1,
+                        "confidence": 0.9,
+                    }
+                ]
+            }
+        )
+    )
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, result_json, created_at, updated_at)
+            VALUES (1, 'build_skim_preview', 'done', ?, '2026-06-16T00:00:00Z', '2026-06-16T00:00:00Z')
+            """,
+            (json.dumps({"preview_path": str(preview_path), "sample_every_seconds": 4, "output_fps": 12}),),
+        )
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, result_json, created_at, updated_at)
+            VALUES (1, 'ziai_film', 'done', '{}', '2026-06-16T00:00:00Z', '2026-06-16T00:00:00Z')
+            """
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO ziai_candidates (
+                job_id, film_id, candidate_index, start_seconds, end_seconds,
+                confidence, clip_path, review_status, created_at
+            ) VALUES (?, 1, 1, 0.0, 2.0, 0.9, ?, 'pending', '2026-06-16T00:00:00Z')
+            """,
+            (job_id, str(candidate_path)),
+        )
+        conn.execute(
+            """
+            INSERT INTO manual_marks (
+                id, film_id, skim_path, preview_seconds, sample_index, source_seconds,
+                selected_tag, note, created_at
+            ) VALUES (1, 1, ?, 0, 1, 1.0, 'kiss', 'kiss', '2026-06-16T00:00:00Z')
+            """,
+            (str(preview_path),),
+        )
+        conn.execute(
+            """
+            INSERT INTO manual_clips (
+                manual_mark_id, film_id, clip_path, clip_tag, metadata_json,
+                start_seconds, end_seconds, created_at
+            ) VALUES (1, 1, ?, 'kiss', '{}', 0, 2, '2026-06-16T00:00:00Z')
+            """,
+            (str(clip_path),),
+        )
+
+    app = create_app()
+    client = app.test_client()
+
+    page = client.get("/films/1")
+    frames_payload = client.get("/films/1/ziai-frames?filter=positive").get_json()
+    media_redirect = client.get("/media/preview/kiss_in_spring_1932/skim-preview.mp4", follow_redirects=False)
+
+    assert page.status_code == 200
+    assert b"https://media.example.test/previews/kiss_in_spring_1932/skim-preview.mp4" in page.data
+    assert b"https://media.example.test/clips/kiss_in_spring_1932/manual-mark-001.mp4" in page.data
+    assert frames_payload["frames"][0]["media_url"] == (
+        "https://media.example.test/previews/kiss_in_spring_1932/ziai/frames/frame_000001.jpg"
+    )
+    assert frames_payload["frames"][0]["candidate_media_url"] == (
+        "https://media.example.test/previews/kiss_in_spring_1932/ziai/candidates/candidate_001.mp4"
+    )
+    assert media_redirect.status_code == 302
+    assert media_redirect.headers["Location"] == "https://media.example.test/previews/kiss_in_spring_1932/skim-preview.mp4"
+
+
 def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)

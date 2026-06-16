@@ -17,6 +17,15 @@ class Settings:
     preview_dir: Path
     clips_dir: Path
     log_dir: Path
+    media_storage_backend: str
+    media_s3_bucket: str
+    media_s3_endpoint_url: str
+    media_s3_region: str
+    media_s3_access_key_id: str
+    media_s3_secret_access_key: str
+    media_s3_public_base_url: str
+    media_s3_acl: str
+    media_s3_cache_control: str
     user_agent: str
     roboflow_api_url: str
     roboflow_api_key: str
@@ -49,6 +58,15 @@ def load_settings() -> Settings:
         preview_dir=Path(os.getenv("PREVIEW_DIR", str(cwd / "data" / "previews"))),
         clips_dir=Path(os.getenv("CLIPS_DIR", str(cwd / "data" / "clips"))),
         log_dir=Path(os.getenv("LOG_DIR", str(cwd / "data" / "logs"))),
+        media_storage_backend=os.getenv("MEDIA_STORAGE_BACKEND", "local"),
+        media_s3_bucket=os.getenv("MEDIA_S3_BUCKET", ""),
+        media_s3_endpoint_url=os.getenv("MEDIA_S3_ENDPOINT_URL", ""),
+        media_s3_region=os.getenv("MEDIA_S3_REGION", ""),
+        media_s3_access_key_id=os.getenv("MEDIA_S3_ACCESS_KEY_ID", ""),
+        media_s3_secret_access_key=os.getenv("MEDIA_S3_SECRET_ACCESS_KEY", ""),
+        media_s3_public_base_url=os.getenv("MEDIA_S3_PUBLIC_BASE_URL", ""),
+        media_s3_acl=os.getenv("MEDIA_S3_ACL", "public-read"),
+        media_s3_cache_control=os.getenv("MEDIA_S3_CACHE_CONTROL", "public, max-age=31536000, immutable"),
         user_agent=os.getenv(
             "USER_AGENT",
             "ia-kissing-pipeline/0.1 (contact: operator@example.com)",
