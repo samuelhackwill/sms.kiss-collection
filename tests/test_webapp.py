@@ -28,6 +28,22 @@ from ia_kissing_pipeline.webapp import (
 from ia_kissing_pipeline.ziai import _chunk_windows
 
 
+@pytest.fixture(autouse=True)
+def default_local_media_storage(monkeypatch) -> None:
+    monkeypatch.setenv("MEDIA_STORAGE_BACKEND", "local")
+    for key in (
+        "MEDIA_S3_BUCKET",
+        "MEDIA_S3_ENDPOINT_URL",
+        "MEDIA_S3_REGION",
+        "MEDIA_S3_ACCESS_KEY_ID",
+        "MEDIA_S3_SECRET_ACCESS_KEY",
+        "MEDIA_S3_PUBLIC_BASE_URL",
+        "MEDIA_S3_ACL",
+        "MEDIA_S3_CACHE_CONTROL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)
@@ -2565,6 +2581,40 @@ def test_review_data_lists_video_files_and_pending_status(tmp_path: Path, monkey
     assert b"phase3_fixture.mp4" in response.data
     assert b"Requeue movie" in response.data
     assert response.data.count(b"Delete video file") == 1
+
+
+def test_review_data_lists_downloads_in_s3_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+    monkeypatch.setenv("MEDIA_STORAGE_BACKEND", "s3")
+    monkeypatch.setenv("MEDIA_S3_BUCKET", "kiss-media")
+    monkeypatch.setenv("MEDIA_S3_ENDPOINT_URL", "https://s3.gra.io.cloud.ovh.net")
+    monkeypatch.setenv("MEDIA_S3_PUBLIC_BASE_URL", "https://media.example.test")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    download_dir = settings.download_dir / "sample_movie"
+    download_dir.mkdir(parents=True)
+    (download_dir / "sample.mp4").write_text("video")
+
+    app = create_app()
+    client = app.test_client()
+    response = client.get("/review_data")
+    missing_media_response = client.get("/media/download/missing.mp4")
+
+    assert response.status_code == 200
+    assert b"Downloaded Sources" in response.data
+    assert b"/media/download/sample_movie/sample.mp4" in response.data
+    assert b"https://media.example.test/download" not in response.data
+    assert missing_media_response.status_code == 404
 
 
 def test_review_data_delete_removes_video_file(tmp_path: Path, monkeypatch) -> None:

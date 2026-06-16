@@ -3237,7 +3237,7 @@ def create_app() -> Flask:
         if not str(path).startswith(str(root.resolve())):
             abort(404)
         if not path.exists():
-            public_url = media_public_url(settings, kind, relpath)
+            public_url = _remote_media_url(settings, kind, relpath)
             if public_url:
                 return redirect(public_url)
             abort(404)
@@ -4406,8 +4406,15 @@ def _save_workflow_predictions(predictions_payload, output_path: Path) -> None:
     output_path.write_text(json.dumps(predictions_payload, indent=2, sort_keys=True, default=str))
 
 
+def _remote_media_url(settings, kind: str, relpath: str) -> str | None:
+    try:
+        return media_public_url(settings, kind, relpath)
+    except ValueError:
+        return None
+
+
 def _media_url(settings, kind: str, relpath: str) -> str:
-    return media_public_url(settings, kind, relpath) or url_for("media_file", kind=kind, relpath=relpath)
+    return _remote_media_url(settings, kind, relpath) or url_for("media_file", kind=kind, relpath=relpath)
 
 
 def _upload_preview_tree(settings, path: Path) -> None:
