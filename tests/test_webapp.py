@@ -624,6 +624,89 @@ def test_ziai_candidate_review_can_update_without_page_refresh(tmp_path: Path, m
     assert dict(dataset) == {"training_label": "negative", "model_outcome": "false_positive"}
 
 
+def test_ziai_can_reject_pending_candidates_without_touching_accepted(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, created_at, updated_at)
+            VALUES (1, 'ziai_film', 'done', '2026-06-16T00:00:00Z', '2026-06-16T00:00:00Z')
+            """
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        candidate_dir = settings.preview_dir / "kiss_in_spring_1932" / "ziai" / "candidates"
+        candidate_dir.mkdir(parents=True)
+        for candidate_id, review_status in ((1, "pending"), (2, "accepted"), (3, "rejected")):
+            candidate_path = candidate_dir / f"candidate_{candidate_id:03d}.mp4"
+            candidate_path.write_text("clip")
+            conn.execute(
+                """
+                INSERT INTO ziai_candidates (
+                    id, job_id, film_id, candidate_index, start_seconds, end_seconds,
+                    confidence, clip_path, review_status, created_at
+                ) VALUES (?, ?, 1, ?, ?, ?, 0.9, ?, ?, '2026-06-16T00:00:00Z')
+                """,
+                (
+                    candidate_id,
+                    job_id,
+                    candidate_id,
+                    float(candidate_id),
+                    float(candidate_id + 3),
+                    str(candidate_path),
+                    review_status,
+                ),
+            )
+
+    app = create_app()
+    client = app.test_client()
+    page = client.get("/ziai")
+    response = client.post(
+        "/ziai/candidates/reject-unaccepted",
+        headers={"Accept": "application/json"},
+    )
+
+    assert page.status_code == 200
+    assert b"id=\"reject-unaccepted-form\"" in page.data
+    assert response.status_code == 200
+    assert response.get_json() == {"updated_count": 1}
+    with get_connection(settings.db_path) as conn:
+        candidates = conn.execute(
+            "SELECT id, review_status FROM ziai_candidates ORDER BY id"
+        ).fetchall()
+        dataset_rows = conn.execute(
+            """
+            SELECT source_id, training_label, model_outcome
+            FROM clip_dataset_items
+            WHERE source_table = 'ziai_candidates'
+            ORDER BY source_id
+            """
+        ).fetchall()
+    assert [dict(row) for row in candidates] == [
+        {"id": 1, "review_status": "rejected"},
+        {"id": 2, "review_status": "accepted"},
+        {"id": 3, "review_status": "rejected"},
+    ]
+    assert [dict(row) for row in dataset_rows] == [
+        {"source_id": 1, "training_label": "negative", "model_outcome": "false_positive"},
+        {"source_id": 2, "training_label": "positive", "model_outcome": "true_positive"},
+        {"source_id": 3, "training_label": "negative", "model_outcome": "false_positive"},
+    ]
+
+
 def test_s3_media_backend_serves_previews_and_clips_from_public_bucket(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)

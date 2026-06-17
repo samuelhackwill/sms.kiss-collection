@@ -685,6 +685,7 @@ ZIAI_TEMPLATE = """
     th, td { border-bottom: 1px solid var(--border); padding: 10px; text-align: left; vertical-align: top; }
     button { padding: 9px 13px; border-radius: 10px; border: 1px solid #3b495d; background: #2a3442; color: #d9e5f7; cursor: pointer; }
     .primary { background: #174d35; border-color: #28764f; color: #a7f3c4; }
+    .danger { background: #5a1f2b; border-color: #9a3d50; color: #ffd3db; }
     .progress-shell { height: 10px; margin-top: 12px; border-radius: 999px; overflow: hidden; background: #0b1016; border: 1px solid var(--border); }
     .progress-bar { height: 100%; width: {{ job_progress_percent }}%; background: linear-gradient(90deg, #26714a, #87f0ae); transition: width 180ms ease; }
     .activity-log { max-height: 320px; overflow: auto; display: grid; gap: 7px; margin-top: 12px; }
@@ -753,6 +754,12 @@ ZIAI_TEMPLATE = """
   </div>
   <div class="panel">
     <h2 style="margin-top:0;">Human Review Candidates</h2>
+    {% if candidates %}
+      <form id="reject-unaccepted-form" class="row" method="post" action="{{ url_for('ziai_reject_unaccepted_candidates') }}" onsubmit="return confirm('Reject every pending ZIAI candidate and keep accepted candidates?');">
+        <button class="danger" type="submit">Reject All Not Accepted</button>
+        <span id="bulk-review-status" class="muted">Accepted candidates are kept. Pending candidates become rejected.</span>
+      </form>
+    {% endif %}
     <div class="clips">
       {% for candidate in candidates %}
         <div class="clip" id="ziai-candidate-{{ candidate['id'] }}" data-review-status="{{ candidate['review_status'] }}">
@@ -801,6 +808,16 @@ ZIAI_TEMPLATE = """
   </script>
   {% endif %}
   <script>
+    function updateCandidateReview(card, reviewStatus) {
+      if (!card) return;
+      const statusBadge = card.querySelector(".candidate-status");
+      card.dataset.reviewStatus = reviewStatus;
+      if (statusBadge) {
+        statusBadge.textContent = reviewStatus;
+        statusBadge.className = `candidate-status ${reviewStatus}`;
+      }
+    }
+
     document.querySelectorAll(".candidate-review-form").forEach((form) => {
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -827,13 +844,7 @@ ZIAI_TEMPLATE = """
           if (!response.ok) {
             throw new Error(payload.error || "Failed to update candidate.");
           }
-          if (card) {
-            card.dataset.reviewStatus = payload.review_status;
-          }
-          if (statusBadge) {
-            statusBadge.textContent = payload.review_status;
-            statusBadge.className = `candidate-status ${payload.review_status}`;
-          }
+          updateCandidateReview(card, payload.review_status);
         } catch (error) {
           if (statusBadge) {
             statusBadge.textContent = error.message || "error";
@@ -844,6 +855,41 @@ ZIAI_TEMPLATE = """
         }
       });
     });
+
+    const rejectUnacceptedForm = document.getElementById("reject-unaccepted-form");
+    if (rejectUnacceptedForm) {
+      rejectUnacceptedForm.onsubmit = null;
+      rejectUnacceptedForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (!window.confirm("Reject every pending ZIAI candidate and keep accepted candidates?")) return;
+        const button = rejectUnacceptedForm.querySelector("button");
+        const status = document.getElementById("bulk-review-status");
+        if (button) button.disabled = true;
+        if (status) status.textContent = "Rejecting pending candidates...";
+        try {
+          const response = await fetch(rejectUnacceptedForm.action, {
+            method: "POST",
+            headers: { "Accept": "application/json" },
+          });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.error || "Failed to reject candidates.");
+          }
+          document.querySelectorAll('.clip[data-review-status]:not([data-review-status="accepted"])').forEach((card) => {
+            updateCandidateReview(card, "rejected");
+          });
+          if (status) {
+            status.textContent = `Rejected ${payload.updated_count} pending candidate(s). Accepted candidates were kept.`;
+          }
+        } catch (error) {
+          if (status) {
+            status.textContent = error.message || "Could not reject candidates.";
+          }
+        } finally {
+          if (button) button.disabled = false;
+        }
+      });
+    }
   </script>
 </body>
 </html>
@@ -2998,6 +3044,18 @@ def create_app() -> Flask:
             return jsonify({"id": candidate_id, "review_status": review_status})
         if return_to == "clips":
             return redirect(url_for("clips_index"))
+        return redirect(url_for("ziai_index"))
+
+    @app.post("/ziai/candidates/reject-unaccepted")
+    def ziai_reject_unaccepted_candidates():
+        with get_connection(settings.db_path) as conn:
+            cursor = conn.execute(
+                "UPDATE ziai_candidates SET review_status = 'rejected' WHERE review_status = 'pending'"
+            )
+            updated_count = cursor.rowcount
+            _sync_clip_dataset_items(conn)
+        if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
+            return jsonify({"updated_count": updated_count})
         return redirect(url_for("ziai_index"))
 
     @app.post("/what-is-a-kiss/<int:clip_id>/load-frames")
