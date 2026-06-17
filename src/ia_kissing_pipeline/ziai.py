@@ -115,8 +115,9 @@ def run_ziai_pipeline(
     source_path: Path,
     output_dir: Path,
     *,
-    min_frames: int = 3,
-    threshold: float = 0.5,
+    min_frames: int = 1,
+    threshold: float = 0.0,
+    max_gap_frames: int = 1,
     clip_padding_seconds: float = 4.0,
     chunk_seconds: float = 300.0,
     inference_batch_size: int = 8,
@@ -272,7 +273,6 @@ def run_ziai_pipeline(
             )
 
     frame_count = len(predictions)
-    max_gap_frames = 2
     segments = _candidate_indices(predictions, min_frames, threshold, max_gap_frames=max_gap_frames)
     _emit(
         progress_callback,
