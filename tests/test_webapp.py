@@ -2161,6 +2161,8 @@ def test_clips_page_builds_training_dataset_from_manual_and_ziai_clips(tmp_path:
     assert b"true positive" in response.data
     assert b"false positive" in response.data
     assert b"false negatives" in response.data
+    assert b"Other Human Tags (1)" in response.data
+    assert b"manual-mark-002.mp4" in response.data
     assert b"candidate_001.mp4" in response.data
     assert b"candidate_002.mp4" in response.data
 

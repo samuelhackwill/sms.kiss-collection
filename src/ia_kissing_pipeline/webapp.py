@@ -1903,6 +1903,12 @@ CLIPS_TEMPLATE = """
     .filters button, .button { border: 1px solid var(--border); background: #182334; color: var(--text); border-radius: 999px; padding: 8px 12px; cursor: pointer; font: inherit; }
     .legend { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
     .pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 999px; padding: 4px 8px; color: var(--muted); font-size: 12px; background: rgba(0, 0, 0, 0.18); }
+    details.other-tags { margin-top: 24px; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 16px; padding: 14px; }
+    details.other-tags summary { cursor: pointer; color: var(--muted); font-weight: 700; }
+    details.other-tags summary::-webkit-details-marker { display: none; }
+    details.other-tags summary::after { content: "show"; float: right; font-size: 12px; font-weight: 400; }
+    details.other-tags[open] summary::after { content: "hide"; }
+    .section-note { color: var(--muted); font-size: 13px; margin: 8px 0 14px 0; }
     .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
     .tile { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-left: 5px solid var(--border); border-radius: 16px; overflow: hidden; }
     .tile.model-true_positive, .tile.model-human_positive { border-left-color: var(--good); }
@@ -1933,17 +1939,17 @@ CLIPS_TEMPLATE = """
   <p class="summary">
     This page materializes every known clip into <code>clip_dataset_items</code>: manually acquired clips from human review,
     ZIAI classifier candidates, and their current labels. Rejected ZIAI positives are stored as false positives;
-    accepted ZIAI positives are true positives. Missed-kiss frame labels are counted as false negatives until we turn them into review clips.
+    accepted ZIAI positives are true positives. Manual non-kiss tags are kept, but folded below the main kiss-training set for now.
   </p>
 
   <div class="stats">
-    <div class="stat"><div class="value">{{ stats["total"] }}</div><div class="label">clips</div></div>
-    <div class="stat"><div class="value">{{ stats["trainable"] }}</div><div class="label">trainable</div></div>
-    <div class="stat"><div class="value">{{ stats["by_source"].get("human_manual_operator", 0) }}</div><div class="label">manual</div></div>
+    <div class="stat"><div class="value">{{ clips|length }}</div><div class="label">main clips</div></div>
+    <div class="stat"><div class="value">{{ other_clips|length }}</div><div class="label">other tags</div></div>
+    <div class="stat"><div class="value">{{ stats["total"] }}</div><div class="label">total rows</div></div>
+    <div class="stat"><div class="value">{{ stats["main_manual"] }}</div><div class="label">manual kiss</div></div>
     <div class="stat"><div class="value">{{ stats["by_source"].get("ziai_classifier_candidate", 0) }}</div><div class="label">ziai</div></div>
     <div class="stat"><div class="value">{{ stats["true_positive"] }}</div><div class="label">true positives</div></div>
     <div class="stat"><div class="value">{{ stats["false_positive"] }}</div><div class="label">false positives</div></div>
-    <div class="stat"><div class="value">{{ stats["true_negative"] }}</div><div class="label">true negatives</div></div>
     <div class="stat"><div class="value">{{ stats["false_negative"] }}</div><div class="label">false negatives</div></div>
   </div>
 
@@ -1986,8 +1992,8 @@ CLIPS_TEMPLATE = """
   </form>
 
   <div class="legend">
-    <span class="pill">Showing {{ clips|length }} filtered clips</span>
-    <span class="pill">manual kiss/non-kiss labels are human supervision</span>
+    <span class="pill">Showing {{ clips|length }} main clips</span>
+    <span class="pill">{{ other_clips|length }} manual non-kiss clips folded below</span>
     <span class="pill">ZIAI rejected = false positive</span>
     <span class="pill">true negatives require sampled classifier-negative clips</span>
   </div>
@@ -2041,6 +2047,43 @@ CLIPS_TEMPLATE = """
     </div>
   {% else %}
     <div class="empty">No clips match those filters yet.</div>
+  {% endif %}
+
+  {% if other_clips %}
+    <details class="other-tags">
+      <summary>Other Human Tags ({{ other_clips|length }})</summary>
+      <p class="section-note">Manual clips tagged as non-kiss, such as dance or phone. They remain in the dataset but are excluded from the main kiss-training grid for now.</p>
+      <div class="grid">
+        {% for clip in other_clips %}
+          <div class="tile model-{{ clip['model_outcome'] }}">
+            {% if clip['media_url'] %}
+              <video controls preload="metadata" playsinline src="{{ clip['media_url'] }}"></video>
+            {% else %}
+              <div class="empty">Media path is not under a known media root.</div>
+            {% endif %}
+            <div class="body">
+              <div class="title"><a href="{{ url_for('film_detail', film_id=clip['film_id']) }}">{{ clip["title"] }}</a></div>
+              <div class="badges">
+                <span class="badge">{{ clip["acquisition_method"]|replace("_", " ") }}</span>
+                <span class="badge {{ clip['training_label'] }}">{{ clip["training_label"] }}</span>
+                <span class="badge">human: {{ clip["human_label"] }}</span>
+              </div>
+              <div class="meta">
+                source {{ clip["source_table"] }} #{{ clip["source_id"] }} |
+                {{ "%.2f"|format(clip["start_seconds"]) }}s-{{ "%.2f"|format(clip["end_seconds"]) }}s
+              </div>
+              <div class="meta">{{ clip["relpath"] or clip["media_path"] }}</div>
+              <div class="actions">
+                <a class="button" href="{{ url_for('film_detail', film_id=clip['film_id']) }}">Film</a>
+                <form method="post" action="{{ url_for('toggle_ignore_clip_route', clip_id=clip['source_id']) }}">
+                  <button>{{ "Unignore" if clip["review_status"] == "ignored" else "Ignore" }}</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </details>
   {% endif %}
 <script>
   document.querySelectorAll(".tile video").forEach((video) => {
@@ -2619,9 +2662,17 @@ def create_app() -> Flask:
         }
         with get_connection(settings.db_path) as conn:
             _sync_clip_dataset_items(conn)
-            clips = _load_clip_dataset_items(conn, settings, filters)
+            dataset_items = _load_clip_dataset_items(conn, settings, filters)
+            clips, other_clips = _split_clip_dataset_items(dataset_items)
             stats = _load_clip_dataset_stats(conn)
-        return render_template_string(CLIPS_TEMPLATE, clips=clips, stats=stats, filters=filters)
+            stats["main_manual"] = sum(1 for clip in clips if clip["acquisition_method"] == "human_manual_operator")
+        return render_template_string(
+            CLIPS_TEMPLATE,
+            clips=clips,
+            other_clips=other_clips,
+            stats=stats,
+            filters=filters,
+        )
 
     @app.get("/what-is-a-kiss")
     def what_is_a_kiss_page():
@@ -4878,6 +4929,24 @@ def _load_clip_dataset_items(conn, settings, filters: dict[str, object]) -> list
         )
         items.append(item)
     return items
+
+
+def _is_other_human_tag_clip(item: dict) -> bool:
+    if item.get("acquisition_method") != "human_manual_operator":
+        return False
+    human_label = str(item.get("human_label") or "").strip().lower()
+    return bool(human_label and human_label != "kiss")
+
+
+def _split_clip_dataset_items(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    main_items: list[dict] = []
+    other_items: list[dict] = []
+    for item in items:
+        if _is_other_human_tag_clip(item):
+            other_items.append(item)
+        else:
+            main_items.append(item)
+    return main_items, other_items
 
 
 def _count_rows(rows) -> int:
