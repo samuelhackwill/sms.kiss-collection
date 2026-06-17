@@ -27,29 +27,52 @@ def _emit(callback: ZiaiProgressCallback | None, event_type: str, **payload: obj
         callback(event_type, payload)
 
 
-def _candidate_indices(predictions: list[int], min_frames: int, threshold: float) -> list[list[int]]:
+def _candidate_indices(
+    predictions: list[int],
+    min_frames: int,
+    threshold: float,
+    *,
+    max_gap_frames: int = 2,
+) -> list[list[int]]:
+    min_positive_frames = max(1, int(min_frames))
+    density_floor = max(0.0, min(1.0, float(threshold)))
+    max_gap_frames = max(0, int(max_gap_frames))
     candidates: list[tuple[int, int]] = []
-    for start_index, prediction in enumerate(predictions):
-        if prediction != 1 or len(predictions) - start_index < min_frames:
-            continue
-        best: tuple[int, int] | None = None
-        for end_index in range(start_index + min_frames - 1, len(predictions)):
-            if predictions[end_index] != 1:
-                continue
-            density = sum(predictions[start_index : end_index + 1]) / (end_index - start_index + 1)
-            if density >= threshold:
-                best = (start_index, end_index)
-        if best is not None:
-            candidates.append(best)
+    start_index: int | None = None
+    end_index: int | None = None
+    positive_count = 0
+    gap_count = 0
 
-    merged: list[tuple[int, int]] = []
-    for start_index, end_index in candidates:
-        if merged and start_index <= merged[-1][1]:
-            if end_index - start_index > merged[-1][1] - merged[-1][0]:
-                merged[-1] = (start_index, end_index)
+    def flush_candidate() -> None:
+        if start_index is None or end_index is None:
+            return
+        total_frames = end_index - start_index + 1
+        density = positive_count / max(1, total_frames)
+        if positive_count >= min_positive_frames and density >= density_floor:
+            candidates.append((start_index, end_index))
+
+    for index, prediction in enumerate(predictions):
+        if prediction == 1:
+            if start_index is None:
+                start_index = index
+                positive_count = 0
+            end_index = index
+            positive_count += 1
+            gap_count = 0
             continue
-        merged.append((start_index, end_index))
-    return [list(range(start_index, end_index + 1)) for start_index, end_index in merged]
+
+        if start_index is None:
+            continue
+        gap_count += 1
+        if gap_count > max_gap_frames:
+            flush_candidate()
+            start_index = None
+            end_index = None
+            positive_count = 0
+            gap_count = 0
+
+    flush_candidate()
+    return [list(range(start_index, end_index + 1)) for start_index, end_index in candidates]
 
 
 def _chunk_windows(duration_seconds: float, chunk_seconds: float) -> list[tuple[float, float]]:
@@ -92,9 +115,9 @@ def run_ziai_pipeline(
     source_path: Path,
     output_dir: Path,
     *,
-    min_frames: int = 10,
-    threshold: float = 0.7,
-    clip_padding_seconds: float = 2.0,
+    min_frames: int = 3,
+    threshold: float = 0.5,
+    clip_padding_seconds: float = 4.0,
     chunk_seconds: float = 300.0,
     inference_batch_size: int = 8,
     progress_callback: ZiaiProgressCallback | None = None,
@@ -249,7 +272,8 @@ def run_ziai_pipeline(
             )
 
     frame_count = len(predictions)
-    segments = _candidate_indices(predictions, min_frames, threshold)
+    max_gap_frames = 2
+    segments = _candidate_indices(predictions, min_frames, threshold, max_gap_frames=max_gap_frames)
     _emit(
         progress_callback,
         "candidates_found",
@@ -302,6 +326,7 @@ def run_ziai_pipeline(
         "candidate_count": len(candidates),
         "min_frames": min_frames,
         "threshold": threshold,
+        "max_gap_frames": max_gap_frames,
         "clip_padding_seconds": clip_padding_seconds,
         "chunk_seconds": chunk_seconds,
         "inference_batch_size": inference_batch_size,

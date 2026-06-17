@@ -6447,9 +6447,9 @@ def _queue_ingestor_dry_run(settings, payload: dict[str, object]) -> int:
 def _queue_ziai_film(settings, film_id: int) -> int:
     now = utc_now_iso()
     payload = {
-        "min_frames": 10,
-        "threshold": 0.7,
-        "clip_padding_seconds": 2.0,
+        "min_frames": 3,
+        "threshold": 0.5,
+        "clip_padding_seconds": 4.0,
         "chunk_seconds": 300.0,
         "inference_batch_size": 8,
     }
@@ -7045,9 +7045,9 @@ def _run_ziai_batch_now(job_id: int) -> int:
         for index, film in enumerate(films):
             now = utc_now_iso()
             child_payload = {
-                "min_frames": 10,
-                "threshold": 0.7,
-                "clip_padding_seconds": 2.0,
+                "min_frames": 3,
+                "threshold": 0.5,
+                "clip_padding_seconds": 4.0,
                 "chunk_seconds": 300.0,
                 "inference_batch_size": 8,
                 "batch_job_id": job_id,
