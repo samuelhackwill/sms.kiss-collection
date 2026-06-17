@@ -561,6 +561,69 @@ def test_film_detail_lists_paginated_ziai_classifier_frames(tmp_path: Path, monk
     }
 
 
+def test_ziai_candidate_review_can_update_without_page_refresh(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, created_at, updated_at)
+            VALUES (1, 'ziai_film', 'done', '2026-06-16T00:00:00Z', '2026-06-16T00:00:00Z')
+            """
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        candidate_path = settings.preview_dir / "kiss_in_spring_1932" / "ziai" / "candidates" / "candidate_001.mp4"
+        candidate_path.parent.mkdir(parents=True)
+        candidate_path.write_text("clip")
+        conn.execute(
+            """
+            INSERT INTO ziai_candidates (
+                id, job_id, film_id, candidate_index, start_seconds, end_seconds,
+                confidence, clip_path, review_status, created_at
+            ) VALUES (1, ?, 1, 1, 0.0, 3.0, 0.9, ?, 'pending', '2026-06-16T00:00:00Z')
+            """,
+            (job_id, str(candidate_path)),
+        )
+
+    app = create_app()
+    client = app.test_client()
+    page = client.get("/ziai")
+    response = client.post(
+        "/ziai/candidates/1/review",
+        data={"review_status": "rejected"},
+        headers={"Accept": "application/json"},
+    )
+
+    assert page.status_code == 200
+    assert b"class=\"candidate-review-form\"" in page.data
+    assert response.status_code == 200
+    assert response.get_json() == {"id": 1, "review_status": "rejected"}
+    with get_connection(settings.db_path) as conn:
+        candidate = conn.execute("SELECT review_status FROM ziai_candidates WHERE id = 1").fetchone()
+        dataset = conn.execute(
+            """
+            SELECT training_label, model_outcome
+            FROM clip_dataset_items
+            WHERE source_table = 'ziai_candidates' AND source_id = 1
+            """
+        ).fetchone()
+    assert candidate["review_status"] == "rejected"
+    assert dict(dataset) == {"training_label": "negative", "model_outcome": "false_positive"}
+
+
 def test_s3_media_backend_serves_previews_and_clips_from_public_bucket(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)

@@ -691,6 +691,13 @@ ZIAI_TEMPLATE = """
     .activity-item { border-left: 3px solid #314056; padding: 7px 10px; background: #0b1016; font: 12px/1.45 monospace; }
     .activity-item.done { border-color: #2d7f55; }
     .activity-item.error { border-color: #b64d5f; color: #ffd3db; }
+    .clip[data-review-status="accepted"] { border-color: #2d7f55; }
+    .clip[data-review-status="rejected"] { border-color: #b64d5f; opacity: 0.78; }
+    .clip[data-review-status="pending"] { border-color: #314056; }
+    .candidate-status { border: 1px solid #314056; border-radius: 999px; padding: 4px 8px; color: #d7e5f7; background: #0b1016; }
+    .candidate-status.accepted { color: #9be7b8; border-color: #2d7f55; }
+    .candidate-status.rejected { color: #ffd3db; border-color: #b64d5f; }
+    .candidate-status.saving { color: #ffd88a; border-color: #8c6a24; }
     video { width: 100%; background: #000; border-radius: 10px; margin: 8px 0; }
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     @media (max-width: 800px) { table { font-size: 13px; } }
@@ -748,13 +755,17 @@ ZIAI_TEMPLATE = """
     <h2 style="margin-top:0;">Human Review Candidates</h2>
     <div class="clips">
       {% for candidate in candidates %}
-        <div class="clip" id="ziai-candidate-{{ candidate['id'] }}">
+        <div class="clip" id="ziai-candidate-{{ candidate['id'] }}" data-review-status="{{ candidate['review_status'] }}">
           <strong>{{ candidate['title'] }}</strong>
           <div class="muted">candidate {{ candidate['candidate_index'] }} | {{ '%.1f'|format(candidate['start_seconds']) }}s-{{ '%.1f'|format(candidate['end_seconds']) }}s | confidence {{ '%.2f'|format(candidate['confidence']) }}</div>
           {% if candidate['media_url'] %}<video controls preload="metadata" src="{{ candidate['media_url'] }}"></video>{% endif %}
           <div class="row">
-            <span>{{ candidate['review_status'] }}</span>
-            <form method="post" action="{{ url_for('ziai_review_candidate', candidate_id=candidate['id']) }}"><button name="review_status" value="accepted">Accept</button><button name="review_status" value="rejected">Reject</button></form>
+            <span class="candidate-status {{ candidate['review_status'] }}">{{ candidate['review_status'] }}</span>
+            <form class="candidate-review-form" method="post" action="{{ url_for('ziai_review_candidate', candidate_id=candidate['id']) }}">
+              <button name="review_status" value="accepted">Accept</button>
+              <button name="review_status" value="rejected">Reject</button>
+              <button name="review_status" value="pending">Pending</button>
+            </form>
           </div>
         </div>
       {% else %}
@@ -789,6 +800,51 @@ ZIAI_TEMPLATE = """
     });
   </script>
   {% endif %}
+  <script>
+    document.querySelectorAll(".candidate-review-form").forEach((form) => {
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const submitter = event.submitter;
+        const status = submitter?.value;
+        if (!status) return;
+        const card = form.closest(".clip");
+        const statusBadge = card?.querySelector(".candidate-status");
+        const buttons = form.querySelectorAll("button");
+        const formData = new FormData(form);
+        formData.set("review_status", status);
+        buttons.forEach((button) => { button.disabled = true; });
+        if (statusBadge) {
+          statusBadge.textContent = "saving...";
+          statusBadge.className = "candidate-status saving";
+        }
+        try {
+          const response = await fetch(form.action, {
+            method: "POST",
+            body: formData,
+            headers: { "Accept": "application/json" },
+          });
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.error || "Failed to update candidate.");
+          }
+          if (card) {
+            card.dataset.reviewStatus = payload.review_status;
+          }
+          if (statusBadge) {
+            statusBadge.textContent = payload.review_status;
+            statusBadge.className = `candidate-status ${payload.review_status}`;
+          }
+        } catch (error) {
+          if (statusBadge) {
+            statusBadge.textContent = error.message || "error";
+            statusBadge.className = "candidate-status rejected";
+          }
+        } finally {
+          buttons.forEach((button) => { button.disabled = false; });
+        }
+      });
+    });
+  </script>
 </body>
 </html>
 """
@@ -2938,6 +2994,8 @@ def create_app() -> Flask:
             if cursor.rowcount == 0:
                 abort(404)
             _sync_clip_dataset_items(conn)
+        if request.accept_mimetypes.accept_json and not request.accept_mimetypes.accept_html:
+            return jsonify({"id": candidate_id, "review_status": review_status})
         if return_to == "clips":
             return redirect(url_for("clips_index"))
         return redirect(url_for("ziai_index"))
