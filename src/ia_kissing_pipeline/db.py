@@ -205,6 +205,33 @@ CREATE TABLE IF NOT EXISTS ziai_frame_reviews (
 
 CREATE INDEX IF NOT EXISTS idx_ziai_frame_reviews_film_id ON ziai_frame_reviews(film_id);
 
+CREATE TABLE IF NOT EXISTS clip_dataset_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_table TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    film_id INTEGER NOT NULL REFERENCES films(id) ON DELETE CASCADE,
+    acquisition_method TEXT NOT NULL,
+    media_kind TEXT NOT NULL,
+    media_path TEXT NOT NULL,
+    start_seconds REAL,
+    end_seconds REAL,
+    human_label TEXT,
+    model_name TEXT,
+    model_prediction TEXT,
+    model_confidence REAL,
+    review_status TEXT NOT NULL DEFAULT 'pending',
+    training_label TEXT NOT NULL DEFAULT 'unlabeled',
+    model_outcome TEXT NOT NULL DEFAULT 'unreviewed',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (source_table, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_clip_dataset_items_film_id ON clip_dataset_items(film_id);
+CREATE INDEX IF NOT EXISTS idx_clip_dataset_items_outcome ON clip_dataset_items(model_outcome);
+CREATE INDEX IF NOT EXISTS idx_clip_dataset_items_training_label ON clip_dataset_items(training_label);
+
 CREATE TABLE IF NOT EXISTS queue_runtime (
     queue_name TEXT PRIMARY KEY,
     state TEXT NOT NULL DEFAULT 'idle',

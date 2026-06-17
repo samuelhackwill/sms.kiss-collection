@@ -1885,33 +1885,165 @@ CLIPS_TEMPLATE = """
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Saved Clips</title>
+  <title>Clip Dataset</title>
   <style>
-    body { margin: 16px; background: #111; color: #f3eee7; }
-    .grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
-    .tile { background: #000; aspect-ratio: 16 / 9; overflow: hidden; }
-    .tile video { width: 100%; height: 100%; object-fit: cover; display: block; cursor: pointer; background: #000; }
-    @media (max-width: 1400px) { .grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
-    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-    @media (max-width: 800px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-    @media (max-width: 560px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    :root { color-scheme: dark; --bg: #0d1117; --panel: #151b23; --panel-2: #111720; --border: #263244; --text: #edf3ff; --muted: #93a4bc; --link: #7cc7ff; --good: #4ade80; --bad: #fb7185; --warn: #fbbf24; --info: #60a5fa; }
+    body { font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif; margin: 24px; background: radial-gradient(circle at top, #182334 0%, var(--bg) 55%); color: var(--text); }
+    a { color: var(--link); text-decoration: none; }
+    h1 { margin-bottom: 6px; }
+    .muted { color: var(--muted); }
+    .summary { color: var(--muted); margin: 0 0 18px 0; max-width: 980px; line-height: 1.45; }
+    .stats { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; margin: 16px 0; }
+    .stat { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
+    .stat .value { font-size: 26px; font-weight: 800; }
+    .stat .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; background: rgba(17, 23, 32, 0.75); border: 1px solid var(--border); border-radius: 16px; padding: 12px; margin-bottom: 16px; }
+    .filters label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+    .filters input, .filters select { min-width: 150px; background: #0b1016; border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 8px 10px; }
+    .filters button, .button { border: 1px solid var(--border); background: #182334; color: var(--text); border-radius: 999px; padding: 8px 12px; cursor: pointer; font: inherit; }
+    .legend { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 999px; padding: 4px 8px; color: var(--muted); font-size: 12px; background: rgba(0, 0, 0, 0.18); }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+    .tile { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-left: 5px solid var(--border); border-radius: 16px; overflow: hidden; }
+    .tile.model-true_positive, .tile.model-human_positive { border-left-color: var(--good); }
+    .tile.model-false_positive, .tile.model-human_negative { border-left-color: var(--bad); }
+    .tile.model-pending_review, .tile.model-human_unlabeled { border-left-color: var(--warn); }
+    .tile.model-ignored { opacity: 0.72; }
+    .tile video { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; background: #000; }
+    .body { padding: 12px; display: grid; gap: 8px; }
+    .title { font-weight: 700; line-height: 1.25; }
+    .meta { color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+    .badge { border-radius: 999px; padding: 3px 8px; font-size: 12px; background: #0b1016; border: 1px solid var(--border); color: var(--muted); }
+    .badge.positive { color: var(--good); border-color: rgba(74, 222, 128, 0.4); }
+    .badge.negative { color: var(--bad); border-color: rgba(251, 113, 133, 0.45); }
+    .badge.unlabeled { color: var(--warn); border-color: rgba(251, 191, 36, 0.45); }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+    .actions form { display: inline; }
+    .actions button { border: 1px solid var(--border); background: #182334; color: var(--text); border-radius: 999px; padding: 5px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+    .empty { padding: 24px; border: 1px solid var(--border); border-radius: 16px; background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); }
+    @media (max-width: 1400px) { .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); } .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (max-width: 950px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 620px) { .stats, .grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
+  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <strong>Clips</strong></p>
+  <h1>Clip Dataset</h1>
+  <p class="summary">
+    This page materializes every known clip into <code>clip_dataset_items</code>: manually acquired clips from human review,
+    ZIAI classifier candidates, and their current labels. Rejected ZIAI positives are stored as false positives;
+    accepted ZIAI positives are true positives. Missed-kiss frame labels are counted as false negatives until we turn them into review clips.
+  </p>
+
+  <div class="stats">
+    <div class="stat"><div class="value">{{ stats["total"] }}</div><div class="label">clips</div></div>
+    <div class="stat"><div class="value">{{ stats["trainable"] }}</div><div class="label">trainable</div></div>
+    <div class="stat"><div class="value">{{ stats["by_source"].get("human_manual_operator", 0) }}</div><div class="label">manual</div></div>
+    <div class="stat"><div class="value">{{ stats["by_source"].get("ziai_classifier_candidate", 0) }}</div><div class="label">ziai</div></div>
+    <div class="stat"><div class="value">{{ stats["true_positive"] }}</div><div class="label">true positives</div></div>
+    <div class="stat"><div class="value">{{ stats["false_positive"] }}</div><div class="label">false positives</div></div>
+    <div class="stat"><div class="value">{{ stats["true_negative"] }}</div><div class="label">true negatives</div></div>
+    <div class="stat"><div class="value">{{ stats["false_negative"] }}</div><div class="label">false negatives</div></div>
+  </div>
+
+  <form class="filters" method="get" action="{{ url_for('clips_index') }}">
+    <label>Film id
+      <input name="film_id" type="number" min="1" value="{{ filters['film_id'] or '' }}">
+    </label>
+    <label>Human tag
+      <input name="tag" value="{{ filters['tag'] or '' }}" placeholder="kiss, dance, phone...">
+    </label>
+    <label>Source
+      <select name="source">
+        <option value="">all sources</option>
+        <option value="human_manual_operator" {{ 'selected' if filters['source'] == 'human_manual_operator' else '' }}>human manual</option>
+        <option value="ziai_classifier_candidate" {{ 'selected' if filters['source'] == 'ziai_classifier_candidate' else '' }}>ziai candidate</option>
+      </select>
+    </label>
+    <label>Label
+      <select name="label">
+        <option value="">all labels</option>
+        <option value="positive" {{ 'selected' if filters['label'] == 'positive' else '' }}>positive</option>
+        <option value="negative" {{ 'selected' if filters['label'] == 'negative' else '' }}>negative</option>
+        <option value="unlabeled" {{ 'selected' if filters['label'] == 'unlabeled' else '' }}>unlabeled</option>
+        <option value="ignore" {{ 'selected' if filters['label'] == 'ignore' else '' }}>ignore</option>
+      </select>
+    </label>
+    <label>Outcome
+      <select name="outcome">
+        <option value="">all outcomes</option>
+        <option value="human_positive" {{ 'selected' if filters['outcome'] == 'human_positive' else '' }}>human positive</option>
+        <option value="human_negative" {{ 'selected' if filters['outcome'] == 'human_negative' else '' }}>human negative</option>
+        <option value="true_positive" {{ 'selected' if filters['outcome'] == 'true_positive' else '' }}>true positive</option>
+        <option value="false_positive" {{ 'selected' if filters['outcome'] == 'false_positive' else '' }}>false positive</option>
+        <option value="pending_review" {{ 'selected' if filters['outcome'] == 'pending_review' else '' }}>pending review</option>
+        <option value="ignored" {{ 'selected' if filters['outcome'] == 'ignored' else '' }}>ignored</option>
+      </select>
+    </label>
+    <button type="submit">Filter</button>
+    <a class="button" href="{{ url_for('clips_index') }}">Reset</a>
+  </form>
+
+  <div class="legend">
+    <span class="pill">Showing {{ clips|length }} filtered clips</span>
+    <span class="pill">manual kiss/non-kiss labels are human supervision</span>
+    <span class="pill">ZIAI rejected = false positive</span>
+    <span class="pill">true negatives require sampled classifier-negative clips</span>
+  </div>
+
   {% if clips %}
     <div class="grid">
       {% for clip in clips %}
-        <div class="tile">
-          <video preload="metadata" playsinline src="{{ clip['media_url'] }}"></video>
+        <div class="tile model-{{ clip['model_outcome'] }}">
+          {% if clip['media_url'] %}
+            <video controls preload="metadata" playsinline src="{{ clip['media_url'] }}"></video>
+          {% else %}
+            <div class="empty">Media path is not under a known media root.</div>
+          {% endif %}
+          <div class="body">
+            <div class="title"><a href="{{ url_for('film_detail', film_id=clip['film_id']) }}">{{ clip["title"] }}</a></div>
+            <div class="badges">
+              <span class="badge">{{ clip["acquisition_method"]|replace("_", " ") }}</span>
+              <span class="badge {{ clip['training_label'] }}">{{ clip["training_label"] }}</span>
+              <span class="badge">{{ clip["model_outcome"]|replace("_", " ") }}</span>
+              {% if clip["human_label"] %}<span class="badge">human: {{ clip["human_label"] }}</span>{% endif %}
+            </div>
+            <div class="meta">
+              source {{ clip["source_table"] }} #{{ clip["source_id"] }} |
+              review {{ clip["review_status"] }}
+              {% if clip["model_name"] %}| model {{ clip["model_name"] }}{% endif %}
+              {% if clip["model_confidence"] is not none %}| confidence {{ "%.3f"|format(clip["model_confidence"]) }}{% endif %}
+              {% if clip["start_seconds"] is not none and clip["end_seconds"] is not none %}
+                | {{ "%.2f"|format(clip["start_seconds"]) }}s-{{ "%.2f"|format(clip["end_seconds"]) }}s
+              {% endif %}
+            </div>
+            <div class="meta">{{ clip["relpath"] or clip["media_path"] }}</div>
+            <div class="actions">
+              <a class="button" href="{{ url_for('film_detail', film_id=clip['film_id']) }}">Film</a>
+              {% if clip["source_table"] == "ziai_candidates" %}
+                <form method="post" action="{{ url_for('ziai_review_candidate', candidate_id=clip['source_id']) }}">
+                  <input type="hidden" name="return_to" value="clips">
+                  <button name="review_status" value="accepted">Accept</button>
+                  <button name="review_status" value="rejected">Reject</button>
+                  <button name="review_status" value="pending">Pending</button>
+                </form>
+              {% endif %}
+              {% if clip["source_table"] == "manual_clips" %}
+                <form method="post" action="{{ url_for('toggle_ignore_clip_route', clip_id=clip['source_id']) }}">
+                  <button>{{ "Unignore" if clip["review_status"] == "ignored" else "Ignore" }}</button>
+                </form>
+              {% endif %}
+            </div>
+          </div>
         </div>
       {% endfor %}
     </div>
   {% else %}
-    <div>No clips yet.</div>
+    <div class="empty">No clips match those filters yet.</div>
   {% endif %}
 <script>
   document.querySelectorAll(".tile video").forEach((video) => {
-    video.removeAttribute("controls");
     video.addEventListener("click", () => {
       if (video.paused) {
         video.play();
@@ -2393,6 +2525,7 @@ def create_app() -> Flask:
                 """,
                 (selected_tag, selected_tag, mark_id),
             )
+            _sync_clip_dataset_items(conn)
         if return_film_id:
             return redirect(url_for("film_detail", film_id=return_film_id))
         return redirect(url_for("films_index"))
@@ -2477,14 +2610,18 @@ def create_app() -> Flask:
 
     @app.get("/clips")
     def clips_index():
+        filters = {
+            "film_id": request.args.get("film_id", type=int),
+            "tag": request.args.get("tag", type=str),
+            "source": request.args.get("source", type=str),
+            "outcome": request.args.get("outcome", type=str),
+            "label": request.args.get("label", type=str),
+        }
         with get_connection(settings.db_path) as conn:
-            clips = _load_clips(
-                conn,
-                settings.clips_dir,
-                film_id=request.args.get("film_id", type=int),
-                tag=request.args.get("tag", type=str),
-            )
-        return render_template_string(CLIPS_TEMPLATE, clips=clips)
+            _sync_clip_dataset_items(conn)
+            clips = _load_clip_dataset_items(conn, settings, filters)
+            stats = _load_clip_dataset_stats(conn)
+        return render_template_string(CLIPS_TEMPLATE, clips=clips, stats=stats, filters=filters)
 
     @app.get("/what-is-a-kiss")
     def what_is_a_kiss_page():
@@ -2741,6 +2878,7 @@ def create_app() -> Flask:
         review_status = request.form.get("review_status", "").strip()
         if review_status not in {"pending", "accepted", "rejected"}:
             abort(400)
+        return_to = request.form.get("return_to", "").strip()
         with get_connection(settings.db_path) as conn:
             cursor = conn.execute(
                 "UPDATE ziai_candidates SET review_status = ? WHERE id = ?",
@@ -2748,6 +2886,9 @@ def create_app() -> Flask:
             )
             if cursor.rowcount == 0:
                 abort(404)
+            _sync_clip_dataset_items(conn)
+        if return_to == "clips":
+            return redirect(url_for("clips_index"))
         return redirect(url_for("ziai_index"))
 
     @app.post("/what-is-a-kiss/<int:clip_id>/load-frames")
@@ -2834,6 +2975,7 @@ def create_app() -> Flask:
                             continue
                         delete_media_file(settings, "clip", path_value)
                     conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip_item["id"],))
+                    _sync_clip_dataset_items(conn)
                 else:
                     resolved_path.unlink()
                     if kind == "clip":
@@ -2933,7 +3075,8 @@ def create_app() -> Flask:
                 WHERE id = ?
                 """,
                 (str(cropped_path), crop_x, crop_y, crop_width, crop_height, clip_id),
-        )
+            )
+            _sync_clip_dataset_items(conn)
         return redirect(url_for("clips_index"))
 
     @app.post("/clips/<int:clip_id>/delete")
@@ -2947,6 +3090,7 @@ def create_app() -> Flask:
                 if path_value:
                     delete_media_file(settings, "clip", path_value)
             conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip_id,))
+            _sync_clip_dataset_items(conn)
         if return_film_id:
             return redirect(url_for("film_detail", film_id=return_film_id))
         return redirect(url_for("clips_index"))
@@ -2960,6 +3104,7 @@ def create_app() -> Flask:
                 abort(404)
             next_value = 0 if int(clip["ignored"] or 0) else 1
             conn.execute("UPDATE manual_clips SET ignored = ? WHERE id = ?", (next_value, clip_id))
+            _sync_clip_dataset_items(conn)
         if return_film_id:
             return redirect(url_for("film_detail", film_id=return_film_id))
         return redirect(url_for("clips_index"))
@@ -2975,6 +3120,7 @@ def create_app() -> Flask:
                         delete_media_file(settings, "clip", path_value)
                 conn.execute("DELETE FROM manual_clips WHERE id = ?", (clip["id"],))
             conn.execute("DELETE FROM manual_marks WHERE id = ?", (mark_id,))
+            _sync_clip_dataset_items(conn)
         if return_film_id:
             return redirect(url_for("film_detail", film_id=return_film_id))
         return redirect(url_for("films_index"))
@@ -4522,6 +4668,282 @@ def _persist_clip_kiss_timing(conn, clip_id: int, kiss_start_seconds, kiss_end_s
         "UPDATE manual_clips SET metadata_json = ? WHERE id = ?",
         (json.dumps(metadata, sort_keys=True), clip_id),
     )
+
+
+def _training_label_for_human_label(label: str | None, *, ignored: bool = False) -> str:
+    if ignored:
+        return "ignore"
+    clean_label = (label or "").strip().lower()
+    if not clean_label:
+        return "unlabeled"
+    if clean_label == "kiss":
+        return "positive"
+    return "negative"
+
+
+def _manual_clip_outcome(label: str | None, *, ignored: bool = False) -> str:
+    if ignored:
+        return "ignored"
+    training_label = _training_label_for_human_label(label)
+    if training_label == "positive":
+        return "human_positive"
+    if training_label == "negative":
+        return "human_negative"
+    return "human_unlabeled"
+
+
+def _ziai_candidate_dataset_fields(review_status: str) -> tuple[str | None, str, str]:
+    if review_status == "accepted":
+        return "kiss", "positive", "true_positive"
+    if review_status == "rejected":
+        return "not_kiss", "negative", "false_positive"
+    return None, "unlabeled", "pending_review"
+
+
+def _sync_clip_dataset_items(conn) -> None:
+    now = utc_now_iso()
+    manual_rows = conn.execute("SELECT * FROM manual_clips").fetchall()
+    for row in manual_rows:
+        item = dict(row)
+        ignored = bool(item.get("ignored"))
+        human_label = item.get("clip_tag") or None
+        metadata = json.loads(item.get("metadata_json") or "{}")
+        media_path = item.get("cropped_clip_path") or item.get("clip_path")
+        conn.execute(
+            """
+            INSERT INTO clip_dataset_items (
+                source_table, source_id, film_id, acquisition_method, media_kind, media_path,
+                start_seconds, end_seconds, human_label, model_name, model_prediction,
+                model_confidence, review_status, training_label, model_outcome,
+                metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_table, source_id) DO UPDATE SET
+                film_id = excluded.film_id,
+                acquisition_method = excluded.acquisition_method,
+                media_kind = excluded.media_kind,
+                media_path = excluded.media_path,
+                start_seconds = excluded.start_seconds,
+                end_seconds = excluded.end_seconds,
+                human_label = excluded.human_label,
+                model_name = excluded.model_name,
+                model_prediction = excluded.model_prediction,
+                model_confidence = excluded.model_confidence,
+                review_status = excluded.review_status,
+                training_label = excluded.training_label,
+                model_outcome = excluded.model_outcome,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                "manual_clips",
+                int(item["id"]),
+                int(item["film_id"]),
+                "human_manual_operator",
+                "clip",
+                str(media_path),
+                item.get("start_seconds"),
+                item.get("end_seconds"),
+                human_label,
+                None,
+                None,
+                None,
+                "ignored" if ignored else "accepted",
+                _training_label_for_human_label(human_label, ignored=ignored),
+                _manual_clip_outcome(human_label, ignored=ignored),
+                json.dumps(metadata, sort_keys=True),
+                item.get("created_at") or now,
+                now,
+            ),
+        )
+
+    ziai_rows = conn.execute("SELECT * FROM ziai_candidates").fetchall()
+    for row in ziai_rows:
+        item = dict(row)
+        human_label, training_label, model_outcome = _ziai_candidate_dataset_fields(item["review_status"])
+        metadata = {
+            "candidate_index": int(item["candidate_index"]),
+            "job_id": int(item["job_id"]),
+            "review_status": item["review_status"],
+        }
+        conn.execute(
+            """
+            INSERT INTO clip_dataset_items (
+                source_table, source_id, film_id, acquisition_method, media_kind, media_path,
+                start_seconds, end_seconds, human_label, model_name, model_prediction,
+                model_confidence, review_status, training_label, model_outcome,
+                metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_table, source_id) DO UPDATE SET
+                film_id = excluded.film_id,
+                acquisition_method = excluded.acquisition_method,
+                media_kind = excluded.media_kind,
+                media_path = excluded.media_path,
+                start_seconds = excluded.start_seconds,
+                end_seconds = excluded.end_seconds,
+                human_label = excluded.human_label,
+                model_name = excluded.model_name,
+                model_prediction = excluded.model_prediction,
+                model_confidence = excluded.model_confidence,
+                review_status = excluded.review_status,
+                training_label = excluded.training_label,
+                model_outcome = excluded.model_outcome,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                "ziai_candidates",
+                int(item["id"]),
+                int(item["film_id"]),
+                "ziai_classifier_candidate",
+                "preview",
+                str(item["clip_path"]),
+                item.get("start_seconds"),
+                item.get("end_seconds"),
+                human_label,
+                "ziai_kissing_detector",
+                "kiss_candidate",
+                item.get("confidence"),
+                item["review_status"],
+                training_label,
+                model_outcome,
+                json.dumps(metadata, sort_keys=True),
+                item.get("created_at") or now,
+                now,
+            ),
+        )
+
+    conn.execute(
+        """
+        DELETE FROM clip_dataset_items
+        WHERE source_table = 'manual_clips'
+          AND source_id NOT IN (SELECT id FROM manual_clips)
+        """
+    )
+    conn.execute(
+        """
+        DELETE FROM clip_dataset_items
+        WHERE source_table = 'ziai_candidates'
+          AND source_id NOT IN (SELECT id FROM ziai_candidates)
+        """
+    )
+
+
+def _load_clip_dataset_items(conn, settings, filters: dict[str, object]) -> list[dict]:
+    clauses: list[str] = []
+    params: list[object] = []
+    film_id = filters.get("film_id")
+    if film_id is not None:
+        clauses.append("cdi.film_id = ?")
+        params.append(film_id)
+    source = str(filters.get("source") or "").strip()
+    if source:
+        clauses.append("cdi.acquisition_method = ?")
+        params.append(source)
+    outcome = str(filters.get("outcome") or "").strip()
+    if outcome:
+        clauses.append("cdi.model_outcome = ?")
+        params.append(outcome)
+    label = str(filters.get("label") or "").strip()
+    if label:
+        clauses.append("cdi.training_label = ?")
+        params.append(label)
+    tag = str(filters.get("tag") or "").strip()
+    if tag:
+        clauses.append("cdi.human_label = ?")
+        params.append(tag)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        f"""
+        SELECT cdi.*, films.title, films.archive_identifier
+        FROM clip_dataset_items cdi
+        JOIN films ON films.id = cdi.film_id
+        {where_sql}
+        ORDER BY cdi.created_at DESC, cdi.id DESC
+        """,
+        params,
+    ).fetchall()
+
+    items: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        media_path = Path(item["media_path"])
+        relpath = media_relpath(settings, item["media_kind"], media_path)
+        item["relpath"] = relpath
+        item["media_url"] = _media_url(settings, item["media_kind"], relpath) if relpath else None
+        item["metadata"] = json.loads(item.get("metadata_json") or "{}")
+        item["duration_seconds"] = (
+            float(item["end_seconds"]) - float(item["start_seconds"])
+            if item.get("start_seconds") is not None and item.get("end_seconds") is not None
+            else None
+        )
+        items.append(item)
+    return items
+
+
+def _count_rows(rows) -> int:
+    return sum(int(row["count"]) for row in rows)
+
+
+def _load_clip_dataset_stats(conn) -> dict[str, object]:
+    total = conn.execute("SELECT COUNT(*) AS count FROM clip_dataset_items").fetchone()["count"]
+    by_source = {
+        row["acquisition_method"]: int(row["count"])
+        for row in conn.execute(
+            """
+            SELECT acquisition_method, COUNT(*) AS count
+            FROM clip_dataset_items
+            GROUP BY acquisition_method
+            """
+        ).fetchall()
+    }
+    by_outcome = {
+        row["model_outcome"]: int(row["count"])
+        for row in conn.execute(
+            """
+            SELECT model_outcome, COUNT(*) AS count
+            FROM clip_dataset_items
+            GROUP BY model_outcome
+            """
+        ).fetchall()
+    }
+    by_label = {
+        row["training_label"]: int(row["count"])
+        for row in conn.execute(
+            """
+            SELECT training_label, COUNT(*) AS count
+            FROM clip_dataset_items
+            GROUP BY training_label
+            """
+        ).fetchall()
+    }
+    missed_kiss_frames = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM ziai_frame_reviews
+        WHERE review_label = 'missed_kiss'
+        """
+    ).fetchone()["count"]
+    trainable_count = _count_rows(
+        conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM clip_dataset_items
+            WHERE training_label IN ('positive', 'negative')
+            """
+        ).fetchall()
+    )
+    return {
+        "total": int(total),
+        "trainable": int(trainable_count),
+        "by_source": by_source,
+        "by_outcome": by_outcome,
+        "by_label": by_label,
+        "missed_kiss_frames": int(missed_kiss_frames),
+        "true_positive": by_outcome.get("true_positive", 0),
+        "false_positive": by_outcome.get("false_positive", 0),
+        "false_negative": int(missed_kiss_frames),
+        "true_negative": by_outcome.get("true_negative", 0),
+    }
 
 
 def _load_clips(conn, clips_dir: Path, film_id: int | None = None, tag: str | None = None) -> list[dict]:
@@ -6459,6 +6881,7 @@ def _run_ziai_film_now(
                         utc_now_iso(),
                     ),
                 )
+            _sync_clip_dataset_items(conn)
             conn.execute(
                 """
                 UPDATE analysis_jobs
@@ -6704,6 +7127,7 @@ def _build_manual_clip_now(job_id: int, film_id: int, mark_id: int, pre_seconds:
                     utc_now_iso(),
                 ),
             )
+            _sync_clip_dataset_items(conn)
             _update_job(conn, job_id, "done", "done", 1.0)
     except BaseException as exc:
         with get_connection(settings.db_path) as conn:

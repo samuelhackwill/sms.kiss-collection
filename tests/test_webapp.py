@@ -2067,6 +2067,146 @@ def test_random_clips_api_returns_json_payload(tmp_path: Path, monkeypatch) -> N
     assert tag_payload["clips"][0]["kiss_end_seconds"] == 2.5
 
 
+def test_clips_page_builds_training_dataset_from_manual_and_ziai_clips(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        clip_dir = settings.clips_dir / "kiss_in_spring_1932"
+        clip_dir.mkdir(parents=True, exist_ok=True)
+        manual_kiss = clip_dir / "manual-mark-001.mp4"
+        manual_phone = clip_dir / "manual-mark-002.mp4"
+        manual_kiss.write_text("kiss clip")
+        manual_phone.write_text("phone clip")
+        conn.execute(
+            """
+            INSERT INTO manual_marks (
+                id, film_id, skim_path, skim_sample_every_seconds, skim_output_fps,
+                preview_seconds, sample_index, source_seconds, selected_tag, note, created_at
+            ) VALUES
+                (1, 1, '', 4, 12, 0, 1, 5, 'kiss', 'kiss', '2026-03-24T00:00:00Z'),
+                (2, 1, '', 4, 12, 0, 2, 12, 'phone', 'phone', '2026-03-24T00:00:01Z')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO manual_clips (
+                id, manual_mark_id, film_id, clip_path, clip_tag, metadata_json, start_seconds, end_seconds, created_at
+            ) VALUES
+                (1, 1, 1, ?, 'kiss', '{}', 5, 9, '2026-03-24T00:00:00Z'),
+                (2, 2, 1, ?, 'phone', '{}', 12, 17, '2026-03-24T00:00:01Z')
+            """,
+            (str(manual_kiss), str(manual_phone)),
+        )
+        ziai_dir = settings.preview_dir / "kiss_in_spring_1932" / "ziai" / "candidates"
+        ziai_dir.mkdir(parents=True, exist_ok=True)
+        accepted_candidate = ziai_dir / "candidate_001.mp4"
+        rejected_candidate = ziai_dir / "candidate_002.mp4"
+        accepted_candidate.write_text("candidate one")
+        rejected_candidate.write_text("candidate two")
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, created_at, updated_at)
+            VALUES (1, 'ziai_film', 'done', '2026-06-16T00:00:00Z', '2026-06-16T00:00:00Z')
+            """
+        )
+        job_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+        conn.execute(
+            """
+            INSERT INTO ziai_candidates (
+                id, job_id, film_id, candidate_index, start_seconds, end_seconds,
+                confidence, clip_path, review_status, created_at
+            ) VALUES
+                (10, ?, 1, 1, 20, 24, 0.92, ?, 'accepted', '2026-06-16T00:00:00Z'),
+                (11, ?, 1, 2, 30, 34, 0.87, ?, 'rejected', '2026-06-16T00:00:01Z')
+            """,
+            (job_id, str(accepted_candidate), job_id, str(rejected_candidate)),
+        )
+        frame_path = settings.preview_dir / "kiss_in_spring_1932" / "ziai" / "frames" / "frame_000123.jpg"
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
+        frame_path.write_text("frame")
+        conn.execute(
+            """
+            INSERT INTO ziai_frame_reviews (
+                film_id, frame_index, timestamp_seconds, frame_path,
+                classifier_prediction, classifier_confidence, review_label, created_at, updated_at
+            ) VALUES (1, 123, 123.0, ?, 0, 0.2, 'missed_kiss', '2026-06-16T00:00:00Z', '2026-06-16T00:00:00Z')
+            """,
+            (str(frame_path),),
+        )
+
+    app = create_app()
+    client = app.test_client()
+    response = client.get("/clips")
+    false_positive_response = client.get("/clips?outcome=false_positive")
+
+    assert response.status_code == 200
+    assert b"Clip Dataset" in response.data
+    assert b"human manual operator" in response.data
+    assert b"ziai classifier candidate" in response.data
+    assert b"human positive" in response.data
+    assert b"human negative" in response.data
+    assert b"true positive" in response.data
+    assert b"false positive" in response.data
+    assert b"false negatives" in response.data
+    assert b"candidate_001.mp4" in response.data
+    assert b"candidate_002.mp4" in response.data
+
+    assert false_positive_response.status_code == 200
+    assert b"candidate_002.mp4" in false_positive_response.data
+    assert b"candidate_001.mp4" not in false_positive_response.data
+    with get_connection(settings.db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT source_table, source_id, acquisition_method, training_label, model_outcome
+            FROM clip_dataset_items
+            ORDER BY source_table, source_id
+            """
+        ).fetchall()
+    assert [dict(row) for row in rows] == [
+        {
+            "source_table": "manual_clips",
+            "source_id": 1,
+            "acquisition_method": "human_manual_operator",
+            "training_label": "positive",
+            "model_outcome": "human_positive",
+        },
+        {
+            "source_table": "manual_clips",
+            "source_id": 2,
+            "acquisition_method": "human_manual_operator",
+            "training_label": "negative",
+            "model_outcome": "human_negative",
+        },
+        {
+            "source_table": "ziai_candidates",
+            "source_id": 10,
+            "acquisition_method": "ziai_classifier_candidate",
+            "training_label": "positive",
+            "model_outcome": "true_positive",
+        },
+        {
+            "source_table": "ziai_candidates",
+            "source_id": 11,
+            "acquisition_method": "ziai_classifier_candidate",
+            "training_label": "negative",
+            "model_outcome": "false_positive",
+        },
+    ]
+
+
 def test_random_clips_api_ordered_mode_uses_clip_id_order(tmp_path: Path, monkeypatch) -> None:
     fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
     monkeypatch.chdir(tmp_path)
