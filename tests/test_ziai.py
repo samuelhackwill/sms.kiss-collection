@@ -19,9 +19,9 @@ def test_ziai_candidate_indices_rejects_sparse_positive_noise() -> None:
     assert candidates == []
 
 
-def test_ziai_candidate_indices_recall_first_keeps_granular_candidates() -> None:
+def test_ziai_candidate_indices_requires_two_positive_frames_but_keeps_granular_candidates() -> None:
     predictions = [0, 1, 0, 0, 1, 0, 1, 0, 0, 1]
 
-    candidates = _candidate_indices(predictions, min_frames=1, threshold=0.0, max_gap_frames=1)
+    candidates = _candidate_indices(predictions, min_frames=2, threshold=0.0, max_gap_frames=1)
 
-    assert candidates == [[1], [4, 5, 6], [9]]
+    assert candidates == [[4, 5, 6]]

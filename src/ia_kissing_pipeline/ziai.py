@@ -115,7 +115,7 @@ def run_ziai_pipeline(
     source_path: Path,
     output_dir: Path,
     *,
-    min_frames: int = 1,
+    min_frames: int = 2,
     threshold: float = 0.0,
     max_gap_frames: int = 1,
     clip_padding_seconds: float = 4.0,

@@ -6563,7 +6563,7 @@ def _queue_ingestor_dry_run(settings, payload: dict[str, object]) -> int:
 def _queue_ziai_film(settings, film_id: int) -> int:
     now = utc_now_iso()
     payload = {
-        "min_frames": 1,
+        "min_frames": 2,
         "threshold": 0.0,
         "max_gap_frames": 1,
         "clip_padding_seconds": 4.0,
@@ -7036,7 +7036,7 @@ def _run_ziai_film_now(
         result = run_ziai_pipeline(
             source_path,
             output_dir,
-            min_frames=int(payload.get("min_frames", 1)),
+            min_frames=int(payload.get("min_frames", 2)),
             threshold=float(payload.get("threshold", 0.0)),
             max_gap_frames=int(payload.get("max_gap_frames", 1)),
             clip_padding_seconds=float(payload.get("clip_padding_seconds", 4.0)),
@@ -7163,7 +7163,7 @@ def _run_ziai_batch_now(job_id: int) -> int:
         for index, film in enumerate(films):
             now = utc_now_iso()
             child_payload = {
-                "min_frames": 1,
+                "min_frames": 2,
                 "threshold": 0.0,
                 "max_gap_frames": 1,
                 "clip_padding_seconds": 4.0,
