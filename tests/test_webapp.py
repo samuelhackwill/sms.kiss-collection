@@ -379,10 +379,10 @@ def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monk
         ).fetchone()
         film = dict(conn.execute("SELECT * FROM films WHERE id = 1").fetchone())
     queued_payload = json.loads(job["payload_json"])
-    assert queued_payload["min_frames"] == 2
-    assert queued_payload["threshold"] == 0.0
-    assert queued_payload["max_gap_frames"] == 1
-    assert queued_payload["clip_padding_seconds"] == 4.0
+    assert queued_payload["min_frames"] == 10
+    assert queued_payload["threshold"] == 0.7
+    assert "max_gap_frames" not in queued_payload
+    assert queued_payload["clip_padding_seconds"] == 2.0
 
     source_path = settings.download_dir / "kiss_in_spring_1932" / "source.mp4"
     source_path.parent.mkdir(parents=True)
@@ -423,10 +423,10 @@ def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monk
 
     monkeypatch.setattr("ia_kissing_pipeline.webapp.run_ziai_pipeline", fake_run_ziai)
     assert _run_ziai_film_now(job["id"], 1) == 0
-    assert captured_ziai_kwargs["min_frames"] == 2
-    assert captured_ziai_kwargs["threshold"] == 0.0
-    assert captured_ziai_kwargs["max_gap_frames"] == 1
-    assert captured_ziai_kwargs["clip_padding_seconds"] == 4.0
+    assert captured_ziai_kwargs["min_frames"] == 10
+    assert captured_ziai_kwargs["threshold"] == 0.7
+    assert "max_gap_frames" not in captured_ziai_kwargs
+    assert captured_ziai_kwargs["clip_padding_seconds"] == 2.0
 
     completed_page = client.get(f"/ziai?job_id={job['id']}")
     events = client.get(f"/ziai/jobs/{job['id']}/events")
@@ -878,10 +878,10 @@ def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypa
             (child_job_ids[0],),
         ).fetchone()
     child_payload = json.loads(child_job["payload_json"])
-    assert child_payload["min_frames"] == 2
-    assert child_payload["threshold"] == 0.0
-    assert child_payload["max_gap_frames"] == 1
-    assert child_payload["clip_padding_seconds"] == 4.0
+    assert child_payload["min_frames"] == 10
+    assert child_payload["threshold"] == 0.7
+    assert "max_gap_frames" not in child_payload
+    assert child_payload["clip_padding_seconds"] == 2.0
     assert batch["status"] == "done"
     assert json.loads(batch["result_json"])["completed"] == 1
 

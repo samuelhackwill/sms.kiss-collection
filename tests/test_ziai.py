@@ -3,25 +3,25 @@ from __future__ import annotations
 from ia_kissing_pipeline.ziai import _candidate_indices
 
 
-def test_ziai_candidate_indices_keeps_short_dense_positive_sequences() -> None:
-    predictions = [0, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0]
+def test_ziai_candidate_indices_uses_original_dense_window_rule() -> None:
+    predictions = [0, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 0]
 
-    candidates = _candidate_indices(predictions, min_frames=3, threshold=0.5, max_gap_frames=2)
+    candidates = _candidate_indices(predictions, min_frames=10, threshold=0.7)
 
-    assert candidates == [list(range(1, 10))]
+    assert candidates == [list(range(1, 11))]
 
 
-def test_ziai_candidate_indices_rejects_sparse_positive_noise() -> None:
-    predictions = [1, 0, 0, 1, 0, 0, 1]
+def test_ziai_candidate_indices_rejects_short_positive_bursts() -> None:
+    predictions = [1, 1, 1, 1, 1, 1, 1, 1, 1]
 
-    candidates = _candidate_indices(predictions, min_frames=3, threshold=0.5, max_gap_frames=2)
+    candidates = _candidate_indices(predictions, min_frames=10, threshold=0.7)
 
     assert candidates == []
 
 
-def test_ziai_candidate_indices_requires_two_positive_frames_but_keeps_granular_candidates() -> None:
-    predictions = [0, 1, 0, 0, 1, 0, 1, 0, 0, 1]
+def test_ziai_candidate_indices_rejects_sparse_positive_noise() -> None:
+    predictions = [1, 0, 0, 1, 0, 0, 1, 0, 0, 1]
 
-    candidates = _candidate_indices(predictions, min_frames=2, threshold=0.0, max_gap_frames=1)
+    candidates = _candidate_indices(predictions, min_frames=10, threshold=0.7)
 
-    assert candidates == [[4, 5, 6]]
+    assert candidates == []
