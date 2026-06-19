@@ -6839,14 +6839,49 @@ def _queue_ziai_batch(settings) -> int:
         ).fetchone()["count"]
         if remaining == 0:
             raise ValueError("No remaining confirmed-kiss films need a ZIAI run")
+        target_rows = conn.execute(
+            """
+            SELECT f.id
+            FROM films f
+            JOIN film_reviews fr ON fr.film_id = f.id AND fr.review_status = 'has_kiss'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM analysis_jobs j
+                WHERE j.film_id = f.id
+                  AND j.job_type = 'ziai_film'
+                  AND j.status IN ('queued', 'running', 'done')
+            )
+            ORDER BY f.id
+            """
+        ).fetchall()
+        target_film_ids = [int(row["id"]) for row in target_rows]
         conn.execute(
             """
             INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
             VALUES (NULL, 'ziai_batch', 'queued', ?, ?, ?, ?)
             """,
             (
-                json.dumps({"remaining_at_queue_time": remaining}, sort_keys=True),
-                json.dumps({"phase": "queued", "progress": 0.0}, sort_keys=True),
+                json.dumps(
+                    {
+                        "remaining_at_queue_time": remaining,
+                        "target_film_ids": target_film_ids,
+                        "state_machine_version": 1,
+                    },
+                    sort_keys=True,
+                ),
+                json.dumps(
+                    {
+                        "phase": "queued",
+                        "progress": 0.0,
+                        "state": {
+                            "total": remaining,
+                            "current_index": 0,
+                            "completed": [],
+                            "failed": [],
+                            "skipped": [],
+                        },
+                    },
+                    sort_keys=True,
+                ),
                 now,
                 now,
             ),
@@ -7129,12 +7164,16 @@ def _record_ziai_event(
     *,
     status: str = "running",
 ) -> None:
-    result = {
-        "phase": payload.get("phase", event_type),
-        "progress": float(payload.get("progress", 0.0)),
-        "message": payload.get("message"),
-    }
     with get_connection(settings.db_path) as conn:
+        row = conn.execute("SELECT result_json FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+        result = json.loads(row["result_json"] or "{}") if row else {}
+        result.update(
+            {
+                "phase": payload.get("phase", event_type),
+                "progress": float(payload.get("progress", 0.0)),
+                "message": payload.get("message"),
+            }
+        )
         conn.execute(
             """
             UPDATE analysis_jobs
@@ -7155,6 +7194,7 @@ def _run_ziai_film_now(
     batch_total: int = 1,
     allow_unconfirmed: bool = False,
     progress_observer: IngestorProgressCallback | None = None,
+    upload_frames: bool | None = None,
 ) -> int:
     settings = load_settings()
     settings.ensure_directories()
@@ -7230,6 +7270,8 @@ def _run_ziai_film_now(
                 )
 
         payload = job["payload"]
+        if upload_frames is None:
+            upload_frames = bool(payload.get("upload_frames", True))
         result = run_ziai_pipeline(
             source_path,
             output_dir,
@@ -7287,20 +7329,34 @@ def _run_ziai_film_now(
                     "candidate_count": result["candidate_count"],
                 },
             )
-        try:
-            _upload_preview_tree(settings, output_dir / "frames")
-        except Exception as exc:
+        if upload_frames:
+            try:
+                _upload_preview_tree(settings, output_dir / "frames")
+            except Exception as exc:
+                with get_connection(settings.db_path) as conn:
+                    append_job_event(
+                        conn,
+                        job_id,
+                        "ziai_frame_upload_error",
+                        {
+                            "phase": "done",
+                            "progress": 1.0,
+                            "message": f"ZIAI candidate clips are ready, but frame upload failed: {exc}",
+                            "film_id": film_id,
+                            "error": str(exc),
+                        },
+                    )
+        else:
             with get_connection(settings.db_path) as conn:
                 append_job_event(
                     conn,
                     job_id,
-                    "ziai_frame_upload_error",
+                    "ziai_frame_upload_skipped",
                     {
                         "phase": "done",
                         "progress": 1.0,
-                        "message": f"ZIAI candidate clips are ready, but frame upload failed: {exc}",
+                        "message": "Skipped full frame upload for batch throughput; candidate clips and result JSON are ready.",
                         "film_id": film_id,
-                        "error": str(exc),
                     },
                 )
         return 0
@@ -7337,6 +7393,133 @@ def _run_ziai_film_now(
         return 1
 
 
+def _ziai_batch_child_payload(job_id: int) -> dict[str, object]:
+    return {
+        "min_frames": 10,
+        "threshold": 0.7,
+        "clip_padding_seconds": 2.0,
+        "chunk_seconds": 300.0,
+        "inference_batch_size": 8,
+        "upload_frames": False,
+        "batch_job_id": job_id,
+    }
+
+
+def _load_ziai_batch_target_films(conn, job: dict) -> list[dict]:
+    payload = job["payload"]
+    target_ids = [int(value) for value in payload.get("target_film_ids") or [] if str(value).strip()]
+    if target_ids:
+        placeholders = ",".join("?" for _ in target_ids)
+        rows = conn.execute(
+            f"""
+            SELECT f.id, f.title
+            FROM films f
+            JOIN film_reviews fr ON fr.film_id = f.id AND fr.review_status = 'has_kiss'
+            WHERE f.id IN ({placeholders})
+            """,
+            target_ids,
+        ).fetchall()
+        by_id = {int(row["id"]): dict(row) for row in rows}
+        return [by_id[film_id] for film_id in target_ids if film_id in by_id]
+    return [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT f.id, f.title
+            FROM films f
+            JOIN film_reviews fr ON fr.film_id = f.id AND fr.review_status = 'has_kiss'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM analysis_jobs j
+                WHERE j.film_id = f.id
+                  AND j.job_type = 'ziai_film'
+                  AND j.status IN ('queued', 'running', 'done')
+            )
+            ORDER BY f.id
+            """
+        ).fetchall()
+    ]
+
+
+def _load_ziai_batch_child_jobs(conn, batch_job_id: int) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT id, film_id, status, payload_json, result_json, error_text, updated_at
+        FROM analysis_jobs
+        WHERE job_type = 'ziai_film'
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    children = []
+    for row in rows:
+        payload = json.loads(row["payload_json"] or "{}")
+        if int(payload.get("batch_job_id") or 0) != batch_job_id:
+            continue
+        children.append({**dict(row), "payload": payload, "result": json.loads(row["result_json"] or "{}")})
+    return children
+
+
+def _latest_ziai_batch_child_for_film(children: list[dict], film_id: int) -> dict | None:
+    matches = [child for child in children if int(child["film_id"] or 0) == film_id]
+    return matches[-1] if matches else None
+
+
+def _ziai_batch_state(job: dict, total: int) -> dict[str, object]:
+    state = dict((job.get("result") or {}).get("state") or {})
+    state.setdefault("total", total)
+    state.setdefault("current_index", 0)
+    state.setdefault("completed", [])
+    state.setdefault("failed", [])
+    state.setdefault("skipped", [])
+    state["total"] = total
+    return state
+
+
+def _ziai_batch_state_has(state: dict[str, object], key: str, film_id: int) -> bool:
+    return any(int(item.get("film_id") or 0) == film_id for item in state.get(key, []))
+
+
+def _record_ziai_batch_state(
+    settings,
+    job_id: int,
+    event_type: str,
+    state: dict[str, object],
+    message: str,
+    *,
+    phase: str = "running_films",
+    status: str = "running",
+    progress: float | None = None,
+    extra: dict[str, object] | None = None,
+    error_text: str | None = None,
+) -> None:
+    total = max(1, int(state.get("total") or 0))
+    if progress is None:
+        progress = min(0.99, max(0.0, float(state.get("current_index") or 0) / total))
+    result = {
+        "phase": phase,
+        "progress": progress,
+        "message": message,
+        "film_count": int(state.get("total") or 0),
+        "completed": len(state.get("completed", [])),
+        "failed": len(state.get("failed", [])),
+        "skipped": len(state.get("skipped", [])),
+        "current_index": int(state.get("current_index") or 0),
+        "current_film_id": state.get("current_film_id"),
+        "current_child_job_id": state.get("current_child_job_id"),
+        "state": state,
+    }
+    event_payload = {**result, **(extra or {})}
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = ?, result_json = ?, error_text = ?, updated_at = ?
+            WHERE id = ? AND job_type = 'ziai_batch'
+            """,
+            (status, json.dumps(result, sort_keys=True), error_text, utc_now_iso(), job_id),
+        )
+        append_job_event(conn, job_id, event_type, event_payload)
+
+
 def _run_ziai_batch_now(job_id: int) -> int:
     settings = load_settings()
     settings.ensure_directories()
@@ -7344,46 +7527,92 @@ def _run_ziai_batch_now(job_id: int) -> int:
     try:
         with get_connection(settings.db_path) as conn:
             job = _load_ziai_job(conn, job_id)
-            films = conn.execute(
-                """
-                SELECT f.id, f.title
-                FROM films f
-                JOIN film_reviews fr ON fr.film_id = f.id AND fr.review_status = 'has_kiss'
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM analysis_jobs j
-                    WHERE j.film_id = f.id
-                      AND j.job_type = 'ziai_film'
-                      AND j.status IN ('queued', 'running', 'done')
-                )
-                ORDER BY f.id
-                """
-            ).fetchall()
-        if not job or job["job_type"] != "ziai_batch":
-            raise ValueError(f"ZIAI batch job {job_id} not found")
+            if not job or job["job_type"] != "ziai_batch":
+                raise ValueError(f"ZIAI batch job {job_id} not found")
+            films = _load_ziai_batch_target_films(conn, job)
+            target_film_ids = [int(film["id"]) for film in films]
+            payload = {**job["payload"], "target_film_ids": target_film_ids, "state_machine_version": 1}
+            conn.execute(
+                "UPDATE analysis_jobs SET payload_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(payload, sort_keys=True), utc_now_iso(), job_id),
+            )
         total = len(films)
-        _record_ziai_event(
+        state = _ziai_batch_state(job, total)
+        _record_ziai_batch_state(
             settings,
             job_id,
             "job_started",
-            {
-                "phase": "running_films",
-                "progress": 0.0,
-                "message": f"Started ZIAI loop for {total} confirmed film(s)",
-                "film_count": total,
-            },
+            state,
+            f"Started ZIAI state-machine loop for {total} confirmed film(s)",
+            progress=0.0,
+            extra={"film_count": total},
         )
-        completed = 0
-        failed = 0
         for index, film in enumerate(films):
+            film_id = int(film["id"])
+            with get_connection(settings.db_path) as conn:
+                done_elsewhere = conn.execute(
+                    """
+                    SELECT id
+                    FROM analysis_jobs
+                    WHERE film_id = ? AND job_type = 'ziai_film' AND status = 'done'
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (film_id,),
+                ).fetchone()
+                children = _load_ziai_batch_child_jobs(conn, job_id)
+                existing_child = _latest_ziai_batch_child_for_film(children, film_id)
+
+                if existing_child and existing_child["status"] in ("queued", "running"):
+                    conn.execute(
+                        """
+                        UPDATE analysis_jobs
+                        SET status = 'error', error_text = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        ("replaced by restarted ZIAI batch state machine", utc_now_iso(), existing_child["id"]),
+                    )
+                    existing_child = None
+
+            if done_elsewhere and not existing_child:
+                if not _ziai_batch_state_has(state, "skipped", film_id):
+                    state["skipped"].append({"film_id": film_id, "title": film["title"], "reason": "already_done"})
+                state.update({"current_index": index + 1, "current_film_id": film_id, "current_child_job_id": None})
+                _record_ziai_batch_state(
+                    settings,
+                    job_id,
+                    "film_skipped",
+                    state,
+                    f"Skipped film {index + 1} of {total}: {film['title']} already has a completed ZIAI run",
+                    progress=(index + 1) / max(1, total),
+                    extra={"film_id": film_id, "batch_index": index + 1, "batch_total": total},
+                )
+                continue
+
+            if existing_child and existing_child["status"] == "done":
+                if not _ziai_batch_state_has(state, "completed", film_id):
+                    state["completed"].append(
+                        {
+                            "film_id": film_id,
+                            "title": film["title"],
+                            "child_job_id": int(existing_child["id"]),
+                            "candidate_count": int((existing_child.get("result") or {}).get("candidate_count") or 0),
+                        }
+                    )
+                continue
+            if existing_child and existing_child["status"] == "error":
+                if not _ziai_batch_state_has(state, "failed", film_id):
+                    state["failed"].append(
+                        {
+                            "film_id": film_id,
+                            "title": film["title"],
+                            "child_job_id": int(existing_child["id"]),
+                            "error": existing_child.get("error_text") or "child job failed",
+                        }
+                    )
+                continue
+
             now = utc_now_iso()
-            child_payload = {
-                "min_frames": 10,
-                "threshold": 0.7,
-                "clip_padding_seconds": 2.0,
-                "chunk_seconds": 300.0,
-                "inference_batch_size": 8,
-                "batch_job_id": job_id,
-            }
+            child_payload = _ziai_batch_child_payload(job_id)
             with get_connection(settings.db_path) as conn:
                 conn.execute(
                     """
@@ -7391,7 +7620,7 @@ def _run_ziai_batch_now(job_id: int) -> int:
                     VALUES (?, 'ziai_film', 'queued', ?, ?, ?, ?)
                     """,
                     (
-                        film["id"],
+                        film_id,
                         json.dumps(child_payload, sort_keys=True),
                         json.dumps({"phase": "queued", "progress": 0.0}, sort_keys=True),
                         now,
@@ -7405,73 +7634,102 @@ def _run_ziai_batch_now(job_id: int) -> int:
                     "queued",
                     {"phase": "queued", "progress": 0.0, "message": f"Queued ZIAI pipeline for {film['title']}"},
                 )
-            _record_ziai_event(
+            state.update(
+                {
+                    "current_index": index + 1,
+                    "current_film_id": film_id,
+                    "current_child_job_id": child_job_id,
+                }
+            )
+            _record_ziai_batch_state(
                 settings,
                 job_id,
                 "film_started",
-                {
-                    "phase": "running_films",
-                    "progress": index / max(1, total),
-                    "message": f"Starting film {index + 1} of {total}: {film['title']}",
-                    "film_id": film["id"],
+                state,
+                f"Starting film {index + 1} of {total}: {film['title']}",
+                progress=index / max(1, total),
+                extra={
+                    "film_id": film_id,
                     "child_job_id": child_job_id,
                     "batch_index": index + 1,
                     "batch_total": total,
                 },
             )
-            result = _run_ziai_film_now(
+            result_code = _run_ziai_film_now(
                 child_job_id,
-                int(film["id"]),
+                film_id,
                 batch_job_id=job_id,
                 batch_index=index,
                 batch_total=total,
+                upload_frames=False,
             )
-            if result == 0:
-                completed += 1
-                _record_ziai_event(
+            with get_connection(settings.db_path) as conn:
+                child_job = _load_ziai_job(conn, child_job_id)
+            child_result = child_job["result"] if child_job else {}
+            if result_code == 0 and child_job and child_job["status"] == "done":
+                completed_item = {
+                    "film_id": film_id,
+                    "title": film["title"],
+                    "child_job_id": child_job_id,
+                    "candidate_count": int(child_result.get("candidate_count") or 0),
+                }
+                if not _ziai_batch_state_has(state, "completed", film_id):
+                    state["completed"].append(completed_item)
+                state.update({"current_child_job_id": None})
+                _record_ziai_batch_state(
                     settings,
                     job_id,
                     "film_complete",
-                    {
-                        "phase": "running_films",
-                        "progress": (index + 1) / max(1, total),
-                        "message": f"Completed film {index + 1} of {total}: {film['title']}",
-                        "film_id": film["id"],
-                        "child_job_id": child_job_id,
-                    },
+                    state,
+                    f"Completed film {index + 1} of {total}: {film['title']}",
+                    progress=(index + 1) / max(1, total),
+                    extra={**completed_item, "batch_index": index + 1, "batch_total": total},
                 )
             else:
-                failed += 1
-        result = {"phase": "done", "progress": 1.0, "film_count": total, "completed": completed, "failed": failed}
-        with get_connection(settings.db_path) as conn:
-            conn.execute(
-                """
-                UPDATE analysis_jobs
-                SET status = 'done', result_json = ?, error_text = NULL, updated_at = ?
-                WHERE id = ? AND job_type = 'ziai_batch'
-                """,
-                (json.dumps(result, sort_keys=True), utc_now_iso(), job_id),
-            )
-            append_job_event(
-                conn,
-                job_id,
-                "done",
-                {
-                    **result,
-                    "message": f"ZIAI loop complete: {completed} succeeded, {failed} failed",
-                },
-            )
+                error_text = (child_job or {}).get("error_text") or "child job failed"
+                failed_item = {
+                    "film_id": film_id,
+                    "title": film["title"],
+                    "child_job_id": child_job_id,
+                    "error": error_text,
+                }
+                if not _ziai_batch_state_has(state, "failed", film_id):
+                    state["failed"].append(failed_item)
+                state.update({"current_child_job_id": None})
+                _record_ziai_batch_state(
+                    settings,
+                    job_id,
+                    "film_error",
+                    state,
+                    f"Film {index + 1} of {total} failed; continuing: {film['title']}",
+                    progress=(index + 1) / max(1, total),
+                    extra={**failed_item, "batch_index": index + 1, "batch_total": total},
+                )
+        state.update({"current_index": total, "current_film_id": None, "current_child_job_id": None})
+        _record_ziai_batch_state(
+            settings,
+            job_id,
+            "done",
+            state,
+            f"ZIAI loop complete: {len(state['completed'])} succeeded, {len(state['failed'])} failed, {len(state['skipped'])} skipped",
+            phase="done",
+            status="done",
+            progress=1.0,
+        )
         return 0
     except BaseException as exc:
         error_payload = {"phase": "error", "progress": 1.0, "message": f"ZIAI batch failed: {exc}", "error": str(exc)}
         with get_connection(settings.db_path) as conn:
+            row = conn.execute("SELECT result_json FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+            result = json.loads(row["result_json"] or "{}") if row else {}
+            result.update(error_payload)
             conn.execute(
                 """
                 UPDATE analysis_jobs
                 SET status = 'error', result_json = ?, error_text = ?, updated_at = ?
                 WHERE id = ? AND job_type = 'ziai_batch'
                 """,
-                (json.dumps(error_payload, sort_keys=True), str(exc), utc_now_iso(), job_id),
+                (json.dumps(result, sort_keys=True), str(exc), utc_now_iso(), job_id),
             )
             append_job_event(conn, job_id, "error", error_payload)
         return 1
@@ -8276,6 +8534,7 @@ def _create_auto_ziai_child_job(settings, parent_job_id: int, film_id: int, titl
         "clip_padding_seconds": 2.0,
         "chunk_seconds": 300.0,
         "inference_batch_size": 8,
+        "upload_frames": False,
         "auto_ingest_ziai_job_id": parent_job_id,
     }
     now = utc_now_iso()

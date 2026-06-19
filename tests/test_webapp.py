@@ -887,6 +887,7 @@ def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypa
     def fake_run_child(job_id, film_id, **kwargs):
         processed.append(film_id)
         child_job_ids.append(job_id)
+        assert kwargs["upload_frames"] is False
         with get_connection(settings.db_path) as conn:
             conn.execute("UPDATE analysis_jobs SET status = 'done' WHERE id = ?", (job_id,))
         return 0
@@ -905,8 +906,67 @@ def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypa
     assert child_payload["threshold"] == 0.7
     assert "max_gap_frames" not in child_payload
     assert child_payload["clip_padding_seconds"] == 2.0
+    assert child_payload["upload_frames"] is False
     assert batch["status"] == "done"
     assert json.loads(batch["result_json"])["completed"] == 1
+
+
+def test_ziai_batch_state_machine_continues_after_failed_film(tmp_path: Path, monkeypatch) -> None:
+    fixture_path = Path(__file__).resolve().parent / "fixtures" / "ia_items.json"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        ingest_fixture(conn, fixture_path)
+        conn.execute("INSERT INTO film_reviews (film_id, review_status) VALUES (1, 'has_kiss')")
+        conn.execute("INSERT INTO film_reviews (film_id, review_status) VALUES (2, 'has_kiss')")
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._spawn_pipeline_command", lambda settings, command: None)
+    app = create_app()
+    client = app.test_client()
+    queued = client.post("/ziai/jobs", follow_redirects=False)
+    assert queued.status_code == 302
+    with get_connection(settings.db_path) as conn:
+        batch_job = conn.execute(
+            "SELECT id FROM analysis_jobs WHERE job_type = 'ziai_batch' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    processed: list[int] = []
+
+    def fake_run_child(job_id, film_id, **kwargs):
+        processed.append(film_id)
+        with get_connection(settings.db_path) as conn:
+            if film_id == 1:
+                conn.execute("UPDATE analysis_jobs SET status = 'error', error_text = 'bad source' WHERE id = ?", (job_id,))
+                return 1
+            conn.execute(
+                "UPDATE analysis_jobs SET status = 'done', result_json = ? WHERE id = ?",
+                (json.dumps({"phase": "done", "progress": 1.0, "candidate_count": 3}, sort_keys=True), job_id),
+            )
+        return 0
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._run_ziai_film_now", fake_run_child)
+    assert _run_ziai_batch_now(batch_job["id"]) == 0
+    assert processed == [1, 2]
+    with get_connection(settings.db_path) as conn:
+        batch = conn.execute("SELECT status, result_json FROM analysis_jobs WHERE id = ?", (batch_job["id"],)).fetchone()
+        child_rows = conn.execute("SELECT status FROM analysis_jobs WHERE job_type = 'ziai_film' ORDER BY id").fetchall()
+    result = json.loads(batch["result_json"])
+    assert batch["status"] == "done"
+    assert result["completed"] == 1
+    assert result["failed"] == 1
+    assert result["state"]["completed"][0]["film_id"] == 2
+    assert result["state"]["failed"][0]["film_id"] == 1
+    assert [row["status"] for row in child_rows] == ["error", "done"]
 
 
 def test_ziai_chunk_windows_bound_memory_work(tmp_path: Path) -> None:
