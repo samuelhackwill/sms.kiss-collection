@@ -7064,6 +7064,7 @@ def _run_ziai_film_now(
             _, _, source_path = _resolve_source_video(conn, settings, film_id)
         source_path = source_path.resolve()
         output_dir = (settings.preview_dir / film["archive_identifier"] / "ziai").resolve()
+        cache_dir = (settings.cache_dir / "ziai" / film["archive_identifier"]).resolve()
         _record_ziai_event(
             settings,
             job_id,
@@ -7103,6 +7104,7 @@ def _run_ziai_film_now(
             clip_padding_seconds=float(payload.get("clip_padding_seconds", 2.0)),
             chunk_seconds=float(payload.get("chunk_seconds", 300.0)),
             inference_batch_size=int(payload.get("inference_batch_size", 8)),
+            cache_dir=cache_dir,
             progress_callback=progress_callback,
         )
         _upload_preview_tree(settings, output_dir)

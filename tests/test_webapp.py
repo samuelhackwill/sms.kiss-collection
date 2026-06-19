@@ -427,6 +427,7 @@ def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monk
     assert captured_ziai_kwargs["threshold"] == 0.7
     assert "max_gap_frames" not in captured_ziai_kwargs
     assert captured_ziai_kwargs["clip_padding_seconds"] == 2.0
+    assert captured_ziai_kwargs["cache_dir"] == (settings.cache_dir / "ziai" / film["archive_identifier"]).resolve()
 
     completed_page = client.get(f"/ziai?job_id={job['id']}")
     events = client.get(f"/ziai/jobs/{job['id']}/events")

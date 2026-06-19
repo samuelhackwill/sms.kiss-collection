@@ -15,6 +15,7 @@ from ia_kissing_pipeline.video.probe import probe_media
 
 
 ZIAI_FRAME_SECONDS = 0.96
+ZIAI_EXTRACTION_CACHE_VERSION = 1
 ZiaiProgressCallback = Callable[[str, dict[str, object]], None]
 
 
@@ -88,6 +89,58 @@ def _extract_chunk(source_path: Path, output_path: Path, start_seconds: float, d
     )
 
 
+def _extraction_cache_metadata(source_path: Path, duration_seconds: float, chunk_seconds: float) -> dict[str, object]:
+    stat = source_path.stat()
+    return {
+        "version": ZIAI_EXTRACTION_CACHE_VERSION,
+        "source_path": str(source_path.resolve()),
+        "source_size": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+        "duration_seconds": round(float(duration_seconds), 3),
+        "chunk_seconds": float(chunk_seconds),
+        "frame_seconds": ZIAI_FRAME_SECONDS,
+    }
+
+
+def _prepare_extraction_cache(cache_dir: Path, metadata: dict[str, object]) -> None:
+    manifest_path = cache_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            existing = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError:
+            existing = None
+        if existing != metadata:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+
+
+def _load_cached_chunk(cache_path: Path, torch_module) -> tuple[list, list] | None:
+    if not cache_path.exists():
+        return None
+    try:
+        payload = torch_module.load(cache_path, map_location="cpu")
+    except Exception:
+        cache_path.unlink(missing_ok=True)
+        return None
+    if not isinstance(payload, dict) or "audio" not in payload or "images" not in payload:
+        cache_path.unlink(missing_ok=True)
+        return None
+    audio = payload["audio"]
+    images = payload["images"]
+    if not isinstance(audio, list) or not isinstance(images, list) or len(audio) != len(images):
+        cache_path.unlink(missing_ok=True)
+        return None
+    return audio, images
+
+
+def _save_cached_chunk(cache_path: Path, torch_module, audio: list, images: list) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    torch_module.save({"audio": audio, "images": images}, tmp_path)
+    tmp_path.replace(cache_path)
+
+
 def run_ziai_pipeline(
     source_path: Path,
     output_dir: Path,
@@ -97,6 +150,7 @@ def run_ziai_pipeline(
     clip_padding_seconds: float = 2.0,
     chunk_seconds: float = 300.0,
     inference_batch_size: int = 8,
+    cache_dir: Path | None = None,
     progress_callback: ZiaiProgressCallback | None = None,
 ) -> dict:
     detector_root = _detector_root()
@@ -126,7 +180,14 @@ def run_ziai_pipeline(
     duration_seconds = float(probe_media(source_path)["duration_seconds"] or 0.0)
     if duration_seconds <= 0:
         raise RuntimeError(f"Could not determine video duration for {source_path}")
-    chunk_windows = _chunk_windows(duration_seconds, max(30.0, chunk_seconds))
+    effective_chunk_seconds = max(30.0, chunk_seconds)
+    chunk_windows = _chunk_windows(duration_seconds, effective_chunk_seconds)
+    cache_root = Path(cache_dir) if cache_dir is not None else None
+    if cache_root is not None:
+        _prepare_extraction_cache(
+            cache_root,
+            _extraction_cache_metadata(source_path, duration_seconds, effective_chunk_seconds),
+        )
 
     _emit(
         progress_callback,
@@ -150,6 +211,8 @@ def run_ziai_pipeline(
     confidences: list[float] = []
     manifest_frames: list[dict[str, object]] = []
     processed_seconds = 0.0
+    cache_hits = 0
+    cache_misses = 0
     _emit(
         progress_callback,
         "extracting_frames",
@@ -163,30 +226,49 @@ def run_ziai_pipeline(
         temp_dir = Path(temp_dir_value)
         for chunk_index, (chunk_start, chunk_duration) in enumerate(chunk_windows, start=1):
             chunk_path = temp_dir / f"chunk_{chunk_index:04d}.mkv"
+            cache_path = cache_root / f"chunk_{chunk_index:04d}.pt" if cache_root is not None else None
             chunk_base_progress = 0.05 + (0.7 * processed_seconds / duration_seconds)
+            cached_chunk = _load_cached_chunk(cache_path, torch) if cache_path is not None else None
             _emit(
                 progress_callback,
                 "chunk_started",
                 phase="extracting_frames",
                 progress=chunk_base_progress,
-                message=f"Extracting chunk {chunk_index} of {len(chunk_windows)}",
+                message=(
+                    f"Loading cached extraction chunk {chunk_index} of {len(chunk_windows)}"
+                    if cached_chunk is not None
+                    else f"Extracting chunk {chunk_index} of {len(chunk_windows)}"
+                ),
                 chunk_index=chunk_index,
                 chunk_count=len(chunk_windows),
                 chunk_start_seconds=chunk_start,
                 chunk_duration_seconds=chunk_duration,
+                cache_hit=cached_chunk is not None,
             )
-            _extract_chunk(source_path, chunk_path, chunk_start, chunk_duration)
-            audio, images = BuildDataset.one_video_extract_audio_and_stills(str(chunk_path))
+            if cached_chunk is not None:
+                audio, images = cached_chunk
+                cache_hits += 1
+            else:
+                cache_misses += 1
+                _extract_chunk(source_path, chunk_path, chunk_start, chunk_duration)
+                audio, images = BuildDataset.one_video_extract_audio_and_stills(str(chunk_path))
+                if cache_path is not None:
+                    _save_cached_chunk(cache_path, torch, audio, images)
             chunk_frame_count = len(images)
             _emit(
                 progress_callback,
                 "chunk_extracted",
                 phase="classifying_frames",
                 progress=chunk_base_progress,
-                message=f"Extracted {chunk_frame_count} frames from chunk {chunk_index} of {len(chunk_windows)}",
+                message=(
+                    f"Loaded {chunk_frame_count} cached frames from chunk {chunk_index} of {len(chunk_windows)}"
+                    if cached_chunk is not None
+                    else f"Extracted {chunk_frame_count} frames from chunk {chunk_index} of {len(chunk_windows)}"
+                ),
                 chunk_index=chunk_index,
                 chunk_count=len(chunk_windows),
                 chunk_frame_count=chunk_frame_count,
+                cache_hit=cached_chunk is not None,
             )
 
             for batch_start in range(0, chunk_frame_count, max(1, inference_batch_size)):
@@ -303,8 +385,11 @@ def run_ziai_pipeline(
         "min_frames": min_frames,
         "threshold": threshold,
         "clip_padding_seconds": clip_padding_seconds,
-        "chunk_seconds": chunk_seconds,
+        "chunk_seconds": effective_chunk_seconds,
         "inference_batch_size": inference_batch_size,
+        "extraction_cache_dir": str(cache_root) if cache_root is not None else None,
+        "extraction_cache_hits": cache_hits,
+        "extraction_cache_misses": cache_misses,
         "frames": manifest_frames,
         "candidates": candidates,
     }
