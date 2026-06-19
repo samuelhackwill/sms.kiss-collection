@@ -7107,7 +7107,8 @@ def _run_ziai_film_now(
             cache_dir=cache_dir,
             progress_callback=progress_callback,
         )
-        _upload_preview_tree(settings, output_dir)
+        _upload_preview_tree(settings, output_dir / "candidates")
+        _upload_preview_file(settings, output_dir / "result.json")
         summary = {key: value for key, value in result.items() if key != "frames"}
         summary.update({"phase": "done", "progress": 1.0})
         with get_connection(settings.db_path) as conn:
@@ -7152,6 +7153,22 @@ def _run_ziai_film_now(
                     "candidate_count": result["candidate_count"],
                 },
             )
+        try:
+            _upload_preview_tree(settings, output_dir / "frames")
+        except Exception as exc:
+            with get_connection(settings.db_path) as conn:
+                append_job_event(
+                    conn,
+                    job_id,
+                    "ziai_frame_upload_error",
+                    {
+                        "phase": "done",
+                        "progress": 1.0,
+                        "message": f"ZIAI candidate clips are ready, but frame upload failed: {exc}",
+                        "film_id": film_id,
+                        "error": str(exc),
+                    },
+                )
         return 0
     except BaseException as exc:
         error_payload = {

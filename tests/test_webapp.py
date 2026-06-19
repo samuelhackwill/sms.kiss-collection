@@ -422,12 +422,33 @@ def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monk
         }
 
     monkeypatch.setattr("ia_kissing_pipeline.webapp.run_ziai_pipeline", fake_run_ziai)
+
+    upload_calls = []
+
+    def fake_upload_preview_tree(settings_arg, path):
+        upload_calls.append(("tree", path.name))
+        if path.name == "frames":
+            with get_connection(settings.db_path) as conn:
+                frame_upload_job = conn.execute("SELECT status FROM analysis_jobs WHERE id = ?", (job["id"],)).fetchone()
+                frame_upload_candidate = conn.execute(
+                    "SELECT review_status FROM ziai_candidates WHERE film_id = 1"
+                ).fetchone()
+            assert frame_upload_job["status"] == "done"
+            assert frame_upload_candidate["review_status"] == "pending"
+
+    def fake_upload_preview_file(settings_arg, path):
+        upload_calls.append(("file", path.name))
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._upload_preview_tree", fake_upload_preview_tree)
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._upload_preview_file", fake_upload_preview_file)
+
     assert _run_ziai_film_now(job["id"], 1) == 0
     assert captured_ziai_kwargs["min_frames"] == 10
     assert captured_ziai_kwargs["threshold"] == 0.7
     assert "max_gap_frames" not in captured_ziai_kwargs
     assert captured_ziai_kwargs["clip_padding_seconds"] == 2.0
     assert captured_ziai_kwargs["cache_dir"] == (settings.cache_dir / "ziai" / film["archive_identifier"]).resolve()
+    assert upload_calls == [("tree", "candidates"), ("file", "result.json"), ("tree", "frames")]
 
     completed_page = client.get(f"/ziai?job_id={job['id']}")
     events = client.get(f"/ziai/jobs/{job['id']}/events")
