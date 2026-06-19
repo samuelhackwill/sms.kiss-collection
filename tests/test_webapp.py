@@ -19,6 +19,7 @@ from ia_kissing_pipeline.webapp import (
     _cleanup_nonpending_local_artifacts,
     _run_ingestor_dry_run_now,
     _run_kiss_detector_now,
+    _run_auto_ingest_ziai_cycle,
     _run_ziai_batch_now,
     _run_ziai_film_now,
     _reconcile_stale_ziai_jobs,
@@ -2611,6 +2612,193 @@ def test_admin_post_starts_get_more_vids_job(tmp_path: Path, monkeypatch) -> Non
     assert job["job_type"] == "download_batch"
     assert job["status"] == "queued"
     assert '"count": 4' in job["payload_json"]
+
+
+def test_admin_auto_ingest_ziai_launch_abort_resume(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    spawned_commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.webapp._spawn_pipeline_command",
+        lambda settings, command: spawned_commands.append(command),
+    )
+
+    app = create_app()
+    client = app.test_client()
+
+    admin_response = client.get("/admin")
+    assert admin_response.status_code == 200
+    assert b"Hourly Auto Ingest + ZIAI" in admin_response.data
+    assert b"LAUNCH" in admin_response.data
+
+    launch_response = client.post("/admin/auto-ingest-ziai/launch", follow_redirects=False)
+    assert launch_response.status_code == 302
+    assert len(spawned_commands) == 1
+    assert "auto-ingest-ziai" in spawned_commands[0]
+    with get_connection(settings.db_path) as conn:
+        runtime = conn.execute("SELECT * FROM queue_runtime WHERE queue_name = 'auto_ingest_ziai'").fetchone()
+        job = conn.execute(
+            "SELECT id, job_type, status FROM analysis_jobs WHERE job_type = 'auto_ingest_ziai' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert runtime["state"] == "queued"
+    assert int(runtime["owner_job_id"]) == int(job["id"])
+    assert job["status"] == "queued"
+
+    running_response = client.get("/admin")
+    assert b"RUNNING" in running_response.data
+    assert b"ABORT" in running_response.data
+
+    abort_response = client.post("/admin/auto-ingest-ziai/abort", follow_redirects=False)
+    assert abort_response.status_code == 302
+    with get_connection(settings.db_path) as conn:
+        runtime = conn.execute("SELECT * FROM queue_runtime WHERE queue_name = 'auto_ingest_ziai'").fetchone()
+        job = conn.execute("SELECT status FROM analysis_jobs WHERE id = ?", (job["id"],)).fetchone()
+    assert runtime["state"] == "paused"
+    assert job["status"] == "aborted"
+
+    paused_response = client.get("/admin")
+    assert b"RESUME" in paused_response.data
+
+    resume_response = client.post("/admin/auto-ingest-ziai/resume", follow_redirects=False)
+    assert resume_response.status_code == 302
+    assert len(spawned_commands) == 2
+    with get_connection(settings.db_path) as conn:
+        latest_job = conn.execute(
+            "SELECT job_type, status FROM analysis_jobs WHERE job_type = 'auto_ingest_ziai' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert latest_job["job_type"] == "auto_ingest_ziai"
+    assert latest_job["status"] == "queued"
+
+
+def test_auto_ingest_ziai_cycle_inserts_film_and_runs_unconfirmed_ziai(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("IA_KISSING_DISABLE_QUEUE_FILL", "1")
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (NULL, 'auto_ingest_ziai', 'running', '{}', '{"phase":"running","progress":0.0}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """
+        )
+        parent_job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    metadata = {
+        "archive_identifier": "auto_feature_film",
+        "title": "Auto Feature Film",
+        "year": 1932,
+        "description": "A public domain feature film.",
+        "subjects": ["Feature films"],
+        "creator": None,
+        "collection": "feature_films",
+        "language": "English",
+        "runtime_seconds": 120,
+        "item_url": "https://archive.org/details/auto_feature_film",
+        "license_text": None,
+        "license_url": None,
+        "rights_notes": None,
+        "rights_confidence": "unknown",
+        "rights_confidence_score": 0.0,
+        "metadata_score": 0.0,
+        "metadata_reason_json": "{}",
+        "files": [
+            {
+                "filename": "auto_feature_film.mp4",
+                "format": "MPEG4",
+                "size_bytes": 1024,
+                "download_url": "https://archive.org/download/auto_feature_film/auto_feature_film.mp4",
+                "is_video": True,
+                "is_subtitle": False,
+                "is_preferred_source": True,
+            }
+        ],
+    }
+
+    def fake_dry_run(*args, **kwargs) -> dict:
+        progress_callback = kwargs.get("progress_callback")
+        if progress_callback:
+            progress_callback("film_complete", {"phase": "probing_duplicates", "progress": 1.0, "message": "done"})
+        return {
+            "query": "collection:feature_films",
+            "start_page": 1,
+            "pages_hit": 1,
+            "docs_seen": 1,
+            "results": [
+                {
+                    "metadata": metadata,
+                    "title_analysis": {
+                        "canonical_title": "Auto Feature Film",
+                        "input_title_is_original_language": True,
+                        "decisions": [],
+                    },
+                    "score": {"blocked": False},
+                    "heuristics": [],
+                    "duplicate_hits": [],
+                    "duplicate_decisions": [],
+                }
+            ],
+        }
+
+    ziai_calls: list[dict] = []
+
+    def fake_run_ziai_film_now(job_id: int, film_id: int, **kwargs) -> int:
+        ziai_calls.append({"job_id": job_id, "film_id": film_id, **kwargs})
+        observer = kwargs.get("progress_observer")
+        if observer:
+            observer("done", {"phase": "done", "progress": 1.0, "message": "ZIAI done"})
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'done', result_json = ?, updated_at = '2026-01-01T00:00:01Z'
+                WHERE id = ?
+                """,
+                (json.dumps({"phase": "done", "progress": 1.0, "candidate_count": 2}, sort_keys=True), job_id),
+            )
+        return 0
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._run_ingestor_dry_run", fake_dry_run)
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._run_ziai_film_now", fake_run_ziai_film_now)
+
+    result = _run_auto_ingest_ziai_cycle(settings, parent_job_id)
+
+    assert result["status"] == "ziai_done"
+    assert result["candidate_count"] == 2
+    assert len(ziai_calls) == 1
+    assert ziai_calls[0]["allow_unconfirmed"] is True
+    with get_connection(settings.db_path) as conn:
+        film = conn.execute("SELECT id, status FROM films WHERE archive_identifier = 'auto_feature_film'").fetchone()
+        review = conn.execute("SELECT * FROM film_reviews WHERE film_id = ?", (film["id"],)).fetchone()
+        child_job = conn.execute(
+            "SELECT payload_json FROM analysis_jobs WHERE film_id = ? AND job_type = 'ziai_film'",
+            (film["id"],),
+        ).fetchone()
+        next_page = conn.execute("SELECT value FROM app_settings WHERE key = 'auto_ingest_ziai_next_page'").fetchone()
+    assert film["status"] == "ziai_candidates_pending"
+    assert review is None
+    assert f'"auto_ingest_ziai_job_id": {parent_job_id}' in child_job["payload_json"]
+    assert next_page["value"] == "2"
 
 
 def test_update_mark_tag_updates_mark_and_clip(tmp_path: Path, monkeypatch) -> None:

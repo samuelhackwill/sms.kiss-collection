@@ -287,6 +287,13 @@ def init_db(db_path: Path) -> None:
         )
         conn.execute(
             """
+            INSERT INTO queue_runtime (queue_name, state, updated_at)
+            VALUES ('auto_ingest_ziai', 'idle', CURRENT_TIMESTAMP)
+            ON CONFLICT(queue_name) DO NOTHING
+            """
+        )
+        conn.execute(
+            """
             INSERT INTO app_settings (key, value)
             VALUES ('clip_order_mode', 'random')
             ON CONFLICT(key) DO NOTHING

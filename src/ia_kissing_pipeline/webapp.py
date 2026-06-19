@@ -27,6 +27,7 @@ from ia_kissing_pipeline.db import get_connection, init_db
 from ia_kissing_pipeline.main import _resolve_source_video
 from ia_kissing_pipeline.ingest.ia_client import IAClient
 from ia_kissing_pipeline.ingest.ia_ingest import ingest_from_ia, make_checkpoint_key, normalize_item
+from ia_kissing_pipeline.ingest.store import upsert_film_item
 from ia_kissing_pipeline.jobs.events import append_job_event, list_job_events, list_recent_job_events
 from ia_kissing_pipeline.main import run_metadata_scoring
 from ia_kissing_pipeline.media_storage import (
@@ -50,6 +51,9 @@ QUEUE_INGEST_LIMIT = 8
 QUEUE_INGEST_ROWS = 4
 QUEUE_STALE_SECONDS = 600
 QUEUE_NAME = "download_batch"
+AUTO_INGEST_ZIAI_QUEUE_NAME = "auto_ingest_ziai"
+AUTO_INGEST_ZIAI_INTERVAL_SECONDS = 3600
+AUTO_INGEST_ZIAI_NEXT_PAGE_KEY = "auto_ingest_ziai_next_page"
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 CODE_ARCHIVE_EXCLUDED_TOP_LEVEL = {
     ".venv",
@@ -405,6 +409,9 @@ ADMIN_TEMPLATE = """
     label { display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
     input[type="number"] { width: 110px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: #0d1117; color: var(--text); }
     button { padding: 9px 14px; border-radius: 10px; border: 1px solid #3b495d; background: #2a3442; color: #d9e5f7; cursor: pointer; }
+    button[disabled] { opacity: 0.62; cursor: default; }
+    .button-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+    .button-row form { margin-top: 0; }
     .status { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--border); }
   </style>
 </head>
@@ -432,6 +439,38 @@ ADMIN_TEMPLATE = """
       {% else %}
         <p class="mono">idle</p>
       {% endif %}
+    </div>
+    <div class="status">
+      <h2 style="margin-top:0;">Hourly Auto Ingest + ZIAI</h2>
+      <p class="muted">Every cycle checks one new Internet Archive film title, prefers an original-language sibling when Codex flags the title as translated, then runs ZIAI candidate generation.</p>
+      <p class="mono">state={{ auto_ziai["state"] }} interval_seconds={{ auto_ziai["interval_seconds"] }} next_page={{ auto_ziai["next_page"] }}</p>
+      {% if auto_ziai["job"] %}
+        <p class="mono">job_id={{ auto_ziai["job"]["id"] }} status={{ auto_ziai["job"]["status"] }} phase={{ auto_ziai["job"]["phase"] }} progress={{ auto_ziai["job"]["progress_percent"] }}%</p>
+        {% if auto_ziai["job"]["message"] %}
+          <p>{{ auto_ziai["job"]["message"] }}</p>
+        {% endif %}
+        {% if auto_ziai["job"]["last_cycle"] %}
+          <p class="mono">last_cycle={{ auto_ziai["job"]["last_cycle"]["status"] }} film={{ auto_ziai["job"]["last_cycle"].get("title") or auto_ziai["job"]["last_cycle"].get("archive_identifier") or "none" }}</p>
+        {% endif %}
+      {% else %}
+        <p class="mono">no auto-ingest job yet</p>
+      {% endif %}
+      <div class="button-row">
+        {% if auto_ziai["active"] %}
+          <button type="button" disabled>RUNNING</button>
+          <form method="post" action="{{ url_for('admin_abort_auto_ingest_ziai') }}">
+            <button type="submit">ABORT</button>
+          </form>
+        {% elif auto_ziai["has_started"] %}
+          <form method="post" action="{{ url_for('admin_resume_auto_ingest_ziai') }}">
+            <button type="submit">RESUME</button>
+          </form>
+        {% else %}
+          <form method="post" action="{{ url_for('admin_launch_auto_ingest_ziai') }}">
+            <button type="submit">LAUNCH</button>
+          </form>
+        {% endif %}
+      </div>
     </div>
   </div>
 </body>
@@ -3168,14 +3207,17 @@ def create_app() -> Flask:
     def admin_index():
         requested_count = max(1, min(100, request.args.get("count", default=1, type=int) or 1))
         with get_connection(settings.db_path) as conn:
+            _recover_auto_ingest_ziai_state(conn, settings)
             queue_job = _load_download_batch_job(conn)
             ready_count = _count_active_pool_films(conn)
+            auto_ziai = _load_auto_ingest_ziai_status(conn)
         return render_template_string(
             ADMIN_TEMPLATE,
             message=request.args.get("message", type=str),
             requested_count=requested_count,
             queue_job=queue_job,
             ready_count=ready_count,
+            auto_ziai=auto_ziai,
         )
 
     @app.post("/admin/get-more-films")
@@ -3187,6 +3229,29 @@ def create_app() -> Flask:
         else:
             message = f"Get more films is already running as job {job_id}."
         return redirect(url_for("admin_index", message=message, count=count))
+
+    @app.post("/admin/auto-ingest-ziai/launch")
+    def admin_launch_auto_ingest_ziai():
+        started, job_id = _start_auto_ingest_ziai(settings, resume=False)
+        if started:
+            message = f"Started hourly auto ingest + ZIAI job {job_id}."
+        else:
+            message = f"Hourly auto ingest + ZIAI is already running as job {job_id}."
+        return redirect(url_for("admin_index", message=message))
+
+    @app.post("/admin/auto-ingest-ziai/abort")
+    def admin_abort_auto_ingest_ziai():
+        aborted, message = _abort_auto_ingest_ziai(settings)
+        return redirect(url_for("admin_index", message=message))
+
+    @app.post("/admin/auto-ingest-ziai/resume")
+    def admin_resume_auto_ingest_ziai():
+        started, job_id = _start_auto_ingest_ziai(settings, resume=True)
+        if started:
+            message = f"Resumed hourly auto ingest + ZIAI as job {job_id}."
+        else:
+            message = f"Hourly auto ingest + ZIAI is already running as job {job_id}."
+        return redirect(url_for("admin_index", message=message))
 
     @app.get("/api/random-clips")
     def random_clips_api():
@@ -6384,6 +6449,53 @@ def _load_download_batch_job(conn) -> dict | None:
     )
 
 
+def _load_auto_ingest_ziai_status(conn) -> dict:
+    runtime = _load_auto_ingest_ziai_runtime(conn)
+    job = _load_latest_auto_ingest_ziai_job(conn)
+    next_page = _get_auto_ingest_ziai_next_page(conn)
+    state = runtime["state"] if runtime else "idle"
+    active = state in ("queued", "running")
+    return {
+        "state": state,
+        "active": active,
+        "has_started": bool(job) or state in ("paused", "error", "aborted"),
+        "interval_seconds": _auto_ingest_ziai_interval_seconds(),
+        "next_page": next_page,
+        "last_error": runtime["last_error"] if runtime else None,
+        "job": job,
+    }
+
+
+def _load_latest_auto_ingest_ziai_job(conn) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT id, status, payload_json, result_json, error_text, created_at, updated_at
+        FROM analysis_jobs
+        WHERE film_id IS NULL AND job_type = 'auto_ingest_ziai'
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return None
+    result = json.loads(row["result_json"] or "{}")
+    progress = float(result.get("progress", 0.0))
+    return {
+        "id": int(row["id"]),
+        "status": row["status"],
+        "payload": json.loads(row["payload_json"] or "{}"),
+        "result": result,
+        "phase": result.get("phase", row["status"]),
+        "progress": progress,
+        "progress_percent": int(max(0, min(100, round(progress * 100)))),
+        "message": result.get("message") or row["error_text"],
+        "last_cycle": result.get("last_cycle"),
+        "error_text": row["error_text"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def _source_cached(settings, archive_identifier: str) -> bool:
     source_dir = settings.download_dir / archive_identifier
     return source_dir.exists() and any(path.is_file() for path in source_dir.iterdir())
@@ -6529,7 +6641,7 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
     log_path = (settings.log_dir / "webapp-jobs.log").resolve()
     runtime_dir = Path(f"/run/user/{os.getuid()}")
     systemd_run = shutil.which("systemd-run")
-    independent_job = any(item in {"ziai-film-job", "ziai-batch-job"} for item in command)
+    independent_job = any(item in {"ziai-film-job", "ziai-batch-job", "auto-ingest-ziai"} for item in command)
     if independent_job and systemd_run and (runtime_dir / "bus").exists():
         unit_name = f"ia-kissing-job-{time.time_ns()}"
         systemd_env = {
@@ -6549,9 +6661,22 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
                     f"--property=WorkingDirectory={project_root}",
                     f"--property=StandardOutput=append:{log_path}",
                     f"--property=StandardError=append:{log_path}",
-                    *[f"--setenv={key}={value}" for key, value in env.items() if key in {
-                        "DB_PATH", "CACHE_DIR", "DOWNLOAD_DIR", "FRAME_DIR", "PREVIEW_DIR", "CLIPS_DIR", "LOG_DIR", "PATH"
-                    }],
+                    *[
+                        f"--setenv={key}={value}"
+                        for key, value in env.items()
+                        if key in {
+                            "DB_PATH",
+                            "CACHE_DIR",
+                            "DOWNLOAD_DIR",
+                            "FRAME_DIR",
+                            "PREVIEW_DIR",
+                            "CLIPS_DIR",
+                            "LOG_DIR",
+                            "PATH",
+                        }
+                        or key.startswith("IA_KISSING_")
+                        or key.startswith("MEDIA_")
+                    ],
                     "--",
                     *command,
                 ],
@@ -7027,6 +7152,8 @@ def _run_ziai_film_now(
     batch_job_id: int | None = None,
     batch_index: int = 0,
     batch_total: int = 1,
+    allow_unconfirmed: bool = False,
+    progress_observer: IngestorProgressCallback | None = None,
 ) -> int:
     settings = load_settings()
     settings.ensure_directories()
@@ -7034,52 +7161,58 @@ def _run_ziai_film_now(
     try:
         with get_connection(settings.db_path) as conn:
             job = _load_ziai_job(conn, job_id)
-            film_row = conn.execute(
-                """
-                SELECT f.*
-                FROM films f
-                JOIN film_reviews fr ON fr.film_id = f.id
-                WHERE f.id = ? AND fr.review_status = 'has_kiss'
-                """,
-                (film_id,),
-            ).fetchone()
+            if allow_unconfirmed:
+                film_row = conn.execute(
+                    "SELECT f.* FROM films f WHERE f.id = ?",
+                    (film_id,),
+                ).fetchone()
+            else:
+                film_row = conn.execute(
+                    """
+                    SELECT f.*
+                    FROM films f
+                    JOIN film_reviews fr ON fr.film_id = f.id
+                    WHERE f.id = ? AND fr.review_status = 'has_kiss'
+                    """,
+                    (film_id,),
+                ).fetchone()
         if not job or job["job_type"] != "ziai_film":
             raise ValueError(f"ZIAI film job {job_id} not found")
         if not film_row:
+            if allow_unconfirmed:
+                raise ValueError(f"Film {film_id} not found")
             raise ValueError(f"Film {film_id} is not confirmed as containing a kiss")
         film = dict(film_row)
-        _record_ziai_event(
-            settings,
-            job_id,
-            "job_started",
-            {
-                "phase": "resolving_source",
-                "progress": 0.01,
-                "message": f"Started ZIAI pipeline for {film['title']}",
-                "film_id": film_id,
-            },
-        )
+        started_payload = {
+            "phase": "resolving_source",
+            "progress": 0.01,
+            "message": f"Started ZIAI pipeline for {film['title']}",
+            "film_id": film_id,
+        }
+        _record_ziai_event(settings, job_id, "job_started", started_payload)
+        if progress_observer is not None:
+            progress_observer("job_started", started_payload)
 
         with get_connection(settings.db_path) as conn:
             _, _, source_path = _resolve_source_video(conn, settings, film_id)
         source_path = source_path.resolve()
         output_dir = (settings.preview_dir / film["archive_identifier"] / "ziai").resolve()
         cache_dir = (settings.cache_dir / "ziai" / film["archive_identifier"]).resolve()
-        _record_ziai_event(
-            settings,
-            job_id,
-            "source_ready",
-            {
-                "phase": "source_ready",
-                "progress": 0.01,
-                "message": f"Source video is ready for {film['title']}",
-                "film_id": film_id,
-            },
-        )
+        source_ready_payload = {
+            "phase": "source_ready",
+            "progress": 0.01,
+            "message": f"Source video is ready for {film['title']}",
+            "film_id": film_id,
+        }
+        _record_ziai_event(settings, job_id, "source_ready", source_ready_payload)
+        if progress_observer is not None:
+            progress_observer("source_ready", source_ready_payload)
 
         def progress_callback(event_type: str, event_payload: dict[str, object]) -> None:
             payload = {**event_payload, "film_id": film_id, "film_title": film["title"]}
             _record_ziai_event(settings, job_id, event_type, payload)
+            if progress_observer is not None:
+                progress_observer(event_type, payload)
             if batch_job_id is not None:
                 child_progress = float(payload.get("progress", 0.0))
                 batch_progress = (batch_index + child_progress) / max(1, batch_total)
@@ -7766,6 +7899,667 @@ def _maybe_start_queue_fill(settings, target_ready: int) -> None:
     )
 
 
+def _auto_ingest_ziai_interval_seconds() -> int:
+    raw_value = os.getenv("IA_KISSING_AUTO_ZIAI_INTERVAL_SECONDS")
+    if raw_value is None:
+        return AUTO_INGEST_ZIAI_INTERVAL_SECONDS
+    try:
+        return max(1, int(float(raw_value)))
+    except (TypeError, ValueError):
+        return AUTO_INGEST_ZIAI_INTERVAL_SECONDS
+
+
+def _get_auto_ingest_ziai_next_page(conn) -> int:
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = ?",
+        (AUTO_INGEST_ZIAI_NEXT_PAGE_KEY,),
+    ).fetchone()
+    if not row:
+        return 1
+    try:
+        return max(1, int(row["value"]))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _set_auto_ingest_ziai_next_page(conn, page: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO app_settings (key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (AUTO_INGEST_ZIAI_NEXT_PAGE_KEY, str(max(1, int(page)))),
+    )
+
+
+def _load_auto_ingest_ziai_runtime(conn):
+    row = conn.execute(
+        "SELECT * FROM queue_runtime WHERE queue_name = ?",
+        (AUTO_INGEST_ZIAI_QUEUE_NAME,),
+    ).fetchone()
+    if row:
+        return row
+    conn.execute(
+        """
+        INSERT INTO queue_runtime (queue_name, state, updated_at)
+        VALUES (?, 'idle', ?)
+        ON CONFLICT(queue_name) DO NOTHING
+        """,
+        (AUTO_INGEST_ZIAI_QUEUE_NAME, utc_now_iso()),
+    )
+    return conn.execute(
+        "SELECT * FROM queue_runtime WHERE queue_name = ?",
+        (AUTO_INGEST_ZIAI_QUEUE_NAME,),
+    ).fetchone()
+
+
+def _transition_auto_ingest_ziai_runtime(
+    conn,
+    state: str,
+    owner_job_id: int | None,
+    owner_pid: int | None,
+    last_error: str | None,
+) -> None:
+    now = utc_now_iso()
+    conn.execute(
+        """
+        UPDATE queue_runtime
+        SET state = ?, owner_job_id = ?, owner_pid = ?, heartbeat_at = ?, target_ready = 0, last_error = ?, updated_at = ?
+        WHERE queue_name = ?
+        """,
+        (state, owner_job_id, owner_pid, now, last_error, now, AUTO_INGEST_ZIAI_QUEUE_NAME),
+    )
+
+
+def _auto_ingest_ziai_job_is_active(conn) -> bool:
+    runtime = _load_auto_ingest_ziai_runtime(conn)
+    return bool(runtime and runtime["state"] in ("queued", "running"))
+
+
+def _abandon_auto_ingest_ziai_runtime(conn, job_id: int, reason: str) -> None:
+    error_payload = {
+        "phase": "error",
+        "progress": 1.0,
+        "message": reason,
+        "error": reason,
+    }
+    if job_id:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'error', result_json = ?, error_text = ?, updated_at = ?
+            WHERE id = ? AND job_type = 'auto_ingest_ziai' AND status IN ('queued', 'running')
+            """,
+            (json.dumps(error_payload, sort_keys=True), reason, utc_now_iso(), job_id),
+        )
+        append_job_event(conn, job_id, "error", error_payload)
+    _transition_auto_ingest_ziai_runtime(conn, "error", None, None, reason)
+
+
+def _recover_auto_ingest_ziai_state(conn, settings) -> None:
+    runtime = _load_auto_ingest_ziai_runtime(conn)
+    if runtime and runtime["state"] in ("queued", "running"):
+        owner_pid = int(runtime["owner_pid"] or 0)
+        owner_job_id = int(runtime["owner_job_id"] or 0)
+        heartbeat_age = _heartbeat_age_seconds(runtime["heartbeat_at"])
+        if runtime["state"] == "queued" and owner_job_id:
+            job_row = conn.execute(
+                "SELECT status FROM analysis_jobs WHERE id = ? AND job_type = 'auto_ingest_ziai'",
+                (owner_job_id,),
+            ).fetchone()
+            if not job_row or job_row["status"] not in ("queued", "running"):
+                _abandon_auto_ingest_ziai_runtime(conn, owner_job_id, "queued auto ingest job missing")
+            elif heartbeat_age > QUEUE_STALE_SECONDS:
+                _abandon_auto_ingest_ziai_runtime(conn, owner_job_id, "queued auto ingest worker stale")
+        elif runtime["state"] == "running":
+            if not _pid_is_alive(owner_pid) or heartbeat_age > QUEUE_STALE_SECONDS:
+                if owner_pid and _pid_is_alive(owner_pid):
+                    try:
+                        os.kill(owner_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                _abandon_auto_ingest_ziai_runtime(conn, owner_job_id, "auto ingest worker stale")
+
+    rows = conn.execute(
+        """
+        SELECT id
+        FROM analysis_jobs
+        WHERE film_id IS NULL AND job_type = 'auto_ingest_ziai' AND status IN ('queued', 'running')
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    runtime = _load_auto_ingest_ziai_runtime(conn)
+    runtime_job_id = int(runtime["owner_job_id"] or 0) if runtime else 0
+    for row in rows:
+        if int(row["id"]) == runtime_job_id:
+            continue
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = 'error', error_text = 'superseded auto ingest job', updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now_iso(), row["id"]),
+        )
+
+
+def _start_auto_ingest_ziai(settings, *, resume: bool) -> tuple[bool, int | None]:
+    interval_seconds = _auto_ingest_ziai_interval_seconds()
+    job_id = None
+    with get_connection(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _recover_auto_ingest_ziai_state(conn, settings)
+        if _auto_ingest_ziai_job_is_active(conn):
+            runtime = _load_auto_ingest_ziai_runtime(conn)
+            return False, int(runtime["owner_job_id"] or 0) if runtime else None
+        payload = {
+            "query": QUEUE_INGEST_QUERY,
+            "interval_seconds": interval_seconds,
+            "limit": 1,
+            "rows": 1,
+            "duplicate_rows": 4,
+            "resume": bool(resume),
+        }
+        result = {
+            "phase": "queued",
+            "progress": 0.0,
+            "message": "Queued hourly auto ingest + ZIAI",
+        }
+        now = utc_now_iso()
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (NULL, 'auto_ingest_ziai', 'queued', ?, ?, ?, ?)
+            """,
+            (json.dumps(payload, sort_keys=True), json.dumps(result, sort_keys=True), now, now),
+        )
+        job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        append_job_event(conn, job_id, "queued", result)
+        _transition_auto_ingest_ziai_runtime(conn, "queued", job_id, None, None)
+    _spawn_pipeline_command(
+        settings,
+        [
+            sys.executable,
+            "-m",
+            "ia_kissing_pipeline.webapp",
+            "auto-ingest-ziai",
+            "--job-id",
+            str(job_id),
+        ],
+    )
+    return True, job_id
+
+
+def _abort_auto_ingest_ziai(settings) -> tuple[bool, str]:
+    owner_pid = 0
+    job_id = 0
+    with get_connection(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _recover_auto_ingest_ziai_state(conn, settings)
+        runtime = _load_auto_ingest_ziai_runtime(conn)
+        if not runtime or runtime["state"] not in ("queued", "running"):
+            return False, "Hourly auto ingest + ZIAI is not running."
+        owner_pid = int(runtime["owner_pid"] or 0)
+        job_id = int(runtime["owner_job_id"] or 0)
+        payload = {
+            "phase": "aborted",
+            "progress": 1.0,
+            "message": "Hourly auto ingest + ZIAI aborted by admin",
+        }
+        if job_id:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'aborted', result_json = ?, error_text = NULL, updated_at = ?
+                WHERE id = ? AND job_type = 'auto_ingest_ziai'
+                """,
+                (json.dumps(payload, sort_keys=True), utc_now_iso(), job_id),
+            )
+            append_job_event(conn, job_id, "aborted", payload)
+        _transition_auto_ingest_ziai_runtime(conn, "paused", None, None, "aborted by admin")
+    if owner_pid and _pid_is_alive(owner_pid):
+        try:
+            os.kill(owner_pid, signal.SIGTERM)
+        except OSError:
+            pass
+    return True, f"Aborted hourly auto ingest + ZIAI job {job_id}."
+
+
+def _start_auto_ingest_ziai_runtime(settings, job_id: int) -> bool:
+    with get_connection(settings.db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _recover_auto_ingest_ziai_state(conn, settings)
+        runtime = _load_auto_ingest_ziai_runtime(conn)
+        if not runtime:
+            raise RuntimeError("auto ingest runtime row missing")
+        if int(runtime["owner_job_id"] or 0) != job_id or runtime["state"] != "queued":
+            return False
+        _transition_auto_ingest_ziai_runtime(conn, "running", job_id, os.getpid(), None)
+    return True
+
+
+def _heartbeat_auto_ingest_ziai_runtime(settings, job_id: int) -> None:
+    with get_connection(settings.db_path) as conn:
+        runtime = _load_auto_ingest_ziai_runtime(conn)
+        if not runtime or int(runtime["owner_job_id"] or 0) != job_id or runtime["state"] != "running":
+            raise RuntimeError("auto ingest runtime ownership lost")
+        _transition_auto_ingest_ziai_runtime(conn, "running", job_id, os.getpid(), None)
+
+
+def _finish_auto_ingest_ziai_runtime(settings, job_id: int, state: str, last_error: str | None) -> None:
+    with get_connection(settings.db_path) as conn:
+        runtime = _load_auto_ingest_ziai_runtime(conn)
+        if not runtime or int(runtime["owner_job_id"] or 0) != job_id:
+            return
+        _transition_auto_ingest_ziai_runtime(conn, state, job_id, os.getpid(), last_error)
+        _transition_auto_ingest_ziai_runtime(conn, "idle", None, None, last_error)
+
+
+def _auto_ingest_ziai_should_continue(settings, job_id: int) -> bool:
+    with get_connection(settings.db_path) as conn:
+        runtime = _load_auto_ingest_ziai_runtime(conn)
+        return bool(
+            runtime
+            and runtime["state"] == "running"
+            and int(runtime["owner_job_id"] or 0) == job_id
+        )
+
+
+def _record_auto_ingest_ziai_event(
+    settings,
+    job_id: int,
+    event_type: str,
+    payload: dict[str, object],
+    *,
+    status: str = "running",
+) -> None:
+    result = {
+        **payload,
+        "phase": payload.get("phase", event_type),
+        "progress": float(payload.get("progress", 0.0)),
+        "message": payload.get("message"),
+    }
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE analysis_jobs
+            SET status = ?, result_json = ?, error_text = NULL, updated_at = ?
+            WHERE id = ? AND job_type = 'auto_ingest_ziai'
+            """,
+            (status, json.dumps(result, sort_keys=True), utc_now_iso(), job_id),
+        )
+        append_job_event(conn, job_id, event_type, result)
+
+
+def _select_auto_ingest_ziai_metadata(settings, candidate: dict) -> dict:
+    metadata = candidate["metadata"]
+    title_analysis = candidate.get("title_analysis") or {}
+    duplicate_hits = candidate.get("duplicate_hits") or []
+    input_is_original_language = title_analysis.get("input_title_is_original_language")
+    if input_is_original_language is False:
+        accepted_sibling = next((hit for hit in duplicate_hits if hit.get("accepted")), None)
+        if not accepted_sibling:
+            return {
+                "status": "skipped",
+                "reason": "translated_title_without_accepted_sibling",
+                "archive_identifier": metadata["archive_identifier"],
+                "title": metadata["title"],
+            }
+        sibling_identifier = str(accepted_sibling.get("archive_identifier") or "").strip()
+        if not sibling_identifier:
+            return {
+                "status": "skipped",
+                "reason": "translated_title_sibling_missing_identifier",
+                "archive_identifier": metadata["archive_identifier"],
+                "title": metadata["title"],
+            }
+        with get_connection(settings.db_path) as conn:
+            existing = conn.execute(
+                "SELECT id FROM films WHERE archive_identifier = ?",
+                (sibling_identifier,),
+            ).fetchone()
+        if existing:
+            return {
+                "status": "skipped",
+                "reason": "original_language_sibling_already_in_db",
+                "archive_identifier": sibling_identifier,
+                "title": accepted_sibling.get("title") or sibling_identifier,
+            }
+        client = IAClient(settings.cache_dir, settings.user_agent, throttle_seconds=0.2)
+        metadata_payload = client.fetch_metadata(sibling_identifier)
+        sibling_doc = {
+            "identifier": sibling_identifier,
+            "title": accepted_sibling.get("title") or sibling_identifier,
+            "year": accepted_sibling.get("year"),
+            "language": accepted_sibling.get("language"),
+            "collection": accepted_sibling.get("collection"),
+        }
+        return {
+            "status": "selected",
+            "reason": "selected_original_language_sibling",
+            "source_archive_identifier": metadata["archive_identifier"],
+            "metadata": normalize_item(sibling_doc, metadata_payload),
+        }
+
+    with get_connection(settings.db_path) as conn:
+        existing = conn.execute(
+            "SELECT id FROM films WHERE archive_identifier = ?",
+            (metadata["archive_identifier"],),
+        ).fetchone()
+    if existing:
+        return {
+            "status": "skipped",
+            "reason": "already_in_db",
+            "archive_identifier": metadata["archive_identifier"],
+            "title": metadata["title"],
+        }
+    if bool((candidate.get("score") or {}).get("blocked")):
+        return {
+            "status": "skipped",
+            "reason": "metadata_blocked",
+            "archive_identifier": metadata["archive_identifier"],
+            "title": metadata["title"],
+        }
+    return {
+        "status": "selected",
+        "reason": "selected_candidate",
+        "metadata": metadata,
+    }
+
+
+def _create_auto_ziai_child_job(settings, parent_job_id: int, film_id: int, title: str) -> int:
+    payload = {
+        "min_frames": 10,
+        "threshold": 0.7,
+        "clip_padding_seconds": 2.0,
+        "chunk_seconds": 300.0,
+        "inference_batch_size": 8,
+        "auto_ingest_ziai_job_id": parent_job_id,
+    }
+    now = utc_now_iso()
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (?, 'ziai_film', 'queued', ?, ?, ?, ?)
+            """,
+            (
+                film_id,
+                json.dumps(payload, sort_keys=True),
+                json.dumps({"phase": "queued", "progress": 0.0}, sort_keys=True),
+                now,
+                now,
+            ),
+        )
+        child_job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        append_job_event(
+            conn,
+            child_job_id,
+            "queued",
+            {
+                "phase": "queued",
+                "progress": 0.0,
+                "message": f"Queued automatic ZIAI pipeline for {title}",
+                "film_id": film_id,
+                "auto_ingest_ziai_job_id": parent_job_id,
+            },
+        )
+    return child_job_id
+
+
+def _run_auto_ingest_ziai_cycle(settings, job_id: int) -> dict[str, object]:
+    with get_connection(settings.db_path) as conn:
+        start_page = _get_auto_ingest_ziai_next_page(conn)
+
+    def progress_callback(event_type: str, event_payload: dict[str, object]) -> None:
+        child_progress = float(event_payload.get("progress", 0.0))
+        _record_auto_ingest_ziai_event(
+            settings,
+            job_id,
+            f"ingestor_{event_type}",
+            {
+                **event_payload,
+                "phase": "ingesting",
+                "progress": min(0.45, 0.05 + 0.40 * child_progress),
+            },
+        )
+
+    dry_run = _run_ingestor_dry_run(
+        settings,
+        query=QUEUE_INGEST_QUERY,
+        start_page=start_page,
+        limit=1,
+        rows=1,
+        duplicate_rows=4,
+        progress_callback=progress_callback,
+    )
+    pages_hit = max(1, int(dry_run.get("pages_hit") or 0))
+    with get_connection(settings.db_path) as conn:
+        _set_auto_ingest_ziai_next_page(conn, start_page + pages_hit)
+
+    results = dry_run.get("results") or []
+    if not results:
+        return {
+            "status": "skipped",
+            "reason": "no_ia_result",
+            "start_page": start_page,
+            "next_page": start_page + pages_hit,
+        }
+
+    selection = _select_auto_ingest_ziai_metadata(settings, results[0])
+    if selection["status"] != "selected":
+        return {
+            **selection,
+            "start_page": start_page,
+            "next_page": start_page + pages_hit,
+        }
+
+    selected_metadata = selection["metadata"]
+    with get_connection(settings.db_path) as conn:
+        film_id = upsert_film_item(conn, selected_metadata)
+    metadata_score = score_metadata(
+        selected_metadata["title"],
+        selected_metadata.get("description", ""),
+        selected_metadata.get("subjects", []),
+        selected_metadata.get("collection"),
+    )
+    metadata_status = "excluded_metadata" if metadata_score.blocked else "metadata_scored"
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            UPDATE films
+            SET metadata_score = ?, metadata_reason_json = ?, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                metadata_score.score,
+                json.dumps(metadata_score.reasons, sort_keys=True),
+                metadata_status,
+                utc_now_iso(),
+                film_id,
+            ),
+        )
+        film = conn.execute("SELECT id, title, archive_identifier, status FROM films WHERE id = ?", (film_id,)).fetchone()
+        if not film:
+            raise RuntimeError(f"Auto-ingested film {film_id} disappeared")
+        if film["status"] == "excluded_metadata":
+            return {
+                "status": "skipped",
+                "reason": "metadata_blocked_after_insert",
+                "film_id": film_id,
+                "archive_identifier": film["archive_identifier"],
+                "title": film["title"],
+                "start_page": start_page,
+                "next_page": start_page + pages_hit,
+            }
+        conn.execute(
+            "UPDATE films SET status = 'ziai_pending_review', updated_at = ? WHERE id = ?",
+            (utc_now_iso(), film_id),
+        )
+
+    _record_auto_ingest_ziai_event(
+        settings,
+        job_id,
+        "ziai_queued",
+        {
+            "phase": "running_ziai",
+            "progress": 0.50,
+            "message": f"Starting ZIAI for {film['title']}",
+            "film_id": film_id,
+            "archive_identifier": film["archive_identifier"],
+            "title": film["title"],
+            "selection_reason": selection["reason"],
+        },
+    )
+    child_job_id = _create_auto_ziai_child_job(settings, job_id, film_id, film["title"])
+
+    def ziai_progress_observer(event_type: str, event_payload: dict[str, object]) -> None:
+        child_progress = float(event_payload.get("progress", 0.0))
+        _record_auto_ingest_ziai_event(
+            settings,
+            job_id,
+            f"ziai_{event_type}",
+            {
+                **event_payload,
+                "phase": "running_ziai",
+                "progress": min(0.98, 0.50 + 0.48 * child_progress),
+                "child_job_id": child_job_id,
+            },
+        )
+
+    result_code = _run_ziai_film_now(
+        child_job_id,
+        film_id,
+        allow_unconfirmed=True,
+        progress_observer=ziai_progress_observer,
+    )
+    with get_connection(settings.db_path) as conn:
+        child_job = _load_ziai_job(conn, child_job_id)
+        child_result = child_job["result"] if child_job else {}
+        candidate_count = int(child_result.get("candidate_count") or 0)
+        next_status = "ziai_candidates_pending" if result_code == 0 else "ziai_error"
+        conn.execute(
+            "UPDATE films SET status = ?, updated_at = ? WHERE id = ?",
+            (next_status, utc_now_iso(), film_id),
+        )
+    return {
+        "status": "ziai_done" if result_code == 0 else "ziai_error",
+        "reason": selection["reason"],
+        "film_id": film_id,
+        "archive_identifier": film["archive_identifier"],
+        "title": film["title"],
+        "child_job_id": child_job_id,
+        "candidate_count": candidate_count,
+        "start_page": start_page,
+        "next_page": start_page + pages_hit,
+    }
+
+
+def _run_auto_ingest_ziai_now(job_id: int, *, once: bool = False) -> int:
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    if not _start_auto_ingest_ziai_runtime(settings, job_id):
+        return 0
+    cycle_count = 0
+    last_cycle: dict[str, object] | None = None
+    try:
+        with get_connection(settings.db_path) as conn:
+            job = conn.execute(
+                "SELECT payload_json FROM analysis_jobs WHERE id = ? AND job_type = 'auto_ingest_ziai'",
+                (job_id,),
+            ).fetchone()
+        payload = json.loads(job["payload_json"] or "{}") if job else {}
+        interval_seconds = max(1, int(payload.get("interval_seconds") or _auto_ingest_ziai_interval_seconds()))
+        _record_auto_ingest_ziai_event(
+            settings,
+            job_id,
+            "job_started",
+            {
+                "phase": "starting",
+                "progress": 0.01,
+                "message": "Started hourly auto ingest + ZIAI worker",
+                "interval_seconds": interval_seconds,
+            },
+        )
+        while True:
+            if not _auto_ingest_ziai_should_continue(settings, job_id):
+                return 0
+            _heartbeat_auto_ingest_ziai_runtime(settings, job_id)
+            _record_auto_ingest_ziai_event(
+                settings,
+                job_id,
+                "cycle_started",
+                {
+                    "phase": "ingesting",
+                    "progress": 0.02,
+                    "message": f"Starting auto ingest cycle {cycle_count + 1}",
+                    "cycle_count": cycle_count,
+                    "last_cycle": last_cycle,
+                },
+            )
+            last_cycle = _run_auto_ingest_ziai_cycle(settings, job_id)
+            cycle_count += 1
+            done_payload = {
+                "phase": "done" if once else "sleeping",
+                "progress": 1.0 if once else 0.99,
+                "message": (
+                    f"Auto ingest cycle {cycle_count} complete: "
+                    f"{last_cycle['status']} ({last_cycle.get('reason', 'no reason')})"
+                ),
+                "cycle_count": cycle_count,
+                "last_cycle": last_cycle,
+                "interval_seconds": interval_seconds,
+            }
+            if once:
+                _record_auto_ingest_ziai_event(settings, job_id, "done", done_payload, status="done")
+                _finish_auto_ingest_ziai_runtime(settings, job_id, "idle", None)
+                return 0
+            next_run_epoch = time.time() + interval_seconds
+            while time.time() < next_run_epoch:
+                if not _auto_ingest_ziai_should_continue(settings, job_id):
+                    return 0
+                remaining_seconds = max(0, int(round(next_run_epoch - time.time())))
+                next_run_at = datetime.fromtimestamp(next_run_epoch, UTC).isoformat()
+                _heartbeat_auto_ingest_ziai_runtime(settings, job_id)
+                _record_auto_ingest_ziai_event(
+                    settings,
+                    job_id,
+                    "sleeping",
+                    {
+                        **done_payload,
+                        "phase": "sleeping",
+                        "progress": 0.99,
+                        "message": f"Waiting {remaining_seconds}s before the next auto ingest cycle",
+                        "next_run_at": next_run_at,
+                        "remaining_seconds": remaining_seconds,
+                    },
+                )
+                time.sleep(min(10, max(1, remaining_seconds)))
+    except BaseException as exc:
+        error_payload = {
+            "phase": "error",
+            "progress": 1.0,
+            "message": f"Hourly auto ingest + ZIAI failed: {exc}",
+            "error": str(exc),
+            "cycle_count": cycle_count,
+            "last_cycle": last_cycle,
+        }
+        with get_connection(settings.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = 'error', result_json = ?, error_text = ?, updated_at = ?
+                WHERE id = ? AND job_type = 'auto_ingest_ziai'
+                """,
+                (json.dumps(error_payload, sort_keys=True), str(exc), utc_now_iso(), job_id),
+            )
+            append_job_event(conn, job_id, "error", error_payload)
+        _finish_auto_ingest_ziai_runtime(settings, job_id, "error", str(exc))
+        return 1
+
+
 def _ingest_and_score_more(settings) -> bool:
     client = IAClient(settings.cache_dir, settings.user_agent, throttle_seconds=0.2)
     checkpoint_key = make_checkpoint_key(QUEUE_INGEST_QUERY)
@@ -7984,8 +8778,10 @@ def _heartbeat_age_seconds(heartbeat_at: str | None) -> int:
         return QUEUE_STALE_SECONDS + 1
     try:
         normalized = heartbeat_at.replace("Z", "+00:00")
-        heartbeat_epoch = time.mktime(time.strptime(normalized[:19], "%Y-%m-%dT%H:%M:%S"))
-        return max(0, int(time.time() - heartbeat_epoch))
+        heartbeat_time = datetime.fromisoformat(normalized)
+        if heartbeat_time.tzinfo is None:
+            heartbeat_time = heartbeat_time.replace(tzinfo=UTC)
+        return max(0, int((datetime.now(UTC) - heartbeat_time.astimezone(UTC)).total_seconds()))
     except (ValueError, TypeError):
         return QUEUE_STALE_SECONDS + 1
 
@@ -8208,6 +9004,15 @@ def main() -> int:
         parser.add_argument("--job-id", type=int, required=True)
         args = parser.parse_args()
         return _run_ziai_batch_now(args.job_id)
+    if len(sys.argv) > 1 and sys.argv[1] == "auto-ingest-ziai":
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("auto-ingest-ziai")
+        parser.add_argument("--job-id", type=int, required=True)
+        parser.add_argument("--once", action="store_true")
+        args = parser.parse_args()
+        return _run_auto_ingest_ziai_now(args.job_id, once=args.once)
     if len(sys.argv) > 1 and sys.argv[1] == "build-manual-clip":
         import argparse
 
