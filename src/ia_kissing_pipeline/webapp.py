@@ -6642,7 +6642,8 @@ def _spawn_pipeline_command(settings, command: list[str]) -> None:
     runtime_dir = Path(f"/run/user/{os.getuid()}")
     systemd_run = shutil.which("systemd-run")
     independent_job = any(item in {"ziai-film-job", "ziai-batch-job", "auto-ingest-ziai"} for item in command)
-    if independent_job and systemd_run and (runtime_dir / "bus").exists():
+    use_systemd_run = os.getenv("IA_KISSING_USE_SYSTEMD_RUN_JOBS", "0") == "1"
+    if independent_job and use_systemd_run and systemd_run and (runtime_dir / "bus").exists():
         unit_name = f"ia-kissing-job-{time.time_ns()}"
         systemd_env = {
             **env,
