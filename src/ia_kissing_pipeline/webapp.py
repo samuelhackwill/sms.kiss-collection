@@ -5558,10 +5558,10 @@ def _detect_ingestor_variant_flags(*parts: str | None) -> list[dict[str, str]]:
 
 def _call_codex_ingestor_title_canonicalizer(original_title: str, cleaned_title: str) -> dict[str, object]:
     if os.getenv("IA_KISSING_USE_CODEX_TITLE_CANONICALIZER", "1") != "1":
-        return {"status": "disabled", "title": None}
+        return {"status": "disabled", "title": None, "input_title_is_original_language": None}
     codex_bin = shutil.which("codex")
     if not codex_bin:
-        return {"status": "missing_codex", "title": None}
+        return {"status": "missing_codex", "title": None, "input_title_is_original_language": None}
 
     model = os.getenv("IA_KISSING_CODEX_MODEL", "gpt-5.4-mini")
     timeout_seconds = float(os.getenv("IA_KISSING_CODEX_TIMEOUT_SECONDS", "20"))
@@ -5571,9 +5571,15 @@ def _call_codex_ingestor_title_canonicalizer(original_title: str, cleaned_title:
     prompt = "\n".join(
         [
             "Normalize this film title for archival duplicate search.",
-            "Return only the most likely canonical original-language title as a single line.",
-            "Do not add commentary, quotes, punctuation fixes beyond the title itself, or multiple options.",
-            "If uncertain, return the cleaned candidate unchanged.",
+            "Use only the two title strings below. Do not use metadata, web search, shell commands, files, MCP, or external tools.",
+            "Return JSON only, with no markdown or commentary:",
+            '{"canonical_title":"...","input_title_is_original_language":null}',
+            "canonical_title is the most likely canonical original-language title.",
+            "If uncertain about the canonical title, use the cleaned candidate unchanged.",
+            "input_title_is_original_language must be a JSON boolean or null.",
+            "input_title_is_original_language is true if the original title already appears to be the original-language release title.",
+            "Set input_title_is_original_language to false if the original title appears translated, localized, or dubbed.",
+            "Set input_title_is_original_language to null if this cannot be determined from the two title strings alone.",
             f"Original title: {original_title}",
             f"Cleaned candidate: {cleaned_title}",
         ]
@@ -5612,17 +5618,19 @@ def _call_codex_ingestor_title_canonicalizer(original_title: str, cleaned_title:
         return {
             "status": "timeout",
             "title": None,
+            "input_title_is_original_language": None,
             "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else None,
         }
     except subprocess.CalledProcessError as exc:
         return {
             "status": "error",
             "title": None,
+            "input_title_is_original_language": None,
             "stderr": (exc.stderr or "").strip() if isinstance(exc.stderr, str) else None,
             "returncode": exc.returncode,
         }
     except OSError as exc:
-        return {"status": "oserror", "title": None, "error": str(exc)}
+        return {"status": "oserror", "title": None, "input_title_is_original_language": None, "error": str(exc)}
     finally:
         output_path.unlink(missing_ok=True)
 
@@ -5630,20 +5638,54 @@ def _call_codex_ingestor_title_canonicalizer(original_title: str, cleaned_title:
         return {
             "status": "empty_output",
             "title": None,
+            "input_title_is_original_language": None,
             "stderr": (completed.stderr or "").strip() if completed.stderr else None,
             "returncode": completed.returncode,
         }
-    answer = re.sub(r"\s+", " ", answer).strip(" \"'")
-    if not answer:
+    raw_answer = answer.strip()
+    json_answer = raw_answer
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw_answer, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        json_answer = fenced.group(1).strip()
+    title_answer = ""
+    input_title_is_original_language = None
+    try:
+        payload = json.loads(json_answer)
+    except json.JSONDecodeError:
+        if raw_answer.startswith("{") or raw_answer.startswith("```"):
+            return {
+                "status": "invalid_json",
+                "title": None,
+                "input_title_is_original_language": None,
+                "stderr": (completed.stderr or "").strip() if completed.stderr else None,
+                "returncode": completed.returncode,
+            }
+        title_answer = raw_answer
+    else:
+        if not isinstance(payload, dict):
+            return {
+                "status": "invalid_json",
+                "title": None,
+                "input_title_is_original_language": None,
+                "stderr": (completed.stderr or "").strip() if completed.stderr else None,
+                "returncode": completed.returncode,
+            }
+        title_answer = str(payload.get("canonical_title") or payload.get("title") or "")
+        flag = payload.get("input_title_is_original_language")
+        input_title_is_original_language = flag if isinstance(flag, bool) else None
+    title_answer = re.sub(r"\s+", " ", title_answer).strip(" \"'")
+    if not title_answer:
         return {
             "status": "empty_output",
             "title": None,
+            "input_title_is_original_language": None,
             "stderr": (completed.stderr or "").strip() if completed.stderr else None,
             "returncode": completed.returncode,
         }
     return {
         "status": "ok",
-        "title": answer,
+        "title": title_answer,
+        "input_title_is_original_language": input_title_is_original_language,
         "stderr": (completed.stderr or "").strip() if completed.stderr else None,
         "returncode": completed.returncode,
         "model": model,
@@ -5688,6 +5730,7 @@ def _canonicalize_ingestor_title(
         )
     codex_result = _call_codex_ingestor_title_canonicalizer(original, cleaned)
     codex_title = codex_result.get("title")
+    input_title_is_original_language = codex_result.get("input_title_is_original_language")
     if codex_result.get("status") == "ok" and codex_title and codex_title != cleaned:
         decisions.append(
             {
@@ -5703,6 +5746,19 @@ def _canonicalize_ingestor_title(
                 "decision": f"confirmed cleaned sibling-search title as {cleaned!r}",
             }
         )
+    if codex_result.get("status") == "ok":
+        if input_title_is_original_language is True:
+            language_decision = "input title appears to already be the original-language title"
+        elif input_title_is_original_language is False:
+            language_decision = "input title appears translated, localized, or dubbed"
+        else:
+            language_decision = "could not determine whether input title is original-language from title strings alone"
+        decisions.append(
+            {
+                "heuristic": "codex title language",
+                "decision": language_decision,
+            }
+        )
     else:
         status = codex_result.get("status")
         if status == "disabled":
@@ -5713,6 +5769,8 @@ def _canonicalize_ingestor_title(
             detail = "timed out before returning a title"
         elif status == "empty_output":
             detail = "returned no final title"
+        elif status == "invalid_json":
+            detail = "returned invalid JSON"
         elif status == "error":
             detail = f"failed with exit code {codex_result.get('returncode')}"
         elif status == "oserror":
@@ -5739,11 +5797,16 @@ def _canonicalize_ingestor_title(
                 ),
                 "original_title": original,
                 "canonical_title": cleaned,
+                "input_title_is_original_language": input_title_is_original_language,
                 "codex_status": codex_result.get("status"),
                 "model": codex_result.get("model"),
             },
         )
-    return {"canonical_title": cleaned, "decisions": decisions}
+    return {
+        "canonical_title": cleaned,
+        "input_title_is_original_language": input_title_is_original_language,
+        "decisions": decisions,
+    }
 
 
 def _same_title_query(title: str) -> str:

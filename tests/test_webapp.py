@@ -933,11 +933,17 @@ def test_canonicalize_ingestor_title_strips_parenthetical_suffixes(monkeypatch) 
 def test_canonicalize_ingestor_title_uses_codex_refinement(monkeypatch) -> None:
     monkeypatch.setattr(
         "ia_kissing_pipeline.webapp._call_codex_ingestor_title_canonicalizer",
-        lambda original, cleaned: {"status": "ok", "title": "Never Take Candy from a Stranger"},
+        lambda original, cleaned: {
+            "status": "ok",
+            "title": "Never Take Candy from a Stranger",
+            "input_title_is_original_language": False,
+        },
     )
     result = _canonicalize_ingestor_title("Never Take Candy From A Stranger (restored, colorized)")
     assert result["canonical_title"] == "Never Take Candy from a Stranger"
+    assert result["input_title_is_original_language"] is False
     assert any(item["heuristic"] == "codex title canonicalizer" for item in result["decisions"])
+    assert any(item["heuristic"] == "codex title language" for item in result["decisions"])
 
 
 def test_source_archive_excludes_env_and_data(tmp_path: Path, monkeypatch) -> None:
@@ -982,8 +988,18 @@ def test_call_codex_ingestor_title_canonicalizer_uses_stdin_prompt(tmp_path: Pat
 
     def fake_run(args, **kwargs):
         output_index = args.index("--output-last-message") + 1
-        Path(args[output_index]).write_text("Canonical Title")
+        Path(args[output_index]).write_text(
+            json.dumps(
+                {
+                    "canonical_title": "Canonical Title",
+                    "input_title_is_original_language": False,
+                }
+            )
+        )
         assert args[-1] == "-"
+        assert "Return JSON only" in kwargs["input"]
+        assert "input_title_is_original_language" in kwargs["input"]
+        assert "Use only the two title strings below" in kwargs["input"]
         assert "Original title: Noisy Title" in kwargs["input"]
         assert "Cleaned candidate: Clean Title" in kwargs["input"]
         class Completed:
@@ -995,6 +1011,7 @@ def test_call_codex_ingestor_title_canonicalizer_uses_stdin_prompt(tmp_path: Pat
     result = _call_codex_ingestor_title_canonicalizer("Noisy Title", "Clean Title")
     assert result["status"] == "ok"
     assert result["title"] == "Canonical Title"
+    assert result["input_title_is_original_language"] is False
 
 
 def test_cleanup_nonpending_local_artifacts_keeps_db_rows(tmp_path: Path, monkeypatch) -> None:
