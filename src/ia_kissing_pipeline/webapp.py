@@ -35,8 +35,10 @@ from ia_kissing_pipeline.media_storage import (
     delete_media_tree,
     ensure_local_media_file,
     has_media_reference,
+    is_s3_enabled,
     media_public_url,
     media_relpath,
+    prune_cache_directory,
     upload_media_file,
     upload_media_tree,
 )
@@ -2540,6 +2542,7 @@ def create_app() -> Flask:
     settings = load_settings()
     settings.ensure_directories()
     init_db(settings.db_path)
+    _prune_configured_cache(settings)
     cors_allowed_origins = {"http://localhost:3000", "http://127.0.0.1:3000"}
     cors_origin_patterns = [
         re.compile(r"^http://10\.73\.73\.\d{1,3}:3000$"),
@@ -3298,7 +3301,11 @@ def create_app() -> Flask:
             source_path = ensure_local_media_file(settings, "clip", clip["clip_path"])
             cropped_path = source_path.with_name(f"{source_path.stem}-crop.mp4")
         crop_clip(source_path, cropped_path, crop_x, crop_y, crop_width, crop_height)
-        _upload_clip_file(settings, cropped_path)
+        _upload_clip_file(
+            settings,
+            cropped_path,
+            delete_local_after_upload=_delete_local_after_upload_enabled(settings),
+        )
         with get_connection(settings.db_path) as conn:
             conn.execute(
                 """
@@ -4795,16 +4802,45 @@ def _media_url(settings, kind: str, relpath: str) -> str:
     return _remote_media_url(settings, kind, relpath) or url_for("media_file", kind=kind, relpath=relpath)
 
 
-def _upload_preview_tree(settings, path: Path) -> None:
-    upload_media_tree(settings, "preview", path)
+def _delete_local_after_upload_enabled(settings) -> bool:
+    return is_s3_enabled(settings) and bool(settings.media_delete_local_after_upload)
 
 
-def _upload_preview_file(settings, path: Path) -> None:
-    upload_media_file(settings, "preview", path)
+def _prune_configured_cache(settings) -> dict[str, int]:
+    if settings.cache_max_bytes <= 0 and settings.cache_max_age_seconds <= 0:
+        return {"bytes_before": 0, "bytes_after": 0, "bytes_removed": 0, "files_removed": 0}
+    return prune_cache_directory(
+        settings.cache_dir,
+        max_bytes=max(0, settings.cache_max_bytes),
+        max_age_seconds=max(0, settings.cache_max_age_seconds),
+    )
 
 
-def _upload_clip_file(settings, path: Path) -> None:
-    upload_media_file(settings, "clip", path)
+def _upload_preview_tree(settings, path: Path, *, delete_local_after_upload: bool = False) -> None:
+    upload_media_tree(
+        settings,
+        "preview",
+        path,
+        delete_local_after_upload=delete_local_after_upload,
+    )
+
+
+def _upload_preview_file(settings, path: Path, *, delete_local_after_upload: bool = False) -> None:
+    upload_media_file(
+        settings,
+        "preview",
+        path,
+        delete_local_after_upload=delete_local_after_upload,
+    )
+
+
+def _upload_clip_file(settings, path: Path, *, delete_local_after_upload: bool = False) -> None:
+    upload_media_file(
+        settings,
+        "clip",
+        path,
+        delete_local_after_upload=delete_local_after_upload,
+    )
 
 
 def _load_latest_job(conn, film_id: int | None, job_type: str) -> dict | None:
@@ -7199,6 +7235,7 @@ def _run_ziai_film_now(
 ) -> int:
     settings = load_settings()
     settings.ensure_directories()
+    _prune_configured_cache(settings)
     init_db(settings.db_path)
     try:
         with get_connection(settings.db_path) as conn:
@@ -7286,8 +7323,17 @@ def _run_ziai_film_now(
             cache_dir=cache_dir,
             progress_callback=progress_callback,
         )
-        _upload_preview_tree(settings, output_dir / "candidates")
-        _upload_preview_file(settings, output_dir / "result.json")
+        prune_uploaded_media = _delete_local_after_upload_enabled(settings)
+        _upload_preview_tree(
+            settings,
+            output_dir / "candidates",
+            delete_local_after_upload=prune_uploaded_media,
+        )
+        _upload_preview_file(
+            settings,
+            output_dir / "result.json",
+            delete_local_after_upload=prune_uploaded_media,
+        )
         summary = {key: value for key, value in result.items() if key != "frames"}
         summary.update({"phase": "done", "progress": 1.0})
         with get_connection(settings.db_path) as conn:
@@ -7334,7 +7380,11 @@ def _run_ziai_film_now(
             )
         if upload_frames:
             try:
-                _upload_preview_tree(settings, output_dir / "frames")
+                _upload_preview_tree(
+                    settings,
+                    output_dir / "frames",
+                    delete_local_after_upload=prune_uploaded_media,
+                )
             except Exception as exc:
                 with get_connection(settings.db_path) as conn:
                     append_job_event(
@@ -7350,6 +7400,8 @@ def _run_ziai_film_now(
                         },
                     )
         else:
+            if prune_uploaded_media:
+                shutil.rmtree(output_dir / "frames", ignore_errors=True)
             with get_connection(settings.db_path) as conn:
                 append_job_event(
                     conn,
@@ -7362,6 +7414,7 @@ def _run_ziai_film_now(
                         "film_id": film_id,
                     },
                 )
+        _prune_configured_cache(settings)
         return 0
     except BaseException as exc:
         error_payload = {
@@ -7527,6 +7580,7 @@ def _record_ziai_batch_state(
 def _run_ziai_batch_now(job_id: int) -> int:
     settings = load_settings()
     settings.ensure_directories()
+    _prune_configured_cache(settings)
     init_db(settings.db_path)
     try:
         with get_connection(settings.db_path) as conn:
@@ -7761,7 +7815,11 @@ def _build_manual_clip_now(job_id: int, film_id: int, mark_id: int, pre_seconds:
         start_seconds = max(0.0, float(mark["source_seconds"]) - pre_seconds)
         end_seconds = float(mark["source_seconds"]) + post_seconds
         extract_clip(source_path, clip_path, start_seconds, end_seconds - start_seconds)
-        _upload_clip_file(settings, clip_path)
+        _upload_clip_file(
+            settings,
+            clip_path,
+            delete_local_after_upload=_delete_local_after_upload_enabled(settings),
+        )
         with get_connection(settings.db_path) as conn:
             conn.execute("DELETE FROM manual_clips WHERE manual_mark_id = ?", (mark_id,))
             conn.execute(
@@ -7823,7 +7881,11 @@ def _build_skim_now(job_id: int, film_id: int, sample_every_seconds: float, outp
             max_height=max_height,
             progress_callback=progress_callback,
         )
-        _upload_preview_file(settings, output_path)
+        _upload_preview_file(
+            settings,
+            output_path,
+            delete_local_after_upload=_delete_local_after_upload_enabled(settings),
+        )
         with get_connection(settings.db_path) as conn:
             conn.execute(
                 """
@@ -7921,6 +7983,7 @@ def _run_kiss_detector_now(job_id: int, film_id: int) -> int:
 def _ensure_review_queue_now(job_id: int, target_ready: int) -> int:
     settings = load_settings()
     settings.ensure_directories()
+    _prune_configured_cache(settings)
     try:
         if not _start_queue_runtime(settings, job_id, target_ready):
             return 0
@@ -8724,6 +8787,7 @@ def _run_auto_ingest_ziai_cycle(settings, job_id: int) -> dict[str, object]:
 def _run_auto_ingest_ziai_now(job_id: int, *, once: bool = False) -> int:
     settings = load_settings()
     settings.ensure_directories()
+    _prune_configured_cache(settings)
     init_db(settings.db_path)
     if not _start_auto_ingest_ziai_runtime(settings, job_id):
         return 0
@@ -9106,7 +9170,11 @@ def _preserve_manual_clips(conn, settings, film) -> None:
         if clip_path.exists() and not str(clip_path).startswith(str(settings.clips_dir)):
             target_path = archive_dir / clip_path.name
             shutil.copy2(clip_path, target_path)
-            _upload_clip_file(settings, target_path)
+            _upload_clip_file(
+                settings,
+                target_path,
+                delete_local_after_upload=_delete_local_after_upload_enabled(settings),
+            )
             conn.execute("UPDATE manual_clips SET clip_path = ? WHERE id = ?", (str(target_path), row["id"]))
         cropped_path = row["cropped_clip_path"]
         if cropped_path:
@@ -9114,7 +9182,11 @@ def _preserve_manual_clips(conn, settings, film) -> None:
             if cropped.exists() and not str(cropped).startswith(str(settings.clips_dir)):
                 target_crop = archive_dir / cropped.name
                 shutil.copy2(cropped, target_crop)
-                _upload_clip_file(settings, target_crop)
+                _upload_clip_file(
+                    settings,
+                    target_crop,
+                    delete_local_after_upload=_delete_local_after_upload_enabled(settings),
+                )
                 conn.execute("UPDATE manual_clips SET cropped_clip_path = ? WHERE id = ?", (str(target_crop), row["id"]))
 
 

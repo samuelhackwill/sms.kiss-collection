@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
+import time
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlparse
 
@@ -63,7 +64,13 @@ def media_key(settings, kind: str, relpath: str) -> str:
     return f"{prefix}/{clean_relpath}"
 
 
-def upload_media_file(settings, kind: str, path_value: str | Path) -> str | None:
+def upload_media_file(
+    settings,
+    kind: str,
+    path_value: str | Path,
+    *,
+    delete_local_after_upload: bool = False,
+) -> str | None:
     if not is_s3_enabled(settings):
         return None
     path = Path(path_value)
@@ -83,10 +90,19 @@ def upload_media_file(settings, kind: str, path_value: str | Path) -> str | None
         extra_args["ACL"] = settings.media_s3_acl
     kwargs = {"ExtraArgs": extra_args} if extra_args else {}
     _s3_client(settings).upload_file(str(path), settings.media_s3_bucket, key, **kwargs)
+    if delete_local_after_upload:
+        path.unlink(missing_ok=True)
+        _remove_empty_media_parents(settings, kind, path.parent)
     return key
 
 
-def upload_media_tree(settings, kind: str, root_path: str | Path) -> list[str]:
+def upload_media_tree(
+    settings,
+    kind: str,
+    root_path: str | Path,
+    *,
+    delete_local_after_upload: bool = False,
+) -> list[str]:
     if not is_s3_enabled(settings):
         return []
     root = Path(root_path)
@@ -95,7 +111,12 @@ def upload_media_tree(settings, kind: str, root_path: str | Path) -> list[str]:
     uploaded = []
     for path in sorted(root.rglob("*")):
         if path.is_file():
-            key = upload_media_file(settings, kind, path)
+            key = upload_media_file(
+                settings,
+                kind,
+                path,
+                delete_local_after_upload=delete_local_after_upload,
+            )
             if key:
                 uploaded.append(key)
     return uploaded
@@ -148,10 +169,91 @@ def delete_media_prefix(settings, kind: str, relpath_prefix: str) -> None:
             client.delete_objects(Bucket=settings.media_s3_bucket, Delete={"Objects": objects})
 
 
+def prune_cache_directory(cache_dir: str | Path, *, max_bytes: int = 0, max_age_seconds: int = 0) -> dict[str, int]:
+    root = Path(cache_dir)
+    result = {
+        "bytes_before": 0,
+        "bytes_after": 0,
+        "bytes_removed": 0,
+        "files_removed": 0,
+    }
+    if not root.exists():
+        return result
+
+    now = time.time()
+    files = _cache_files(root)
+    result["bytes_before"] = sum(item["size"] for item in files)
+
+    if max_age_seconds > 0:
+        cutoff = now - max_age_seconds
+        for item in list(files):
+            if item["mtime"] < cutoff:
+                _remove_cache_file(item["path"], item["size"], result)
+
+    files = _cache_files(root)
+    total_bytes = sum(item["size"] for item in files)
+    if max_bytes > 0 and total_bytes > max_bytes:
+        for item in sorted(files, key=lambda value: value["mtime"]):
+            if total_bytes <= max_bytes:
+                break
+            if _remove_cache_file(item["path"], item["size"], result):
+                total_bytes -= item["size"]
+
+    _remove_empty_cache_dirs(root)
+    result["bytes_after"] = sum(item["size"] for item in _cache_files(root))
+    result["bytes_removed"] = result["bytes_before"] - result["bytes_after"]
+    return result
+
+
 def _media_kind(kind: str) -> tuple[str, str]:
     if kind not in MEDIA_KINDS:
         raise ValueError(f"Unsupported media kind: {kind}")
     return MEDIA_KINDS[kind]
+
+
+def _remove_empty_media_parents(settings, kind: str, start: Path) -> None:
+    root = media_root(settings, kind).resolve()
+    current = start.resolve()
+    while str(current).startswith(str(root)) and current != root:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def _cache_files(root: Path) -> list[dict[str, int | float | Path]]:
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        files.append({"path": path, "size": int(stat.st_size), "mtime": float(stat.st_mtime)})
+    return files
+
+
+def _remove_cache_file(path: Path, size: int, result: dict[str, int]) -> bool:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    result["files_removed"] += 1
+    result["bytes_removed"] += size
+    return True
+
+
+def _remove_empty_cache_dirs(root: Path) -> None:
+    dirs = (item for item in root.rglob("*") if item.is_dir())
+    for path in sorted(dirs, key=lambda value: len(value.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            continue
 
 
 def _clean_relpath(relpath: str) -> str:

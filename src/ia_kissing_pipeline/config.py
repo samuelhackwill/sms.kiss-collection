@@ -7,6 +7,23 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str
@@ -26,6 +43,9 @@ class Settings:
     media_s3_public_base_url: str
     media_s3_acl: str
     media_s3_cache_control: str
+    media_delete_local_after_upload: bool
+    cache_max_bytes: int
+    cache_max_age_seconds: int
     user_agent: str
     roboflow_api_url: str
     roboflow_api_key: str
@@ -67,6 +87,9 @@ def load_settings() -> Settings:
         media_s3_public_base_url=os.getenv("MEDIA_S3_PUBLIC_BASE_URL", ""),
         media_s3_acl=os.getenv("MEDIA_S3_ACL", "public-read"),
         media_s3_cache_control=os.getenv("MEDIA_S3_CACHE_CONTROL", "public, max-age=31536000, immutable"),
+        media_delete_local_after_upload=_env_bool("MEDIA_DELETE_LOCAL_AFTER_UPLOAD", True),
+        cache_max_bytes=_env_int("CACHE_MAX_BYTES", 10 * 1024 * 1024 * 1024),
+        cache_max_age_seconds=_env_int("CACHE_MAX_AGE_SECONDS", 14 * 24 * 60 * 60),
         user_agent=os.getenv(
             "USER_AGENT",
             "ia-kissing-pipeline/0.1 (contact: operator@example.com)",

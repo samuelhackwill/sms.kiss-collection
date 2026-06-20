@@ -426,7 +426,7 @@ def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monk
 
     upload_calls = []
 
-    def fake_upload_preview_tree(settings_arg, path):
+    def fake_upload_preview_tree(settings_arg, path, **kwargs):
         upload_calls.append(("tree", path.name))
         if path.name == "frames":
             with get_connection(settings.db_path) as conn:
@@ -437,7 +437,7 @@ def test_ziai_tab_runs_confirmed_film_and_streams_candidate(tmp_path: Path, monk
             assert frame_upload_job["status"] == "done"
             assert frame_upload_candidate["review_status"] == "pending"
 
-    def fake_upload_preview_file(settings_arg, path):
+    def fake_upload_preview_file(settings_arg, path, **kwargs):
         upload_calls.append(("file", path.name))
 
     monkeypatch.setattr("ia_kissing_pipeline.webapp._upload_preview_tree", fake_upload_preview_tree)
