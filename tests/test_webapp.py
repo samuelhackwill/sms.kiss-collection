@@ -907,6 +907,7 @@ def test_ziai_batch_only_runs_remaining_confirmed_films(tmp_path: Path, monkeypa
     assert "max_gap_frames" not in child_payload
     assert child_payload["clip_padding_seconds"] == 2.0
     assert child_payload["upload_frames"] is False
+    assert child_payload["use_cache"] is False
     assert batch["status"] == "done"
     assert json.loads(batch["result_json"])["completed"] == 1
 

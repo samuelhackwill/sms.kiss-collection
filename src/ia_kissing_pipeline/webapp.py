@@ -7195,6 +7195,7 @@ def _run_ziai_film_now(
     allow_unconfirmed: bool = False,
     progress_observer: IngestorProgressCallback | None = None,
     upload_frames: bool | None = None,
+    use_cache: bool | None = None,
 ) -> int:
     settings = load_settings()
     settings.ensure_directories()
@@ -7238,7 +7239,6 @@ def _run_ziai_film_now(
             _, _, source_path = _resolve_source_video(conn, settings, film_id)
         source_path = source_path.resolve()
         output_dir = (settings.preview_dir / film["archive_identifier"] / "ziai").resolve()
-        cache_dir = (settings.cache_dir / "ziai" / film["archive_identifier"]).resolve()
         source_ready_payload = {
             "phase": "source_ready",
             "progress": 0.01,
@@ -7272,6 +7272,9 @@ def _run_ziai_film_now(
         payload = job["payload"]
         if upload_frames is None:
             upload_frames = bool(payload.get("upload_frames", True))
+        if use_cache is None:
+            use_cache = bool(payload.get("use_cache", True))
+        cache_dir = (settings.cache_dir / "ziai" / film["archive_identifier"]).resolve() if use_cache else None
         result = run_ziai_pipeline(
             source_path,
             output_dir,
@@ -7401,6 +7404,7 @@ def _ziai_batch_child_payload(job_id: int) -> dict[str, object]:
         "chunk_seconds": 300.0,
         "inference_batch_size": 8,
         "upload_frames": False,
+        "use_cache": False,
         "batch_job_id": job_id,
     }
 
@@ -8535,6 +8539,7 @@ def _create_auto_ziai_child_job(settings, parent_job_id: int, film_id: int, titl
         "chunk_seconds": 300.0,
         "inference_batch_size": 8,
         "upload_frames": False,
+        "use_cache": False,
         "auto_ingest_ziai_job_id": parent_job_id,
     }
     now = utc_now_iso()
