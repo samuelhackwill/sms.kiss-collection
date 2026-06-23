@@ -20,6 +20,7 @@ from ia_kissing_pipeline.webapp import (
     _run_ingestor_dry_run_now,
     _run_kiss_detector_now,
     _run_auto_ingest_ziai_cycle,
+    _run_auto_ingest_ziai_cycle_resilient,
     _run_ziai_batch_now,
     _run_ziai_film_now,
     _reconcile_stale_ziai_jobs,
@@ -2796,7 +2797,10 @@ def test_auto_ingest_ziai_cycle_inserts_film_and_runs_unconfirmed_ziai(tmp_path:
         ],
     }
 
+    dry_run_calls: list[dict] = []
+
     def fake_dry_run(*args, **kwargs) -> dict:
+        dry_run_calls.append(kwargs)
         progress_callback = kwargs.get("progress_callback")
         if progress_callback:
             progress_callback("film_complete", {"phase": "probing_duplicates", "progress": 1.0, "message": "done"})
@@ -2846,6 +2850,9 @@ def test_auto_ingest_ziai_cycle_inserts_film_and_runs_unconfirmed_ziai(tmp_path:
 
     assert result["status"] == "ziai_done"
     assert result["candidate_count"] == 2
+    assert dry_run_calls[0]["limit"] == 1
+    assert dry_run_calls[0]["rows"] == 1
+    assert dry_run_calls[0]["duplicate_rows"] == 4
     assert len(ziai_calls) == 1
     assert ziai_calls[0]["allow_unconfirmed"] is True
     with get_connection(settings.db_path) as conn:
@@ -2860,6 +2867,49 @@ def test_auto_ingest_ziai_cycle_inserts_film_and_runs_unconfirmed_ziai(tmp_path:
     assert review is None
     assert f'"auto_ingest_ziai_job_id": {parent_job_id}' in child_job["payload_json"]
     assert next_page["value"] == "2"
+
+
+def test_auto_ingest_ziai_resilient_cycle_skips_error_and_advances_page(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setenv("FRAME_DIR", str(tmp_path / "frames"))
+    monkeypatch.setenv("PREVIEW_DIR", str(tmp_path / "previews"))
+    monkeypatch.setenv("CLIPS_DIR", str(tmp_path / "clips"))
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+
+    settings = load_settings()
+    settings.ensure_directories()
+    init_db(settings.db_path)
+    with get_connection(settings.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO analysis_jobs (film_id, job_type, status, payload_json, result_json, created_at, updated_at)
+            VALUES (NULL, 'auto_ingest_ziai', 'running', '{}', '{"phase":"running","progress":0.0}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """
+        )
+        parent_job_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    def fake_cycle(settings_arg, job_id_arg):
+        raise RuntimeError("metadata fetch failed")
+
+    monkeypatch.setattr("ia_kissing_pipeline.webapp._run_auto_ingest_ziai_cycle", fake_cycle)
+
+    result = _run_auto_ingest_ziai_cycle_resilient(settings, parent_job_id)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "cycle_error"
+    assert result["start_page"] == 1
+    assert result["next_page"] == 2
+    with get_connection(settings.db_path) as conn:
+        next_page = conn.execute("SELECT value FROM app_settings WHERE key = 'auto_ingest_ziai_next_page'").fetchone()
+        job = conn.execute("SELECT status, result_json FROM analysis_jobs WHERE id = ?", (parent_job_id,)).fetchone()
+        event = conn.execute("SELECT event_type FROM job_events WHERE job_id = ? ORDER BY id DESC LIMIT 1", (parent_job_id,)).fetchone()
+    assert next_page["value"] == "2"
+    assert job["status"] == "running"
+    assert json.loads(job["result_json"])["reason"] == "cycle_error"
+    assert event["event_type"] == "cycle_error"
 
 
 def test_update_mark_tag_updates_mark_and_clip(tmp_path: Path, monkeypatch) -> None:

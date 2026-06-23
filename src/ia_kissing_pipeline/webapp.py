@@ -8784,6 +8784,38 @@ def _run_auto_ingest_ziai_cycle(settings, job_id: int) -> dict[str, object]:
     }
 
 
+def _run_auto_ingest_ziai_cycle_resilient(settings, job_id: int) -> dict[str, object]:
+    with get_connection(settings.db_path) as conn:
+        start_page = _get_auto_ingest_ziai_next_page(conn)
+    try:
+        return _run_auto_ingest_ziai_cycle(settings, job_id)
+    except Exception as exc:
+        with get_connection(settings.db_path) as conn:
+            current_page = _get_auto_ingest_ziai_next_page(conn)
+            next_page = max(current_page, start_page + 1)
+            if current_page <= start_page:
+                _set_auto_ingest_ziai_next_page(conn, next_page)
+        payload = {
+            "status": "skipped",
+            "reason": "cycle_error",
+            "error": str(exc),
+            "start_page": start_page,
+            "next_page": next_page,
+        }
+        _record_auto_ingest_ziai_event(
+            settings,
+            job_id,
+            "cycle_error",
+            {
+                "phase": "ingesting",
+                "progress": 0.99,
+                "message": f"Skipped auto ingest page {start_page} after cycle error: {exc}",
+                **payload,
+            },
+        )
+        return payload
+
+
 def _run_auto_ingest_ziai_now(job_id: int, *, once: bool = False) -> int:
     settings = load_settings()
     settings.ensure_directories()
@@ -8828,7 +8860,7 @@ def _run_auto_ingest_ziai_now(job_id: int, *, once: bool = False) -> int:
                     "last_cycle": last_cycle,
                 },
             )
-            last_cycle = _run_auto_ingest_ziai_cycle(settings, job_id)
+            last_cycle = _run_auto_ingest_ziai_cycle_resilient(settings, job_id)
             cycle_count += 1
             done_payload = {
                 "phase": "done" if once else "sleeping",
