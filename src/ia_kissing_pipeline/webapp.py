@@ -2159,11 +2159,11 @@ CLIPS_TEMPLATE = """
       {% for clip in clips %}
         <div class="tile model-{{ clip['model_outcome'] }}">
           {% if clip['media_url'] %}
-            <div class="media-shell" data-clip-media data-src="{{ clip['media_url'] }}">
+            <div class="media-shell" data-clip-media data-src="{{ clip['media_url'] }}{{ '&' if '?' in clip['media_url'] else '?' }}v={{ media_version }}">
               <div class="media-placeholder">
                 <button type="button" class="load-clip">Load clip</button>
                 <div class="media-status">Not loaded yet. Click to fetch this one video from storage.</div>
-                <a href="{{ clip['media_url'] }}" target="_blank" rel="noreferrer">Open raw clip</a>
+                <a href="{{ clip['media_url'] }}{{ '&' if '?' in clip['media_url'] else '?' }}v={{ media_version }}" target="_blank" rel="noreferrer">Open raw clip</a>
               </div>
             </div>
           {% else %}
@@ -2219,11 +2219,11 @@ CLIPS_TEMPLATE = """
         {% for clip in other_clips %}
           <div class="tile model-{{ clip['model_outcome'] }}">
             {% if clip['media_url'] %}
-              <div class="media-shell" data-clip-media data-src="{{ clip['media_url'] }}">
+              <div class="media-shell" data-clip-media data-src="{{ clip['media_url'] }}{{ '&' if '?' in clip['media_url'] else '?' }}v={{ media_version }}">
                 <div class="media-placeholder">
                   <button type="button" class="load-clip">Load clip</button>
                   <div class="media-status">Not loaded yet. Click to fetch this one video from storage.</div>
-                  <a href="{{ clip['media_url'] }}" target="_blank" rel="noreferrer">Open raw clip</a>
+                  <a href="{{ clip['media_url'] }}{{ '&' if '?' in clip['media_url'] else '?' }}v={{ media_version }}" target="_blank" rel="noreferrer">Open raw clip</a>
                 </div>
               </div>
             {% else %}
@@ -2880,6 +2880,7 @@ def create_app() -> Flask:
             other_clips=other_clips,
             stats=stats,
             filters=filters,
+            media_version=int(time.time()),
         )
 
     @app.get("/what-is-a-kiss")
