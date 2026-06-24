@@ -1014,6 +1014,12 @@ def test_canonicalize_ingestor_title_strips_parenthetical_suffixes(monkeypatch) 
     result = _canonicalize_ingestor_title("Film Title [Spanish Dub]")
     assert result["canonical_title"] == "Film Title"
 
+    result = _canonicalize_ingestor_title("THE STRUGGLE (1913) -- dir. by Thomas Ince")
+    assert result["canonical_title"] == "THE STRUGGLE"
+
+    result = _canonicalize_ingestor_title("1936 - Sample Movie - DVD / x264 / MKV / 698x576")
+    assert result["canonical_title"] == "Sample Movie"
+
 
 def test_canonicalize_ingestor_title_uses_codex_refinement(monkeypatch) -> None:
     monkeypatch.setattr(

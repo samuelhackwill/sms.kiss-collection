@@ -5865,7 +5865,21 @@ def _canonicalize_ingestor_title(
     cleaned = re.sub(r"\s*[\(\[].*?[\)\]]\s*$", "", original)
     cleaned = re.sub(r"\s*[\(\[].*?[\)\]]", "", cleaned)
     cleaned = re.sub(r"\s*[-:|]\s*(?:restored|colorized|colourized|remastered|dubbed)\b.*$", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|")
+    cleaned = re.sub(r"^\s*(?:18|19|20)\d{2}\s*[-–—_:|/]*\s*", "", cleaned)
+    cleaned = re.sub(
+        r"\s*(?:[-–—]{1,2}|[:|/])\s*(?:dir\.?|directed by|by)\b.*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\s*(?:[-–—]{1,2}|[:|/])\s*(?:dvd|xvid|divx|x264|mkv|mp4|vhs|rip|"
+        r"\d{3,4}p|sd|hd|imdb\b|film noir\b|masters of cinema\b).*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—_:|/")
     if not cleaned:
         cleaned = original
     decisions = []
