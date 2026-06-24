@@ -2436,6 +2436,9 @@ def test_clips_page_builds_training_dataset_from_manual_and_ziai_clips(tmp_path:
     assert b"manual-mark-002.mp4" in response.data
     assert b"candidate_001.mp4" in response.data
     assert b"candidate_002.mp4" in response.data
+    assert b"Load clip" in response.data
+    assert b"data-clip-media" in response.data
+    assert b"<video controls preload=\"metadata\" playsinline src=" not in response.data
 
     assert false_positive_response.status_code == 200
     assert b"candidate_002.mp4" in false_positive_response.data
@@ -2768,7 +2771,7 @@ def test_auto_ingest_ziai_cycle_inserts_film_and_runs_unconfirmed_ziai(tmp_path:
 
     metadata = {
         "archive_identifier": "auto_feature_film",
-        "title": "Auto Feature Film",
+        "title": "Auto Feature Film (restored scan)",
         "year": 1932,
         "description": "A public domain feature film.",
         "subjects": ["Feature films"],
@@ -2856,7 +2859,7 @@ def test_auto_ingest_ziai_cycle_inserts_film_and_runs_unconfirmed_ziai(tmp_path:
     assert len(ziai_calls) == 1
     assert ziai_calls[0]["allow_unconfirmed"] is True
     with get_connection(settings.db_path) as conn:
-        film = conn.execute("SELECT id, status FROM films WHERE archive_identifier = 'auto_feature_film'").fetchone()
+        film = conn.execute("SELECT id, title, status FROM films WHERE archive_identifier = 'auto_feature_film'").fetchone()
         review = conn.execute("SELECT * FROM film_reviews WHERE film_id = ?", (film["id"],)).fetchone()
         child_job = conn.execute(
             "SELECT payload_json FROM analysis_jobs WHERE film_id = ? AND job_type = 'ziai_film'",
@@ -2864,6 +2867,7 @@ def test_auto_ingest_ziai_cycle_inserts_film_and_runs_unconfirmed_ziai(tmp_path:
         ).fetchone()
         next_page = conn.execute("SELECT value FROM app_settings WHERE key = 'auto_ingest_ziai_next_page'").fetchone()
     assert film["status"] == "ziai_candidates_pending"
+    assert film["title"] == "Auto Feature Film"
     assert review is None
     assert f'"auto_ingest_ziai_job_id": {parent_job_id}' in child_job["payload_json"]
     assert next_page["value"] == "2"

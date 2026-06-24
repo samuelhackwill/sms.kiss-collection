@@ -2036,6 +2036,7 @@ CLIPS_TEMPLATE = """
     h1 { margin-bottom: 6px; }
     .muted { color: var(--muted); }
     .summary { color: var(--muted); margin: 0 0 18px 0; max-width: 980px; line-height: 1.45; }
+    .notice { background: rgba(96, 165, 250, 0.08); border: 1px solid rgba(96, 165, 250, 0.28); border-radius: 14px; padding: 10px 12px; color: #cbe3ff; margin: 0 0 16px 0; max-width: 980px; line-height: 1.45; }
     .stats { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; margin: 16px 0; }
     .stat { background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
     .stat .value { font-size: 26px; font-weight: 800; }
@@ -2059,6 +2060,14 @@ CLIPS_TEMPLATE = """
     .tile.model-pending_review, .tile.model-human_unlabeled { border-left-color: var(--warn); }
     .tile.model-ignored { opacity: 0.72; }
     .tile video { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; background: #000; }
+    .media-shell { background: #020617; border-bottom: 1px solid var(--border); }
+    .media-placeholder { min-height: 180px; aspect-ratio: 16 / 9; display: grid; gap: 8px; place-items: center; text-align: center; padding: 18px; color: var(--muted); }
+    .media-placeholder.loading { min-height: auto; aspect-ratio: auto; display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 10px; text-align: left; }
+    .load-clip { border: 1px solid rgba(124, 199, 255, 0.45); background: rgba(124, 199, 255, 0.12); color: var(--text); border-radius: 999px; padding: 8px 12px; cursor: pointer; font: inherit; }
+    .load-clip:disabled { opacity: 0.65; cursor: wait; }
+    .media-status { font-size: 12px; color: var(--muted); max-width: 34ch; }
+    .media-placeholder.loading .media-status { max-width: none; }
+    .media-status.error { color: var(--bad); }
     .body { padding: 12px; display: grid; gap: 8px; }
     .title { font-weight: 700; line-height: 1.25; }
     .meta { color: var(--muted); font-size: 12px; line-height: 1.45; }
@@ -2083,6 +2092,10 @@ CLIPS_TEMPLATE = """
     This page materializes every known clip into <code>clip_dataset_items</code>: manually acquired clips from human review,
     ZIAI classifier candidates, and their current labels. Rejected ZIAI positives are stored as false positives;
     accepted ZIAI positives are true positives. Manual non-kiss tags are kept, but folded below the main kiss-training set for now.
+  </p>
+  <p class="notice">
+    Clips are lazy-loaded now. The page no longer asks the browser to fetch metadata for every video at once;
+    click <strong>Load clip</strong> on the tile you want to review. If the embedded player stalls, use the raw clip link.
   </p>
 
   <div class="stats">
@@ -2146,7 +2159,13 @@ CLIPS_TEMPLATE = """
       {% for clip in clips %}
         <div class="tile model-{{ clip['model_outcome'] }}">
           {% if clip['media_url'] %}
-            <video controls preload="metadata" playsinline src="{{ clip['media_url'] }}"></video>
+            <div class="media-shell" data-clip-media data-src="{{ clip['media_url'] }}">
+              <div class="media-placeholder">
+                <button type="button" class="load-clip">Load clip</button>
+                <div class="media-status">Not loaded yet. Click to fetch this one video from storage.</div>
+                <a href="{{ clip['media_url'] }}" target="_blank" rel="noreferrer">Open raw clip</a>
+              </div>
+            </div>
           {% else %}
             <div class="empty">Media path is not under a known media root.</div>
           {% endif %}
@@ -2200,7 +2219,13 @@ CLIPS_TEMPLATE = """
         {% for clip in other_clips %}
           <div class="tile model-{{ clip['model_outcome'] }}">
             {% if clip['media_url'] %}
-              <video controls preload="metadata" playsinline src="{{ clip['media_url'] }}"></video>
+              <div class="media-shell" data-clip-media data-src="{{ clip['media_url'] }}">
+                <div class="media-placeholder">
+                  <button type="button" class="load-clip">Load clip</button>
+                  <div class="media-status">Not loaded yet. Click to fetch this one video from storage.</div>
+                  <a href="{{ clip['media_url'] }}" target="_blank" rel="noreferrer">Open raw clip</a>
+                </div>
+              </div>
             {% else %}
               <div class="empty">Media path is not under a known media root.</div>
             {% endif %}
@@ -2229,13 +2254,52 @@ CLIPS_TEMPLATE = """
     </details>
   {% endif %}
 <script>
-  document.querySelectorAll(".tile video").forEach((video) => {
-    video.addEventListener("click", () => {
-      if (video.paused) {
-        video.play();
-      } else {
-        video.pause();
+  document.querySelectorAll("[data-clip-media]").forEach((shell) => {
+    const placeholder = shell.querySelector(".media-placeholder");
+    const button = shell.querySelector(".load-clip");
+    const status = shell.querySelector(".media-status");
+    const source = shell.dataset.src;
+    if (!button || !source) return;
+    button.addEventListener("click", () => {
+      if (shell.dataset.loaded === "1") return;
+      shell.dataset.loaded = "1";
+      button.disabled = true;
+      button.textContent = "Loading...";
+      if (status) {
+        status.textContent = "Requesting clip metadata...";
+        status.classList.remove("error");
       }
+      if (placeholder) placeholder.classList.add("loading");
+      const video = document.createElement("video");
+      video.controls = true;
+      video.preload = "metadata";
+      video.playsInline = true;
+      video.src = source;
+      video.addEventListener("loadedmetadata", () => {
+        if (status) status.textContent = "Clip ready.";
+        button.remove();
+      });
+      video.addEventListener("canplay", () => {
+        if (status) status.textContent = "Clip ready.";
+      });
+      video.addEventListener("waiting", () => {
+        if (status) status.textContent = "Buffering from storage...";
+      });
+      video.addEventListener("error", () => {
+        shell.dataset.loaded = "0";
+        button.disabled = false;
+        button.textContent = "Retry load";
+        if (status) {
+          status.textContent = "Could not load the embedded player. Try the raw clip link.";
+          status.classList.add("error");
+        }
+      });
+      if (placeholder) {
+        shell.replaceChildren(video, placeholder);
+      } else {
+        shell.replaceChildren(video);
+      }
+      video.load();
     });
   });
 </script>
@@ -8565,7 +8629,10 @@ def _select_auto_ingest_ziai_metadata(settings, candidate: dict) -> dict:
             "status": "selected",
             "reason": "selected_original_language_sibling",
             "source_archive_identifier": metadata["archive_identifier"],
-            "metadata": normalize_item(sibling_doc, metadata_payload),
+            "metadata": _auto_ingest_metadata_with_canonical_title(
+                candidate,
+                normalize_item(sibling_doc, metadata_payload),
+            ),
         }
 
     with get_connection(settings.db_path) as conn:
@@ -8590,8 +8657,18 @@ def _select_auto_ingest_ziai_metadata(settings, candidate: dict) -> dict:
     return {
         "status": "selected",
         "reason": "selected_candidate",
-        "metadata": metadata,
+        "metadata": _auto_ingest_metadata_with_canonical_title(candidate, metadata),
     }
+
+
+def _auto_ingest_metadata_with_canonical_title(candidate: dict, metadata: dict) -> dict:
+    title_analysis = candidate.get("title_analysis") or {}
+    canonical_title = re.sub(r"\s+", " ", str(title_analysis.get("canonical_title") or "")).strip()
+    if not canonical_title:
+        return dict(metadata)
+    cleaned_metadata = dict(metadata)
+    cleaned_metadata["title"] = canonical_title
+    return cleaned_metadata
 
 
 def _create_auto_ziai_child_job(settings, parent_job_id: int, film_id: int, title: str) -> int:
