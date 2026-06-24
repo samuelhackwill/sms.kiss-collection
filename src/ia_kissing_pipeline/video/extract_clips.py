@@ -33,6 +33,7 @@ def extract_clip(
         command.extend(["-map", "0:v:0", "-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"])
     else:
         command.append("-an")
+    command.extend(["-movflags", "+faststart"])
     command.append(str(output_path))
     subprocess.run(
         command,
@@ -71,6 +72,8 @@ def crop_clip(
             "-crf",
             "24",
             "-an",
+            "-movflags",
+            "+faststart",
             str(output_path),
         ],
         text=True,

@@ -87,7 +87,24 @@ def test_extract_clip_can_preserve_audio(tmp_path: Path, monkeypatch) -> None:
 
     assert "-an" in commands[0]
     assert "-an" not in commands[1]
+    assert ["-movflags", "+faststart"] == commands[0][commands[0].index("-movflags") : commands[0].index("-movflags") + 2]
+    assert ["-movflags", "+faststart"] == commands[1][commands[1].index("-movflags") : commands[1].index("-movflags") + 2]
     assert ["-c:a", "aac", "-b:a", "128k"] == commands[1][commands[1].index("-c:a") : commands[1].index("-c:a") + 4]
+
+
+def test_crop_clip_writes_faststart_mp4(tmp_path: Path, monkeypatch) -> None:
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "ia_kissing_pipeline.video.extract_clips.subprocess.run",
+        lambda command, **kwargs: commands.append(command),
+    )
+
+    from ia_kissing_pipeline.video.extract_clips import crop_clip
+
+    crop_clip(tmp_path / "source.mp4", tmp_path / "crop.mp4", 0.1, 0.2, 0.7, 0.6)
+
+    assert ["-movflags", "+faststart"] == commands[0][commands[0].index("-movflags") : commands[0].index("-movflags") + 2]
 
 
 def test_video_prepare_and_shot_flow(tmp_path: Path) -> None:
