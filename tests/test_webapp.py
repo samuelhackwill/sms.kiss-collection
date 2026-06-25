@@ -84,6 +84,7 @@ def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     assert films_status_response.status_code == 200
     assert b"films" in films_status_response.data
     assert detail_response.status_code == 200
+    assert b'href="/admin">Admin</a>' in detail_response.data
     assert b"Available Metadata" in detail_response.data
     assert b"archive identifier" in detail_response.data
     assert b"Build / Refresh Skim Preview" in detail_response.data
@@ -93,7 +94,10 @@ def test_webapp_index_and_film_detail(tmp_path: Path, monkeypatch) -> None:
     assert b"skim-viewport" in detail_response.data
     assert b"No Kissing Scenes. Show Me New Video" not in detail_response.data
     assert clips_response.status_code == 200
+    assert b'href="/admin">Admin</a>' in clips_response.data
+    assert b"What Is A Kiss" in clips_response.data
     assert admin_response.status_code == 200
+    assert b"<strong>Admin</strong>" in admin_response.data
     assert b"Run Get More Films" in admin_response.data
 
 
@@ -2008,6 +2012,7 @@ def test_what_is_a_kiss_page_shows_only_kiss_clips_with_timing(tmp_path: Path, m
 
     assert response.status_code == 200
     assert b"What Is A Kiss" in response.data
+    assert b'href="/admin">Admin</a>' in response.data
     assert b"clip 1" in response.data
     assert b"kiss 4.25s" in response.data
     assert b"clip 2" not in response.data
@@ -3234,6 +3239,7 @@ def test_review_data_lists_video_files_and_pending_status(tmp_path: Path, monkey
 
     assert response.status_code == 200
     assert b"Review Data" in response.data
+    assert b'href="/admin">Admin</a>' in response.data
     assert b"Downloaded Sources" in response.data
     assert b"Loose Data Videos" in response.data
     assert b"pending review" in response.data

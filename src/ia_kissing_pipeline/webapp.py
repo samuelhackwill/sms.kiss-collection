@@ -20,6 +20,7 @@ from typing import Callable
 from urllib import request as urllib_request
 
 from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, send_file, stream_with_context, url_for
+from markupsafe import Markup, escape
 from PIL import Image, ImageDraw, UnidentifiedImageError
 
 from ia_kissing_pipeline.config import load_settings
@@ -94,6 +95,28 @@ CODE_ARCHIVE_EXCLUDED_SUFFIXES = {
     ".zip",
 }
 
+MAIN_NAV_ITEMS = (
+    ("index", "index", "Next Review"),
+    ("films", "films_index", "Database"),
+    ("review_data", "review_data_index", "Review Data"),
+    ("ingestor", "ingestor_index", "Ingestor"),
+    ("ziai", "ziai_index", "ZIAI"),
+    ("admin", "admin_index", "Admin"),
+    ("clips", "clips_index", "Clips"),
+    ("what_is_a_kiss", "what_is_a_kiss_page", "What Is A Kiss"),
+)
+
+
+def _render_main_nav(active: str | None = None) -> Markup:
+    items = []
+    for key, endpoint, label in MAIN_NAV_ITEMS:
+        escaped_label = escape(label)
+        if key == active:
+            items.append(f"<strong>{escaped_label}</strong>")
+            continue
+        items.append(f'<a href="{escape(url_for(endpoint))}">{escaped_label}</a>')
+    return Markup("<p>" + " | ".join(items) + "</p>")
+
 
 EMPTY_TEMPLATE = """
 <!doctype html>
@@ -110,7 +133,7 @@ EMPTY_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  {{ main_nav("index") }}
   <div class="panel">
     <h1>No Ready Film Yet</h1>
     <p>The review queue is being filled in the background.</p>
@@ -183,7 +206,7 @@ FILMS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a> | <a href="{{ url_for('what_is_a_kiss_page') }}">What Is A Kiss</a></p>
+  {{ main_nav("films") }}
   <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
     <h1 style="margin:0;">Film Database</h1>
     {% for stat in tag_stats %}
@@ -418,7 +441,7 @@ ADMIN_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  {{ main_nav("admin") }}
   <div class="panel">
     <h1 style="margin-top:0;">Admin</h1>
     <p class="muted">Launch the get more films batch from the web UI. This queues the same download-batch flow used by the Python tooling.</p>
@@ -531,7 +554,7 @@ INGESTOR_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  {{ main_nav("ingestor") }}
   <div class="panel">
     <h1 style="margin-top:0;">Ingestor</h1>
     <p class="muted">Dry-run only. Runs in a background worker and streams Internet Archive search, metadata normalization, Codex title checks, and duplicate-title probing live.</p>
@@ -746,7 +769,7 @@ ZIAI_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <strong>ZIAI</strong> | <a href="{{ url_for('admin_index') }}">Admin</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  {{ main_nav("ziai") }}
   <div class="panel">
     <h1 style="margin-top:0;">ZIAI Pipeline</h1>
     <p class="muted">Extract synchronized 0.96-second frames, classify them, group likely kissing sequences, and build clips for human review.</p>
@@ -1025,7 +1048,7 @@ FILM_TEMPLATE = """
 </head>
 <body class="debug-off">
   <div class="topbar">
-    <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+    {{ main_nav("films") }}
     <button type="button" id="debug-toggle" class="debug-toggle">Debug: Off</button>
   </div>
   <h1 class="debug-only">{{ film["title"] }}</h1>
@@ -2086,7 +2109,7 @@ CLIPS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <strong>Clips</strong></p>
+  {{ main_nav("clips") }}
   <h1>Clip Dataset</h1>
   <p class="summary">
     This page materializes every known clip into <code>clip_dataset_items</code>: manually acquired clips from human review,
@@ -2344,7 +2367,7 @@ WHAT_IS_A_KISS_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  {{ main_nav("what_is_a_kiss") }}
   <h1>What Is A Kiss</h1>
   {% if rows %}
     <div class="page">
@@ -2511,7 +2534,7 @@ REVIEW_DATA_TEMPLATE = """
   </style>
 </head>
 <body>
-  <p><a href="{{ url_for('index') }}">Next Review</a> | <a href="{{ url_for('films_index') }}">Database</a> | <a href="{{ url_for('review_data_index') }}">Review Data</a> | <a href="{{ url_for('ingestor_index') }}">Ingestor</a> | <a href="{{ url_for('ziai_index') }}">ZIAI</a> | <a href="{{ url_for('clips_index') }}">Clips</a></p>
+  {{ main_nav("review_data") }}
   <h1>Review Data</h1>
   {% for section in sections %}
     <details class="section" {% if section["open"] %}open{% endif %}>
@@ -2603,6 +2626,7 @@ def _build_film_metadata_payload(film: sqlite3.Row) -> list[dict[str, str]]:
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    app.jinja_env.globals["main_nav"] = _render_main_nav
     settings = load_settings()
     settings.ensure_directories()
     init_db(settings.db_path)
